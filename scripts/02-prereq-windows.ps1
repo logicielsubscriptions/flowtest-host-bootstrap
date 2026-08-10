@@ -1,0 +1,557 @@
+<#
+.SYNOPSIS
+    Prerequisite installation for a Windows container host that runs containers
+    on caller-specified static IPs.
+
+.DESCRIPTION
+    Prepares a Windows Server 2022 EC2 instance to host Windows containers whose
+    addresses are dictated by a plan file (see -PlanFile). This script is
+    deliberately generic: it declares no addresses, hostnames or workloads of its
+    own — everything comes from the plan.
+
+    Installs, in order:
+        Containers feature (+ optional Hyper-V for isolated containers)
+        Mirantis Container Runtime (MCR) — the supported Docker runtime on
+          Windows Server; Docker CE is not available for Windows Server
+        Chocolatey, git, AWS CLI v2, OpenJDK 17 (Jenkins agent)
+        Microsoft ODBC Driver 18 for SQL Server + sqlcmd (mssql-tools18)
+        HNS PowerShell module
+        servercore:ltsc2022 base image
+        l2bridge Docker networks bound to eth1 / eth2
+
+    IP-exactness note: l2bridge is used rather than 'transparent' because
+    l2bridge rewrites container MAC addresses to the host NIC's MAC. EC2
+    filters foreign MACs, so transparent/macvlan-style networks fail there
+    while l2bridge works.
+
+.PARAMETER PlanFile
+    Path to the flow-plan-windows.json produced by generator/generate_cfn.py.
+    Nothing about the flow is hardcoded in this script — networks, container
+    addresses and peers all come from the plan. Instance UserData passes this in
+    automatically; supply it by hand only when re-running manually.
+
+.PARAMETER SkipReboot
+    Do not reboot automatically after enabling the Containers feature.
+
+.PARAMETER SkipNetworks
+    Skip Docker network creation (useful on a first pass before the secondary
+    ENIs are visible inside the OS).
+
+.NOTES
+    Run in an elevated PowerShell session.
+    CloudFormation now creates the ENIs, assigns the exact production addresses
+    as secondary private IPs, and disables source/dest check — so no AWS-side
+    preparation is needed here.
+    Expect ONE reboot: re-run the script after it, it is idempotent and will
+    continue where it left off. Instance UserData uses <persist>true</persist>,
+    so on a CloudFormation-launched host the re-run happens automatically.
+#>
+
+[CmdletBinding()]
+param(
+    [string]$PlanFile,
+    [switch]$SkipReboot,
+    [switch]$SkipNetworks
+)
+
+$ErrorActionPreference = 'Stop'
+Set-StrictMode -Version Latest
+
+# ───────────────────────────── configuration ─────────────────────────────
+
+# Host-level constants only. Everything flow-specific comes from $PlanFile.
+$script:Config = @{
+    BaseImage      = 'mcr.microsoft.com/windows/servercore:ltsc2022'
+    JdkPackage     = 'openjdk17'
+    McrInstallUrl  = 'https://get.mirantis.com/install.ps1'
+    OdbcUrl        = 'https://go.microsoft.com/fwlink/?linkid=2280794'   # msodbcsql18 x64
+    MsSqlToolsUrl  = 'https://go.microsoft.com/fwlink/?linkid=2280795'   # mssql-tools18 x64
+    WorkRoot       = 'C:\FlowTest'
+}
+
+# Populated by Import-FlowPlan.
+$script:Plan = $null
+
+function Import-FlowPlan {
+    Write-Step 'Flow plan'
+
+    if (-not $PlanFile) {
+        $default = Join-Path $Config.WorkRoot 'bootstrap\flow-plan-windows.json'
+        if (Test-Path $default) {
+            $PlanFile = $default
+            Write-Host "  no -PlanFile given; using $default"
+        }
+    }
+
+    if (-not $PlanFile -or -not (Test-Path $PlanFile)) {
+        Write-Warn 'no flow plan found — installing tooling only, skipping Docker networks'
+        Write-Warn 'Generate one with: python3 generator/generate_cfn.py --flow <FLOW> ...'
+        $script:Plan = $null
+        return
+    }
+
+    $script:Plan = Get-Content -Raw -Path $PlanFile | ConvertFrom-Json
+
+    if ($Plan.hostRole -ne 'windows') {
+        throw "plan file is for hostRole '$($Plan.hostRole)', not 'windows'. Wrong plan file?"
+    }
+    if ($Plan.workRoot) { $Config.WorkRoot = $Plan.workRoot }
+
+    Write-Ok "flow: $($Plan.flow)"
+    foreach ($network in $Plan.networks) {
+        Write-Ok ("{0}  {1}  host={2}  containers={3}" -f `
+            $network.dockerNetwork, $network.subnetCidr, $network.hostPrimaryIp, ($network.containerIps -join ', '))
+    }
+    foreach ($group in $Plan.groups) {
+        $services = ($group.services | ForEach-Object { $_.serviceName }) -join ', '
+        $shared = if ($group.sharedNamespace) { " [shared namespace via $($group.namespaceContainer)]" } else { '' }
+        Write-Ok "group $($group.prodHost) @ $($group.ip): $services$shared"
+    }
+}
+
+# ───────────────────────────── helpers ─────────────────────────────
+
+function Write-Step { param([string]$Message) Write-Host "`n=== $Message ===" -ForegroundColor Cyan }
+function Write-Ok   { param([string]$Message) Write-Host "  [ok]   $Message" -ForegroundColor Green }
+function Write-Skip { param([string]$Message) Write-Host "  [skip] $Message" -ForegroundColor DarkGray }
+function Write-Warn { param([string]$Message) Write-Host "  [warn] $Message" -ForegroundColor Yellow }
+function Write-Fail { param([string]$Message) Write-Host "  [FAIL] $Message" -ForegroundColor Red }
+
+function Assert-Administrator {
+    $identity  = [Security.Principal.WindowsIdentity]::GetCurrent()
+    $principal = New-Object Security.Principal.WindowsPrincipal($identity)
+    if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+        throw 'This script must be run from an elevated PowerShell session.'
+    }
+}
+
+function Assert-SupportedOs {
+    $os = Get-CimInstance Win32_OperatingSystem
+    Write-Ok "OS: $($os.Caption) (build $($os.BuildNumber))"
+    if ($os.ProductType -eq 1) {
+        throw "This host is a client OS. Windows Server 2019/2022 is required for the FIX/OE containers."
+    }
+    if ([int]$os.BuildNumber -lt 17763) {
+        throw "Build $($os.BuildNumber) is too old. Windows Server 2019 (17763) or later is required."
+    }
+    if ([int]$os.BuildNumber -lt 20348) {
+        Write-Warn "Not Server 2022 (20348). Change BaseImage to servercore:ltsc2019 — Windows container images must match the host kernel."
+    }
+}
+
+function Test-CommandExists {
+    param([string]$Name)
+    return [bool](Get-Command $Name -ErrorAction SilentlyContinue)
+}
+
+function Invoke-Download {
+    param([string]$Uri, [string]$OutFile)
+    [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+    Invoke-WebRequest -Uri $Uri -OutFile $OutFile -UseBasicParsing
+}
+
+function Install-MsiFromUrl {
+    param(
+        [string]$Uri,
+        [string]$FileName,
+        [string]$DisplayName,
+        [string[]]$ExtraArgs = @()
+    )
+    $installer = Join-Path $env:TEMP $FileName
+    Write-Host "  downloading $DisplayName ..."
+    Invoke-Download -Uri $Uri -OutFile $installer
+
+    $msiArgs = @('/i', "`"$installer`"", '/qn', '/norestart') + $ExtraArgs
+    $proc = Start-Process -FilePath 'msiexec.exe' -ArgumentList $msiArgs -Wait -PassThru
+    # 3010 = success, reboot required
+    if ($proc.ExitCode -notin @(0, 3010)) {
+        throw "$DisplayName installation failed with exit code $($proc.ExitCode)"
+    }
+    Remove-Item $installer -Force -ErrorAction SilentlyContinue
+    Write-Ok "$DisplayName installed"
+}
+
+# ───────────────────────────── steps ─────────────────────────────
+
+function Enable-ContainerFeatures {
+    Write-Step 'Windows container features'
+    $rebootNeeded = $false
+
+    $containers = Get-WindowsFeature -Name Containers -ErrorAction SilentlyContinue
+    if ($containers -and -not $containers.Installed) {
+        Write-Host '  installing Containers feature ...'
+        $result = Install-WindowsFeature -Name Containers -ErrorAction Stop
+        Write-Ok 'Containers feature installed'
+        if ($result.RestartNeeded -ne 'No') { $rebootNeeded = $true }
+    }
+    elseif ($containers) {
+        Write-Skip 'Containers feature already installed'
+    }
+
+    # Hyper-V is only needed for Hyper-V isolated containers. Process isolation
+    # is the default and is faster; enable Hyper-V only if you need isolation
+    # or a base image whose kernel does not match the host.
+    $hyperv = Get-WindowsFeature -Name Hyper-V -ErrorAction SilentlyContinue
+    if ($hyperv -and -not $hyperv.Installed) {
+        Write-Skip 'Hyper-V not installed (process isolation is used by default)'
+    }
+
+    if ($rebootNeeded) {
+        if ($SkipReboot) {
+            Write-Warn 'REBOOT REQUIRED. Re-run this script after rebooting.'
+            exit 0
+        }
+        Write-Warn 'Rebooting in 15 seconds. Re-run this script after the reboot to continue.'
+        Start-Sleep -Seconds 15
+        Restart-Computer -Force
+        exit 0
+    }
+}
+
+function Install-Chocolatey {
+    Write-Step 'Chocolatey'
+    if (Test-CommandExists 'choco') {
+        Write-Skip "already installed ($(choco --version))"
+        return
+    }
+    Set-ExecutionPolicy Bypass -Scope Process -Force
+    [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+    Invoke-Expression ((New-Object Net.WebClient).DownloadString('https://community.chocolatey.org/install.ps1'))
+    $env:Path = [Environment]::GetEnvironmentVariable('Path', 'Machine') + ';' +
+                [Environment]::GetEnvironmentVariable('Path', 'User')
+    Write-Ok 'Chocolatey installed'
+}
+
+function Install-ChocoPackages {
+    Write-Step 'Tooling (git, AWS CLI v2, JDK 17, 7zip)'
+    $packages = @(
+        @{ Name = 'git';            Probe = 'git' },
+        @{ Name = 'awscli';         Probe = 'aws' },
+        @{ Name = $Config.JdkPackage; Probe = 'java' },
+        @{ Name = '7zip';           Probe = $null }
+    )
+    foreach ($pkg in $packages) {
+        if ($pkg.Probe -and (Test-CommandExists $pkg.Probe)) {
+            Write-Skip "$($pkg.Name) already present"
+            continue
+        }
+        Write-Host "  choco install $($pkg.Name) ..."
+        & choco install $pkg.Name -y --no-progress --limit-output | Out-Null
+        if ($LASTEXITCODE -notin @(0, 3010, 1641)) {
+            throw "choco install $($pkg.Name) failed (exit $LASTEXITCODE)"
+        }
+        Write-Ok "$($pkg.Name) installed"
+    }
+    $env:Path = [Environment]::GetEnvironmentVariable('Path', 'Machine') + ';' +
+                [Environment]::GetEnvironmentVariable('Path', 'User')
+}
+
+function Install-ContainerRuntime {
+    Write-Step 'Mirantis Container Runtime'
+    if (Test-CommandExists 'docker') {
+        Write-Skip "docker already present ($(docker --version))"
+        return
+    }
+
+    # Docker CE has no Windows Server build. MCR (built on CNCF Moby) is the
+    # supported runtime for Windows Server containers.
+    Write-Warn 'MCR is a licensed Mirantis product. Confirm entitlement before production use.'
+    $installer = Join-Path $env:TEMP 'mcr-install.ps1'
+    Write-Host "  downloading $($Config.McrInstallUrl) ..."
+    Invoke-Download -Uri $Config.McrInstallUrl -OutFile $installer
+
+    Write-Host '  running MCR installer (this can take several minutes) ...'
+    & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $installer
+    if ($LASTEXITCODE -ne 0) {
+        Write-Fail "MCR installer exited with $LASTEXITCODE"
+        Write-Warn 'Alternative: containerd + nerdctl, or the Windows Admin Center Containers extension.'
+        throw 'Container runtime installation failed.'
+    }
+    Remove-Item $installer -Force -ErrorAction SilentlyContinue
+
+    Start-Service docker -ErrorAction SilentlyContinue
+    Set-Service  docker -StartupType Automatic
+    Write-Ok "runtime installed: $(docker --version)"
+}
+
+function Install-SqlClientTools {
+    Write-Step 'SQL Server client tools (ODBC Driver 18 + sqlcmd)'
+
+    # The OE reads its DB through an ODBC DSN (ServerConfiguration.ini DSN=,
+    # FbDBConfig.xml <DSN>). The driver is needed in the container IMAGE; it is
+    # installed on the host too so the pipeline can probe DB reachability.
+    $driverInstalled = $false
+    try {
+        $driverInstalled = [bool](Get-OdbcDriver -Name 'ODBC Driver 18 for SQL Server' -ErrorAction SilentlyContinue)
+    } catch { $driverInstalled = $false }
+
+    if ($driverInstalled) {
+        Write-Skip 'ODBC Driver 18 already installed'
+    } else {
+        Install-MsiFromUrl -Uri $Config.OdbcUrl -FileName 'msodbcsql18.msi' `
+            -DisplayName 'ODBC Driver 18 for SQL Server' -ExtraArgs @('IACCEPTMSODBCSQLLICENSETERMS=YES')
+    }
+
+    if (Test-CommandExists 'sqlcmd') {
+        Write-Skip 'sqlcmd already present'
+    } else {
+        Install-MsiFromUrl -Uri $Config.MsSqlToolsUrl -FileName 'mssql-tools18.msi' `
+            -DisplayName 'mssql-tools18 (sqlcmd)' -ExtraArgs @('IACCEPTMSSQLTOOLSLICENSETERMS=YES')
+        $toolsBin = 'C:\Program Files\Microsoft SQL Server\Client SDK\ODBC\180\Tools\Binn'
+        if (Test-Path $toolsBin) {
+            $machinePath = [Environment]::GetEnvironmentVariable('Path', 'Machine')
+            if ($machinePath -notlike "*$toolsBin*") {
+                [Environment]::SetEnvironmentVariable('Path', "$machinePath;$toolsBin", 'Machine')
+                Write-Ok 'sqlcmd added to system PATH'
+            }
+        }
+    }
+}
+
+function Install-HnsModule {
+    Write-Step 'HNS PowerShell module'
+    if (Get-Module -ListAvailable -Name HostNetworkingService -ErrorAction SilentlyContinue) {
+        Write-Skip 'HostNetworkingService module already available'
+        return
+    }
+    try {
+        if (-not (Get-PackageProvider -Name NuGet -ErrorAction SilentlyContinue)) {
+            Install-PackageProvider -Name NuGet -Force -Scope AllUsers | Out-Null
+        }
+        Set-PSRepository -Name PSGallery -InstallationPolicy Trusted -ErrorAction SilentlyContinue
+        Install-Module -Name HostNetworkingService -Force -Scope AllUsers -AllowClobber
+        Write-Ok 'HostNetworkingService module installed'
+    } catch {
+        Write-Warn "could not install HNS module: $($_.Exception.Message)"
+        Write-Warn 'Not fatal — docker network commands still work. The module only helps with HNS troubleshooting.'
+    }
+}
+
+function Get-AdapterForSubnet {
+    param([string]$Cidr)
+
+    # Match a physical adapter carrying an address inside $Cidr.
+    $network = $Cidr.Split('/')[0]
+    $prefix  = [int]$Cidr.Split('/')[1]
+    $octets  = $network.Split('.')
+    $wanted  = ($octets[0..2] -join '.')   # /24 assumption, matching the design
+
+    if ($prefix -ne 24) {
+        Write-Warn "adapter matching assumes /24; got /$prefix for $Cidr"
+    }
+
+    $candidates = Get-NetIPAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue |
+        Where-Object { $_.IPAddress -like "$wanted.*" -and $_.InterfaceAlias -notlike 'vEthernet*' -and $_.InterfaceAlias -ne 'Loopback Pseudo-Interface 1' }
+
+    if (-not $candidates) { return $null }
+    return ($candidates | Select-Object -First 1)
+}
+
+function New-L2BridgeNetwork {
+    param(
+        [string]$Name,
+        [string]$Subnet,
+        [string]$Gateway,
+        [string[]]$PlannedIPs
+    )
+
+    $existing = & docker network ls --filter "name=^$Name$" --format '{{.Name}}' 2>$null
+    if ($existing -eq $Name) {
+        Write-Skip "network '$Name' already exists"
+        return
+    }
+
+    $adapter = Get-AdapterForSubnet -Cidr $Subnet
+    if (-not $adapter) {
+        Write-Warn "no adapter found carrying an address in $Subnet — skipping '$Name'"
+        Write-Warn 'Check that the secondary ENI is attached AND the OS has an IP on it:'
+        Write-Warn '  Get-NetIPAddress -AddressFamily IPv4 | Format-Table IPAddress,InterfaceAlias'
+        return
+    }
+    Write-Host "  $Subnet is on adapter '$($adapter.InterfaceAlias)' ($($adapter.IPAddress))"
+
+    # l2bridge: containers get IPs from the host subnet, MACs rewritten to the
+    # host NIC's MAC — required on EC2, which filters foreign MACs.
+    # NOTE: do not name this $args — that is a PowerShell automatic variable.
+    $dockerArgs = @(
+        'network', 'create',
+        '--driver', 'l2bridge',
+        '--subnet', $Subnet,
+        '--gateway', $Gateway,
+        '-o', "com.docker.network.windowsshim.interface=$($adapter.InterfaceAlias)",
+        '-o', "com.docker.network.windowsshim.networkname=$Name",
+        $Name
+    )
+    Write-Host "  docker $($dockerArgs -join ' ')"
+    & docker @dockerArgs | Out-Null
+    if ($LASTEXITCODE -ne 0) {
+        Write-Fail "failed to create network '$Name'"
+        Write-Warn 'l2bridge on EC2 is open item #1 in the architecture doc. Capture the error and spike it before proceeding.'
+        return
+    }
+    Write-Ok "network '$Name' created ($Subnet via $($adapter.InterfaceAlias))"
+    Write-Host "         planned container IPs: $($PlannedIPs -join ', ')"
+}
+
+function Initialize-DockerNetworks {
+    Write-Step 'Docker networks (l2bridge, prod-exact IPs)'
+    if ($SkipNetworks) {
+        Write-Skip 'skipped by -SkipNetworks'
+        return
+    }
+    if (-not $Plan) {
+        Write-Skip 'no flow plan — nothing to create'
+        return
+    }
+    foreach ($network in $Plan.networks) {
+        New-L2BridgeNetwork -Name $network.dockerNetwork -Subnet $network.subnetCidr `
+            -Gateway $network.gateway -PlannedIPs $network.containerIps
+    }
+}
+
+function Get-BaseImages {
+    Write-Step "Base image: $($Config.BaseImage)"
+    $present = & docker images --format '{{.Repository}}:{{.Tag}}' 2>$null | Where-Object { $_ -eq $Config.BaseImage }
+    if ($present) {
+        Write-Skip 'base image already pulled'
+        return
+    }
+    Write-Host '  pulling (multi-GB, expect several minutes) ...'
+    & docker pull $Config.BaseImage
+    if ($LASTEXITCODE -ne 0) { throw "docker pull $($Config.BaseImage) failed" }
+    Write-Ok 'base image pulled'
+}
+
+function Initialize-Directories {
+    Write-Step 'Working directories'
+    $dirs = @(
+        $Config.WorkRoot,
+        (Join-Path $Config.WorkRoot 'configs'),
+        (Join-Path $Config.WorkRoot 'logs'),
+        (Join-Path $Config.WorkRoot 'messages'),
+        (Join-Path $Config.WorkRoot 'artifacts')
+    )
+    foreach ($dir in $dirs) {
+        if (Test-Path $dir) { Write-Skip $dir }
+        else { New-Item -ItemType Directory -Path $dir -Force | Out-Null; Write-Ok $dir }
+    }
+}
+
+function Test-Prerequisites {
+    Write-Step 'Verification'
+    $failures = @()
+
+    $checks = @(
+        @{ Label = 'docker';  Script = { docker --version } },
+        @{ Label = 'git';     Script = { git --version } },
+        @{ Label = 'aws';     Script = { aws --version } },
+        @{ Label = 'java';    Script = { java -version 2>&1 | Select-Object -First 1 } },
+        @{ Label = 'sqlcmd';  Script = { sqlcmd -? 2>&1 | Select-Object -First 1 } }
+    )
+    foreach ($check in $checks) {
+        try {
+            $out = & $check.Script 2>&1 | Out-String
+            Write-Ok "$($check.Label): $($out.Trim() -split "`n" | Select-Object -First 1)"
+        } catch {
+            Write-Fail "$($check.Label) not working"
+            $failures += $check.Label
+        }
+    }
+
+    try {
+        $svc = Get-Service docker -ErrorAction Stop
+        if ($svc.Status -eq 'Running') { Write-Ok 'docker service running' }
+        else { Write-Fail "docker service is $($svc.Status)"; $failures += 'docker service' }
+    } catch { Write-Fail 'docker service not found'; $failures += 'docker service' }
+
+    Write-Host "`n  Docker networks:"
+    & docker network ls 2>$null | ForEach-Object { Write-Host "    $_" }
+
+    Write-Host "`n  IPv4 addresses on this host:"
+    Get-NetIPAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue |
+        Where-Object { $_.IPAddress -ne '127.0.0.1' } |
+        Sort-Object InterfaceAlias |
+        ForEach-Object { Write-Host ("    {0,-18} {1}" -f $_.IPAddress, $_.InterfaceAlias) }
+
+    if ($Plan -and $Plan.peers -and $Plan.peers.Count -gt 0) {
+        Write-Host "`n  Cross-host reachability (peers from the flow plan):"
+        foreach ($target in $Plan.peers) {
+            if (Test-Connection -ComputerName $target -Count 1 -Quiet -ErrorAction SilentlyContinue) {
+                Write-Ok "$target reachable"
+            } else {
+                Write-Warn "$target unreachable (expected until the other host has bootstrapped)"
+            }
+        }
+    }
+
+    if ($failures.Count -gt 0) {
+        Write-Host ''
+        Write-Fail "incomplete: $($failures -join ', ')"
+        exit 1
+    }
+    Write-Host ''
+    Write-Ok 'All Windows host prerequisites satisfied.'
+}
+
+# ───────────────────────────── main ─────────────────────────────
+
+try {
+    Write-Host ''
+    Write-Host '  VCVW Flow — Windows container host prerequisites' -ForegroundColor White
+    Write-Host '  ------------------------------------------------' -ForegroundColor DarkGray
+
+    Assert-Administrator
+    Assert-SupportedOs
+    Import-FlowPlan
+
+    Enable-ContainerFeatures
+    Install-Chocolatey
+    Install-ChocoPackages
+    Install-ContainerRuntime
+    Install-SqlClientTools
+    Install-HnsModule
+    Initialize-Directories
+    Get-BaseImages
+    Initialize-DockerNetworks
+    Test-Prerequisites
+
+    # Print next steps using values from the plan, so this script carries no
+    # environment-specific addresses of its own.
+    $img = $Config.BaseImage
+    $exampleNet = if ($Plan -and $Plan.networks) { $Plan.networks[0].dockerNetwork } else { '<network>' }
+    $exampleIp  = if ($Plan -and $Plan.networks -and $Plan.networks[0].containerIps) { $Plan.networks[0].containerIps[0] } else { '<ip>' }
+    $sharedGroup = if ($Plan) { $Plan.groups | Where-Object { $_.sharedNamespace } | Select-Object -First 1 } else { $null }
+
+    Write-Host "`nNext steps" -ForegroundColor Gray
+    Write-Host @"
+  1. Verify l2bridge honours a static IP before building anything:
+       docker run --rm -it --network $exampleNet --ip $exampleIp ``
+         $img cmd /c ipconfig
+"@ -ForegroundColor Gray
+
+    if ($sharedGroup) {
+        Write-Host @"
+  2. Verify shared network namespaces work for Windows containers. This decides
+     whether co-located services share one address via a namespace holder, or
+     collapse into a single container with a supervisor entrypoint:
+       docker run -d --name $($sharedGroup.namespaceContainer) ``
+         --network $($sharedGroup.dockerNetwork) --ip $($sharedGroup.ip) ``
+         $img cmd /c "ping -t 127.0.0.1"
+       docker run --rm --network container:$($sharedGroup.namespaceContainer) ``
+         $img cmd /c ipconfig
+     Affected group: $($sharedGroup.prodHost) -> $(($sharedGroup.services | ForEach-Object { $_.serviceName }) -join ', ')
+"@ -ForegroundColor Gray
+    }
+
+    Write-Host @'
+  3. Register this host as a Jenkins agent (JDK 17 is installed).
+  4. Build the engine images for the tags named in the plan.
+
+'@ -ForegroundColor Gray
+}
+catch {
+    Write-Host ''
+    Write-Fail $_.Exception.Message
+    Write-Host $_.ScriptStackTrace -ForegroundColor DarkGray
+    exit 1
+}
