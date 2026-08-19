@@ -174,6 +174,58 @@ install_base_packages() {
   fi
 }
 
+install_ssm_agent() {
+  step "AWS SSM Agent"
+  # AlmaLinux AMIs do NOT ship the SSM Agent — unlike Amazon Linux and the AWS
+  # Windows AMIs. Without it, `aws ssm start-session` fails with
+  # "TargetNotConnected" no matter how correct the instance profile is, and the
+  # host is unreachable if no key pair was set. Install it early, before the long
+  # docker install, so access is available as soon as possible.
+  if systemctl is-active --quiet amazon-ssm-agent 2>/dev/null; then
+    skip "amazon-ssm-agent already running"
+    return
+  fi
+
+  # Region from IMDSv2, falling back to us-east-1.
+  local token region url
+  token="$(curl -sS -X PUT 'http://169.254.169.254/latest/api/token' \
+            -H 'X-aws-ec2-metadata-token-ttl-seconds: 60' --max-time 5 2>/dev/null || true)"
+  if [[ -n "$token" ]]; then
+    region="$(curl -sS -H "X-aws-ec2-metadata-token: $token" --max-time 5 \
+              'http://169.254.169.254/latest/meta-data/placement/region' 2>/dev/null || true)"
+  fi
+  region="${region:-us-east-1}"
+  ok "region $region"
+
+  url="https://s3.${region}.amazonaws.com/amazon-ssm-${region}/latest/linux_amd64/amazon-ssm-agent.rpm"
+  printf '  installing from %s\n' "$url"
+  if dnf install -y "$url" >/dev/null 2>&1; then
+    ok "amazon-ssm-agent installed"
+  else
+    warn "install from the regional bucket failed; trying the global bucket"
+    if dnf install -y \
+        "https://s3.amazonaws.com/ec2-downloads-windows/SSMAgent/latest/linux_amd64/amazon-ssm-agent.rpm" \
+        >/dev/null 2>&1; then
+      ok "amazon-ssm-agent installed (global bucket)"
+    else
+      warn "could not install the SSM Agent - Session Manager will not work on this host"
+      warn "you will need a key pair for SSH access instead"
+      return
+    fi
+  fi
+
+  systemctl enable --now amazon-ssm-agent >/dev/null 2>&1 || true
+  sleep 3
+  if systemctl is-active --quiet amazon-ssm-agent; then
+    ok "amazon-ssm-agent running"
+    printf '%b    Registration also needs an instance profile with AmazonSSMManagedInstanceCore\n' "$C_GREY"
+    printf '    and outbound 443. Confirm from your workstation with:\n'
+    printf '      aws ssm describe-instance-information --query "InstanceInformationList[].InstanceId"%b\n' "$C_OFF"
+  else
+    warn "amazon-ssm-agent installed but not active: journalctl -u amazon-ssm-agent -n 50"
+  fi
+}
+
 install_docker() {
   step "Docker CE"
   if command -v docker &>/dev/null; then
@@ -466,6 +518,13 @@ verify() {
   printf '\n  IPv4 addresses on this host:\n'
   ip -br -4 addr show scope global | sed 's/^/    /'
 
+  printf '\n  Remote access:\n'
+  if systemctl is-active --quiet amazon-ssm-agent 2>/dev/null; then
+    ok "amazon-ssm-agent active (Session Manager should work)"
+  else
+    warn "amazon-ssm-agent NOT active - Session Manager will report TargetNotConnected"
+  fi
+
   printf '\n  Kernel settings:\n'
   printf '    ip_forward = %s\n' "$(cat /proc/sys/net/ipv4/ip_forward)"
   printf '    rp_filter  = %s (2 = loose, required)\n' "$(cat /proc/sys/net/ipv4/conf/all/rp_filter)"
@@ -542,6 +601,7 @@ main() {
 
   install_base_packages   # provides jq, needed by load_flow_plan
   load_flow_plan
+  install_ssm_agent       # early: restores access if no key pair was set
   install_docker
   install_awscli
   install_java
