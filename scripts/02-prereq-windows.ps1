@@ -7,11 +7,11 @@
     Prepares a Windows Server 2022 EC2 instance to host Windows containers whose
     addresses are dictated by a plan file (see -PlanFile). This script is
     deliberately generic: it declares no addresses, hostnames or workloads of its
-    own — everything comes from the plan.
+    own - everything comes from the plan.
 
     Installs, in order:
         Containers feature (+ optional Hyper-V for isolated containers)
-        Mirantis Container Runtime (MCR) — the supported Docker runtime on
+        Mirantis Container Runtime (MCR) - the supported Docker runtime on
           Windows Server; Docker CE is not available for Windows Server
         Chocolatey, git, AWS CLI v2, OpenJDK 17 (Jenkins agent)
         Microsoft ODBC Driver 18 for SQL Server + sqlcmd (mssql-tools18)
@@ -26,7 +26,7 @@
 
 .PARAMETER PlanFile
     Path to the flow-plan-windows.json produced by generator/generate_cfn.py.
-    Nothing about the flow is hardcoded in this script — networks, container
+    Nothing about the flow is hardcoded in this script - networks, container
     addresses and peers all come from the plan. Instance UserData passes this in
     automatically; supply it by hand only when re-running manually.
 
@@ -40,7 +40,7 @@
 .NOTES
     Run in an elevated PowerShell session.
     CloudFormation now creates the ENIs, assigns the exact production addresses
-    as secondary private IPs, and disables source/dest check — so no AWS-side
+    as secondary private IPs, and disables source/dest check - so no AWS-side
     preparation is needed here.
     Expect ONE reboot: re-run the script after it, it is idempotent and will
     continue where it left off. Instance UserData uses <persist>true</persist>,
@@ -57,7 +57,7 @@ param(
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 
-# ───────────────────────────── configuration ─────────────────────────────
+# ----------------------------- configuration -----------------------------
 
 # Host-level constants only. Everything flow-specific comes from $PlanFile.
 $script:Config = @{
@@ -84,7 +84,7 @@ function Import-FlowPlan {
     }
 
     if (-not $PlanFile -or -not (Test-Path $PlanFile)) {
-        Write-Warn 'no flow plan found — installing tooling only, skipping Docker networks'
+        Write-Warn 'no flow plan found - installing tooling only, skipping Docker networks'
         Write-Warn 'Generate one with: python3 generator/generate_cfn.py --flow <FLOW> ...'
         $script:Plan = $null
         return
@@ -109,7 +109,7 @@ function Import-FlowPlan {
     }
 }
 
-# ───────────────────────────── helpers ─────────────────────────────
+# ----------------------------- helpers -----------------------------
 
 function Write-Step { param([string]$Message) Write-Host "`n=== $Message ===" -ForegroundColor Cyan }
 function Write-Ok   { param([string]$Message) Write-Host "  [ok]   $Message" -ForegroundColor Green }
@@ -135,7 +135,7 @@ function Assert-SupportedOs {
         throw "Build $($os.BuildNumber) is too old. Windows Server 2019 (17763) or later is required."
     }
     if ([int]$os.BuildNumber -lt 20348) {
-        Write-Warn "Not Server 2022 (20348). Change BaseImage to servercore:ltsc2019 — Windows container images must match the host kernel."
+        Write-Warn "Not Server 2022 (20348). Change BaseImage to servercore:ltsc2019 - Windows container images must match the host kernel."
     }
 }
 
@@ -171,7 +171,69 @@ function Install-MsiFromUrl {
     Write-Ok "$DisplayName installed"
 }
 
-# ───────────────────────────── steps ─────────────────────────────
+# ----------------------------- steps -----------------------------
+
+function Set-ProdNicRoutePriority {
+    Write-Step 'Route priority (keep egress on the management NIC)'
+
+    # DEFENSIVE, not corrective. Measured on a real host (2026-08-17): Windows
+    # kept one default route via the management NIC and egress worked, so a
+    # blackhole route was NOT what broke bootstrap or SSM registration - that was
+    # transient network readiness at boot.
+    #
+    # Retained as cheap insurance, because the failure mode would be silent and
+    # confusing if it ever occurred: every VPC subnet offers its .1 as a gateway
+    # over DHCP, and the prod-mirroring subnets have no 0.0.0.0/0 route by design.
+    # This function is a no-op on a correctly-routed host. It also serves as a
+    # diagnostic: it prints the live default routes and tests egress.
+    if (-not $Plan) {
+        Write-Skip 'no flow plan - cannot identify prod NICs'
+        return
+    }
+
+    $changed = 0
+    foreach ($network in $Plan.networks) {
+        $prefix = ($network.subnetCidr -split '/')[0] -replace '\.\d+$', '.'
+        $addresses = Get-NetIPAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue |
+                     Where-Object { $_.IPAddress -like "$prefix*" }
+        if (-not $addresses) {
+            Write-Warn "no NIC found in $($network.subnetCidr) yet"
+            continue
+        }
+        foreach ($address in $addresses) {
+            $idx = $address.InterfaceIndex
+            # A high interface metric persists across DHCP renewals and reboots, so
+            # any default route re-added later still loses to the management NIC.
+            Set-NetIPInterface -InterfaceIndex $idx -InterfaceMetric 9000 -ErrorAction SilentlyContinue
+            $stale = Get-NetRoute -InterfaceIndex $idx -DestinationPrefix '0.0.0.0/0' -ErrorAction SilentlyContinue
+            if ($stale) {
+                $stale | Remove-NetRoute -Confirm:$false -ErrorAction SilentlyContinue
+                Write-Ok "removed default route on ifIndex $idx ($($address.IPAddress))"
+                $changed++
+            } else {
+                Write-Skip "ifIndex $idx ($($address.IPAddress)) has no default route"
+            }
+        }
+    }
+
+    Write-Host '  default route(s) now:'
+    Get-NetRoute -DestinationPrefix '0.0.0.0/0' -ErrorAction SilentlyContinue |
+        Sort-Object RouteMetric |
+        ForEach-Object { Write-Host ("    ifIndex {0,-4} via {1,-15} metric {2}" -f $_.InterfaceIndex, $_.NextHop, $_.RouteMetric) }
+
+    try {
+        Invoke-WebRequest -Uri 'https://api.github.com' -UseBasicParsing -TimeoutSec 10 | Out-Null
+        Write-Ok 'internet egress works'
+    } catch {
+        Write-Fail "no internet egress: $($_.Exception.Message)"
+        Write-Warn 'The SSM Agent will not register and image pulls will fail until this is fixed.'
+    }
+
+    if ($changed -gt 0) {
+        Write-Warn 'Removed blackhole default route(s). If the SSM Agent was already running it may take'
+        Write-Warn 'a few minutes to register; restart it to speed that up:  Restart-Service AmazonSSMAgent'
+    }
+}
 
 function Enable-ContainerFeatures {
     Write-Step 'Windows container features'
@@ -323,7 +385,7 @@ function Install-HnsModule {
         Write-Ok 'HostNetworkingService module installed'
     } catch {
         Write-Warn "could not install HNS module: $($_.Exception.Message)"
-        Write-Warn 'Not fatal — docker network commands still work. The module only helps with HNS troubleshooting.'
+        Write-Warn 'Not fatal - docker network commands still work. The module only helps with HNS troubleshooting.'
     }
 }
 
@@ -363,7 +425,7 @@ function New-L2BridgeNetwork {
 
     $adapter = Get-AdapterForSubnet -Cidr $Subnet
     if (-not $adapter) {
-        Write-Warn "no adapter found carrying an address in $Subnet — skipping '$Name'"
+        Write-Warn "no adapter found carrying an address in $Subnet - skipping '$Name'"
         Write-Warn 'Check that the secondary ENI is attached AND the OS has an IP on it:'
         Write-Warn '  Get-NetIPAddress -AddressFamily IPv4 | Format-Table IPAddress,InterfaceAlias'
         return
@@ -371,8 +433,8 @@ function New-L2BridgeNetwork {
     Write-Host "  $Subnet is on adapter '$($adapter.InterfaceAlias)' ($($adapter.IPAddress))"
 
     # l2bridge: containers get IPs from the host subnet, MACs rewritten to the
-    # host NIC's MAC — required on EC2, which filters foreign MACs.
-    # NOTE: do not name this $args — that is a PowerShell automatic variable.
+    # host NIC's MAC - required on EC2, which filters foreign MACs.
+    # NOTE: do not name this $args - that is a PowerShell automatic variable.
     $dockerArgs = @(
         'network', 'create',
         '--driver', 'l2bridge',
@@ -400,7 +462,7 @@ function Initialize-DockerNetworks {
         return
     }
     if (-not $Plan) {
-        Write-Skip 'no flow plan — nothing to create'
+        Write-Skip 'no flow plan - nothing to create'
         return
     }
     foreach ($network in $Plan.networks) {
@@ -493,16 +555,17 @@ function Test-Prerequisites {
     Write-Ok 'All Windows host prerequisites satisfied.'
 }
 
-# ───────────────────────────── main ─────────────────────────────
+# ----------------------------- main -----------------------------
 
 try {
     Write-Host ''
-    Write-Host '  VCVW Flow — Windows container host prerequisites' -ForegroundColor White
+    Write-Host '  VCVW Flow - Windows container host prerequisites' -ForegroundColor White
     Write-Host '  ------------------------------------------------' -ForegroundColor DarkGray
 
     Assert-Administrator
     Assert-SupportedOs
     Import-FlowPlan
+    Set-ProdNicRoutePriority   # must precede anything that needs the network
 
     Enable-ContainerFeatures
     Install-Chocolatey

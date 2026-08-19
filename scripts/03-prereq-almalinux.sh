@@ -174,6 +174,53 @@ install_base_packages() {
   fi
 }
 
+configure_route_priority() {
+  step "Route priority (keep egress on the management NIC)"
+
+  # Every VPC subnet offers its .1 as a default gateway over DHCP, so a
+  # multi-homed instance gets one default route PER NIC. The prod-mirroring
+  # subnets have NO 0.0.0.0/0 route by design, so if one of those NICs wins the
+  # default route, all outbound traffic is blackholed - breaking both the GitHub
+  # fetch and SSM Agent registration. On-link /24 routes are left alone, so
+  # container traffic still leaves on the correct NIC.
+  if [[ "$PLAN_LOADED" -ne 1 ]]; then
+    skip "no flow plan - cannot identify prod NICs"
+    return
+  fi
+
+  local i iface changed=0
+  for i in "${!NET_SUBNETS[@]}"; do
+    iface="$(find_interface_for_subnet "${NET_SUBNETS[$i]}")"
+    if [[ -z "$iface" ]]; then
+      warn "no NIC found in ${NET_SUBNETS[$i]} yet"
+      continue
+    fi
+    if ip route show default dev "$iface" 2>/dev/null | grep -q .; then
+      ip route del default dev "$iface" 2>/dev/null && {
+        ok "removed default route on $iface (${NET_SUBNETS[$i]})"; changed=1; }
+    else
+      skip "$iface (${NET_SUBNETS[$i]}) has no default route"
+    fi
+    # Raise the metric so a route re-added by DHCP still loses to eth0.
+    ip route replace default dev "$iface" metric 9000 2>/dev/null || true
+    ip route del default dev "$iface" metric 9000 2>/dev/null || true
+  done
+
+  printf '  default route(s) now:\n'
+  ip route show default | sed 's/^/    /'
+
+  if curl -fsS --max-time 10 -o /dev/null https://api.github.com; then
+    ok "internet egress works"
+  else
+    fail "no internet egress - SSM registration and image pulls will fail"
+  fi
+
+  if [[ "$changed" -eq 1 ]] && systemctl is-active --quiet amazon-ssm-agent 2>/dev/null; then
+    warn "restarting amazon-ssm-agent so it re-registers now rather than after a backoff"
+    systemctl restart amazon-ssm-agent || true
+  fi
+}
+
 install_ssm_agent() {
   step "AWS SSM Agent"
   # AlmaLinux AMIs do NOT ship the SSM Agent — unlike Amazon Linux and the AWS
@@ -601,6 +648,7 @@ main() {
 
   install_base_packages   # provides jq, needed by load_flow_plan
   load_flow_plan
+  configure_route_priority # must precede anything that needs the network
   install_ssm_agent       # early: restores access if no key pair was set
   install_docker
   install_awscli
