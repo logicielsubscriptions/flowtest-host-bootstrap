@@ -276,21 +276,52 @@ function Install-Chocolatey {
         Write-Skip "already installed ($(choco --version))"
         return
     }
-    Set-ExecutionPolicy Bypass -Scope Process -Force
-    [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-    Invoke-Expression ((New-Object Net.WebClient).DownloadString('https://community.chocolatey.org/install.ps1'))
-    $env:Path = [Environment]::GetEnvironmentVariable('Path', 'Machine') + ';' +
-                [Environment]::GetEnvironmentVariable('Path', 'User')
-    Write-Ok 'Chocolatey installed'
+    # Optional: only used for convenience tooling, never for the container runtime.
+    try {
+        Set-ExecutionPolicy Bypass -Scope Process -Force
+        [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+        Invoke-Expression ((New-Object Net.WebClient).DownloadString('https://community.chocolatey.org/install.ps1'))
+        $env:Path = [Environment]::GetEnvironmentVariable('Path', 'Machine') + ';' +
+                    [Environment]::GetEnvironmentVariable('Path', 'User')
+        $env:ChocolateyInstall = [Environment]::GetEnvironmentVariable('ChocolateyInstall', 'Machine')
+        Write-Ok 'Chocolatey installed'
+    } catch {
+        Write-Warn "Chocolatey install failed: $($_.Exception.Message)"
+        Write-Warn 'Continuing - it is only needed for optional tooling.'
+    }
 }
 
 function Install-ChocoPackages {
-    Write-Step 'Tooling (git, AWS CLI v2, JDK 17, 7zip)'
+    Write-Step 'Optional tooling (git, AWS CLI, JDK 17, 7zip)'
+
+    # NONE of these are required to run containers, which is the whole point of
+    # this host. They are conveniences:
+    #   git    - not used at all; bootstrap fetches a tarball, and configs are
+    #            materialised by the coordinator, not here
+    #   aws    - only for S3 archive pulls (pipeline stages 5/10). AWS-provided
+    #            Windows AMIs already ship the AWS CLI and AWS Tools for PowerShell
+    #   java   - only if this host is ever used as a Jenkins agent
+    #   7zip   - superseded by the built-in tar.exe
+    # So a failure here must NEVER stop the run. Previously this threw on any
+    # non-zero exit and piped choco's output to Out-Null, which turned a
+    # cosmetic problem into a hard stop with no diagnostic. Both fixed.
+    #
+    # Chocolatey also sets ChocolateyInstall as a MACHINE variable, so a freshly
+    # installed choco needs it copied into this process before it behaves.
+    if (-not $env:ChocolateyInstall) {
+        $env:ChocolateyInstall = [Environment]::GetEnvironmentVariable('ChocolateyInstall', 'Machine')
+    }
+
+    if (-not (Test-CommandExists 'choco')) {
+        Write-Warn 'choco not on PATH - skipping optional tooling entirely'
+        return
+    }
+
     $packages = @(
-        @{ Name = 'git';            Probe = 'git' },
-        @{ Name = 'awscli';         Probe = 'aws' },
+        @{ Name = 'git';              Probe = 'git' },
+        @{ Name = 'awscli';           Probe = 'aws' },
         @{ Name = $Config.JdkPackage; Probe = 'java' },
-        @{ Name = '7zip';           Probe = $null }
+        @{ Name = '7zip';             Probe = $null }
     )
     foreach ($pkg in $packages) {
         if ($pkg.Probe -and (Test-CommandExists $pkg.Probe)) {
@@ -298,11 +329,15 @@ function Install-ChocoPackages {
             continue
         }
         Write-Host "  choco install $($pkg.Name) ..."
-        & choco install $pkg.Name -y --no-progress --limit-output | Out-Null
-        if ($LASTEXITCODE -notin @(0, 3010, 1641)) {
-            throw "choco install $($pkg.Name) failed (exit $LASTEXITCODE)"
+        # Show the output: exit codes alone are not diagnostic (choco returns 4
+        # for several unrelated conditions).
+        & choco install $pkg.Name -y --no-progress 2>&1 | ForEach-Object { Write-Host "    $_" }
+        # 0 ok, 2 nothing to do, 350/1604/1641/3010 reboot-related
+        if ($LASTEXITCODE -in @(0, 2, 350, 1604, 1641, 3010)) {
+            Write-Ok "$($pkg.Name) installed (exit $LASTEXITCODE)"
+        } else {
+            Write-Warn "$($pkg.Name) did NOT install (exit $LASTEXITCODE) - continuing, it is optional"
         }
-        Write-Ok "$($pkg.Name) installed"
     }
     $env:Path = [Environment]::GetEnvironmentVariable('Path', 'Machine') + ';' +
                 [Environment]::GetEnvironmentVariable('Path', 'User')
@@ -337,7 +372,10 @@ function Install-ContainerRuntime {
 }
 
 function Install-SqlClientTools {
-    Write-Step 'SQL Server client tools (ODBC Driver 18 + sqlcmd)'
+    Write-Step 'SQL Server client tools (ODBC Driver 18 + sqlcmd) - optional'
+    # Needed by the OE containers' DB access (pipeline stages 5/10), NOT by the
+    # container runtime. Never fatal: a failure here must not block the runtime.
+    try {
 
     # The OE reads its DB through an ODBC DSN (ServerConfiguration.ini DSN=,
     # FbDBConfig.xml <DSN>). The driver is needed in the container IMAGE; it is
@@ -367,6 +405,10 @@ function Install-SqlClientTools {
                 Write-Ok 'sqlcmd added to system PATH'
             }
         }
+    }
+    } catch {
+        Write-Warn "SQL client tools not installed: $($_.Exception.Message)"
+        Write-Warn 'Continuing - only the DB stages need these.'
     }
 }
 
@@ -503,20 +545,26 @@ function Test-Prerequisites {
     Write-Step 'Verification'
     $failures = @()
 
+    # Only the container runtime is REQUIRED. Everything else is convenience
+    # tooling for later pipeline stages and must not fail this host.
     $checks = @(
-        @{ Label = 'docker';  Script = { docker --version } },
-        @{ Label = 'git';     Script = { git --version } },
-        @{ Label = 'aws';     Script = { aws --version } },
-        @{ Label = 'java';    Script = { java -version 2>&1 | Select-Object -First 1 } },
-        @{ Label = 'sqlcmd';  Script = { sqlcmd -? 2>&1 | Select-Object -First 1 } }
+        @{ Label = 'docker';  Required = $true;  Script = { docker --version } },
+        @{ Label = 'git';     Required = $false; Script = { git --version } },
+        @{ Label = 'aws';     Required = $false; Script = { aws --version } },
+        @{ Label = 'java';    Required = $false; Script = { java -version 2>&1 | Select-Object -First 1 } },
+        @{ Label = 'sqlcmd';  Required = $false; Script = { sqlcmd -? 2>&1 | Select-Object -First 1 } }
     )
     foreach ($check in $checks) {
         try {
             $out = & $check.Script 2>&1 | Out-String
             Write-Ok "$($check.Label): $($out.Trim() -split "`n" | Select-Object -First 1)"
         } catch {
-            Write-Fail "$($check.Label) not working"
-            $failures += $check.Label
+            if ($check.Required) {
+                Write-Fail "$($check.Label) not working (REQUIRED)"
+                $failures += $check.Label
+            } else {
+                Write-Warn "$($check.Label) not available (optional)"
+            }
         }
     }
 
