@@ -366,6 +366,26 @@ function Install-ContainerRuntime {
     }
     Remove-Item $installer -Force -ErrorAction SilentlyContinue
 
+    # The MCR installer extends the MACHINE PATH, which does not affect this
+    # already-running process. Without this refresh every later `docker` call
+    # fails with CommandNotFoundException even though the install succeeded.
+    $env:Path = [Environment]::GetEnvironmentVariable('Path', 'Machine') + ';' +
+                [Environment]::GetEnvironmentVariable('Path', 'User')
+    if (-not (Test-CommandExists 'docker')) {
+        $dockerDir = 'C:\Program Files\Docker'
+        if (Test-Path (Join-Path $dockerDir 'docker.exe')) {
+            $env:Path = "$env:Path;$dockerDir"
+            Write-Warn "docker not on the refreshed PATH; added $dockerDir for this session"
+        } else {
+            throw "MCR reported success but docker.exe was not found under $dockerDir"
+        }
+    }
+
+    # The installer usually registers the service; register it if it did not.
+    if (-not (Get-Service docker -ErrorAction SilentlyContinue)) {
+        Write-Host '  registering the docker service ...'
+        & 'C:\Program Files\Docker\dockerd.exe' --register-service
+    }
     Start-Service docker -ErrorAction SilentlyContinue
     Set-Service  docker -StartupType Automatic
     Write-Ok "runtime installed: $(docker --version)"

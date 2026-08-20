@@ -47,6 +47,9 @@ PLAN_FILE="${1:-/opt/flowtest/bootstrap/flow-plan-linux.json}"
 
 MSSQL_IMAGE="mcr.microsoft.com/mssql/server:2022-latest"
 ALMALINUX_BASE_IMAGE="almalinux:9"
+# Network probe image. almalinux:9 is minimal and ships NO iproute2 or iputils,
+# so "ip" and "ping" are absent - busybox in alpine provides both in ~5 MB.
+NET_PROBE_IMAGE="alpine:3"
 WORK_ROOT="/opt/flowtest"
 
 SKIP_NETWORKS="${SKIP_NETWORKS:-0}"
@@ -471,6 +474,57 @@ create_ipvlan_network() {
   fi
 }
 
+release_container_ips_from_host() {
+  step "Release container addresses from the host NICs"
+
+  # An ipvlan child CANNOT share an address with its parent interface. On AWS the
+  # OS may auto-configure every private IP assigned to an ENI - including the
+  # secondaries we reserved for containers - which silently steals the address.
+  #
+  # Observed 2026-08-17: the peer host successfully pinged this host's planned
+  # container addresses before any container existed, which means the OS itself
+  # had them configured on the ENI.
+  #
+  # Only the reserved hostPrimaryIp should remain on each NIC.
+  if [[ "$PLAN_LOADED" -ne 1 ]]; then
+    skip "no flow plan - cannot identify container addresses"
+    return
+  fi
+
+  local i iface ip released=0
+  for i in "${!NET_SUBNETS[@]}"; do
+    iface="$(find_interface_for_subnet "${NET_SUBNETS[$i]}")"
+    if [[ -z "$iface" ]]; then
+      warn "no NIC found in ${NET_SUBNETS[$i]}"
+      continue
+    fi
+    ok "$iface keeps host address ${NET_HOST_IPS[$i]}"
+    for ip in ${NET_CONTAINER_IPS[$i]//,/ }; do
+      if ip -4 addr show dev "$iface" 2>/dev/null | grep -qw "$ip"; then
+        if ip addr del "$ip/24" dev "$iface" 2>/dev/null; then
+          ok "released $ip from $iface (container will claim it)"
+          released=$((released+1))
+        else
+          fail "could not release $ip from $iface - the container will fail to start"
+        fi
+      else
+        skip "$ip not held by $iface"
+      fi
+    done
+  done
+
+  if [[ "$released" -gt 0 ]]; then
+    warn "NetworkManager or amazon-ec2-net-utils may re-add these on a DHCP renew or reboot."
+    warn "If containers later fail with 'address already in use', re-run this script."
+  fi
+
+  printf '  addresses now per prod NIC:\n'
+  for i in "${!NET_SUBNETS[@]}"; do
+    iface="$(find_interface_for_subnet "${NET_SUBNETS[$i]}")"
+    [[ -n "$iface" ]] && ip -br -4 addr show dev "$iface" | sed 's/^/    /'
+  done
+}
+
 initialize_networks() {
   step "Docker networks (ipvlan L2, prod-exact IPs)"
   if [[ "$SKIP_NETWORKS" == "1" ]]; then
@@ -495,7 +549,7 @@ pull_images() {
     return
   fi
   local image
-  for image in "$MSSQL_IMAGE" "$ALMALINUX_BASE_IMAGE"; do
+  for image in "$MSSQL_IMAGE" "$ALMALINUX_BASE_IMAGE" "$NET_PROBE_IMAGE"; do
     if docker image inspect "$image" &>/dev/null; then
       skip "$image already present"
     else
@@ -607,7 +661,9 @@ print_next_steps() {
 
   printf '\nNext steps\n'
   printf '  1. Smoke-test ipvlan with a static address:\n'
-  printf '       docker run --rm --network %s --ip %s %s ip -br addr\n\n' "$net" "$ip" "$ALMALINUX_BASE_IMAGE"
+  printf '       docker run --rm --network %s --ip %s %s ip addr\n' "$net" "$ip" "$NET_PROBE_IMAGE"
+  printf '     (uses %s, not %s: the AlmaLinux base image has no iproute2/iputils)\n\n' \
+    "$NET_PROBE_IMAGE" "$ALMALINUX_BASE_IMAGE"
 
   if [[ "$PLAN_LOADED" -eq 1 ]] && jq -e '.database' "$PLAN_FILE" >/dev/null 2>&1; then
     local db_ip db_net db_name db_count
@@ -659,6 +715,7 @@ main() {
   report_selinux
   initialize_directories
   pull_images
+  release_container_ips_from_host   # ipvlan children cannot share the parent's address
   initialize_networks
   verify
   print_next_steps
