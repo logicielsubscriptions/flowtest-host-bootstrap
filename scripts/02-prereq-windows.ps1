@@ -144,6 +144,87 @@ function Test-CommandExists {
     return [bool](Get-Command $Name -ErrorAction SilentlyContinue)
 }
 
+function Add-MachinePathEntry {
+    <#
+        Add a directory to the MACHINE PATH, persistently and idempotently, and
+        make it usable in this session too.
+
+        Three traps this avoids:
+
+        1. [Environment]::SetEnvironmentVariable('Path', ..., 'Machine') rewrites
+           the value as REG_SZ. The real machine PATH is REG_EXPAND_SZ and holds
+           entries like %SystemRoot%\system32 - converting it stops those
+           expanding and leaves the box with a subtly broken PATH. We write the
+           registry value directly and keep its original kind.
+
+        2. Substring matching. "*C:\Program Files\Docker*" also matches
+           "C:\Program Files\Docker Nested", so entries are compared one at a
+           time: trimmed, case-insensitive, ignoring a trailing backslash.
+
+        3. Reading the value with Get-ItemProperty EXPANDS it, so writing it back
+           would bake today's expansion in permanently. We read it raw.
+    #>
+    param(
+        [Parameter(Mandatory)] [string] $Directory,
+        [string] $Label = 'directory'
+    )
+
+    if (-not (Test-Path $Directory)) {
+        Write-Warn "$Label not added to PATH: $Directory does not exist"
+        return $false
+    }
+
+    $normalize = { param($p) $p.Trim().TrimEnd('\').ToLowerInvariant() }
+    $target = & $normalize $Directory
+
+    $key  = 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Environment'
+    $item = Get-Item -Path $key
+    $raw  = $item.GetValue('Path', '', [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
+    $kind = $item.GetValueKind('Path')
+
+    $entries = @($raw -split ';' | Where-Object { $_.Trim() -ne '' })
+    foreach ($entry in $entries) {
+        if ((& $normalize $entry) -eq $target) {
+            Write-Skip "$Label already on the machine PATH"
+            # Still make sure THIS session can see it.
+            if (($env:Path -split ';' | ForEach-Object { & $normalize $_ }) -notcontains $target) {
+                $env:Path = "$env:Path;$Directory"
+            }
+            return $false
+        }
+    }
+
+    $new = ($entries + $Directory) -join ';'
+    Set-ItemProperty -Path $key -Name 'Path' -Value $new -Type $kind
+    $env:Path = "$env:Path;$Directory"
+    Write-Ok "$Label added to the machine PATH: $Directory"
+    return $true
+}
+
+function Sync-ServiceEnvironment {
+    <#
+        A machine PATH change does not reach processes that are already running,
+        and that includes the SSM Agent service. Anything the pipeline later runs
+        through ssm send-command inherits the AGENT's environment, captured when
+        the agent started - so without this, docker is on the PATH for an
+        interactive session but NOT for a remote command. That half-working state
+        is far more confusing than a clean failure.
+
+        Restarting the agent makes it re-read the environment. A reboot does the
+        same, and this script asks for one anyway after enabling the container
+        features; this just means remote commands work before that reboot.
+    #>
+    $svc = Get-Service -Name 'AmazonSSMAgent' -ErrorAction SilentlyContinue
+    if (-not $svc) { Write-Skip 'SSM Agent not present; nothing to refresh'; return }
+    try {
+        Restart-Service -Name 'AmazonSSMAgent' -Force -ErrorAction Stop
+        Write-Ok 'SSM Agent restarted so remote commands inherit the new PATH'
+    } catch {
+        Write-Warn "could not restart the SSM Agent: $($_.Exception.Message)"
+        Write-Warn 'Remote commands may not see the new PATH until this host reboots.'
+    }
+}
+
 function Invoke-Download {
     param([string]$Uri, [string]$OutFile)
     [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
@@ -371,15 +452,23 @@ function Install-ContainerRuntime {
     # fails with CommandNotFoundException even though the install succeeded.
     $env:Path = [Environment]::GetEnvironmentVariable('Path', 'Machine') + ';' +
                 [Environment]::GetEnvironmentVariable('Path', 'User')
-    if (-not (Test-CommandExists 'docker')) {
-        $dockerDir = 'C:\Program Files\Docker'
-        if (Test-Path (Join-Path $dockerDir 'docker.exe')) {
-            $env:Path = "$env:Path;$dockerDir"
-            Write-Warn "docker not on the refreshed PATH; added $dockerDir for this session"
-        } else {
-            throw "MCR reported success but docker.exe was not found under $dockerDir"
-        }
+
+    # Persist docker.exe on the MACHINE PATH, not just for this session. The
+    # installer usually does this, but it did not on the first host we built:
+    # docker installed cleanly and every later call failed with
+    #   docker : The term 'docker' is not recognized
+    # A session-only fix hides that until the next boot or the next remote
+    # command, so make it permanent whether or not the installer managed it.
+    $dockerDir = 'C:\Program Files\Docker'
+    if (-not (Test-Path (Join-Path $dockerDir 'docker.exe'))) {
+        throw "MCR reported success but docker.exe was not found under $dockerDir"
     }
+    $pathChanged = Add-MachinePathEntry -Directory $dockerDir -Label 'docker.exe'
+
+    if (-not (Test-CommandExists 'docker')) {
+        throw "docker.exe exists at $dockerDir but is still not resolvable on PATH"
+    }
+    if ($pathChanged) { Sync-ServiceEnvironment }
 
     # The installer usually registers the service; register it if it did not.
     if (-not (Get-Service docker -ErrorAction SilentlyContinue)) {
@@ -417,14 +506,12 @@ function Install-SqlClientTools {
     } else {
         Install-MsiFromUrl -Uri $Config.MsSqlToolsUrl -FileName 'mssql-tools18.msi' `
             -DisplayName 'mssql-tools18 (sqlcmd)' -ExtraArgs @('IACCEPTMSSQLTOOLSLICENSETERMS=YES')
+        # Same helper as docker. This used to call SetEnvironmentVariable(...,
+        # 'Machine'), which rewrites PATH as REG_SZ and stops %SystemRoot% style
+        # entries expanding, and it matched on substring so a similarly named
+        # folder would have counted as already present.
         $toolsBin = 'C:\Program Files\Microsoft SQL Server\Client SDK\ODBC\180\Tools\Binn'
-        if (Test-Path $toolsBin) {
-            $machinePath = [Environment]::GetEnvironmentVariable('Path', 'Machine')
-            if ($machinePath -notlike "*$toolsBin*") {
-                [Environment]::SetEnvironmentVariable('Path', "$machinePath;$toolsBin", 'Machine')
-                Write-Ok 'sqlcmd added to system PATH'
-            }
-        }
+        $null = Add-MachinePathEntry -Directory $toolsBin -Label 'sqlcmd'
     }
     } catch {
         Write-Warn "SQL client tools not installed: $($_.Exception.Message)"
@@ -574,6 +661,21 @@ function Test-Prerequisites {
         @{ Label = 'java';    Required = $false; Script = { java -version 2>&1 | Select-Object -First 1 } },
         @{ Label = 'sqlcmd';  Required = $false; Script = { sqlcmd -? 2>&1 | Select-Object -First 1 } }
     )
+    # Verify the PERSISTED PATH, not just this session's. $env:Path was patched
+    # in-process during the install, so a check that only looks there would pass
+    # on a host where the next boot - or the next ssm send-command - cannot find
+    # docker at all. That is precisely the failure this verification exists for.
+    $persistedPath = [Environment]::GetEnvironmentVariable('Path', 'Machine')
+    $normalize = { param($p) $p.Trim().TrimEnd('\').ToLowerInvariant() }
+    $persistedDirs = @($persistedPath -split ';' | Where-Object { $_.Trim() -ne '' } | ForEach-Object { & $normalize $_ })
+    if ($persistedDirs -contains (& $normalize 'C:\Program Files\Docker')) {
+        Write-Ok 'docker.exe is on the persisted machine PATH (survives reboot and remote commands)'
+    } else {
+        Write-Fail 'docker.exe is NOT on the persisted machine PATH (REQUIRED)'
+        Write-Warn 'It may work in this session and then fail after a reboot or via ssm send-command.'
+        $failures += 'docker-on-machine-path'
+    }
+
     foreach ($check in $checks) {
         try {
             $out = & $check.Script 2>&1 | Out-String
