@@ -71,6 +71,34 @@ function Write-Ok   { param([string] $m) Write-Host "  [ok]   $m" -ForegroundCol
 function Write-Bad  { param([string] $m) Write-Host "  [FAIL] $m" -ForegroundColor Red }
 function Write-Warn { param([string] $m) Write-Host "  [warn] $m" -ForegroundColor Yellow }
 
+# Native commands write to STDERR for ordinary, expected conditions - "No such
+# container" when removing one that was never created, for instance. With
+# $ErrorActionPreference = 'Stop', PowerShell promotes that stderr text to a
+# TERMINATING error, so a harmless cleanup line kills the whole script. That is
+# exactly what happened on the first real run: the probe image built, the first
+# variant started to set up, and the run died on `docker rm -f` for a container
+# that did not exist yet.
+#
+# So every docker call goes through this. It isolates the preference change,
+# captures output, and reports success by EXIT CODE - which is the thing that
+# actually indicates whether docker did what was asked.
+function Invoke-Docker {
+    param([Parameter(ValueFromRemainingArguments = $true)] [string[]] $DockerArgs)
+    $prev = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        $out = & docker @DockerArgs 2>&1 | Out-String
+        return [pscustomobject]@{ ExitCode = $LASTEXITCODE; Output = $out }
+    }
+    finally { $ErrorActionPreference = $prev }
+}
+
+# Cleanup that is allowed to find nothing.
+function Remove-ContainerQuietly {
+    param([string] $Name)
+    $null = Invoke-Docker rm -f $Name
+}
+
 $ScriptRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
 
 # ---------------------------------------------------------------------------
@@ -87,9 +115,9 @@ if (-not (Get-Command docker -ErrorAction SilentlyContinue)) {
         throw 'docker not found. Run 02-prereq-windows.ps1 first.'
     }
 }
-Write-Ok "docker: $((docker --version) 2>&1)"
+Write-Ok "docker: $((Invoke-Docker --version).Output.Trim())"
 
-$info = (docker info --format '{{.OSType}}') 2>&1
+$info = (Invoke-Docker info --format '{{.OSType}}').Output
 if ("$info".Trim() -ne 'windows') {
     throw "the Docker daemon is in '$info' mode, not windows."
 }
@@ -111,8 +139,9 @@ if ($Mode -eq 'probe') {
         throw "console-probe/Dockerfile not found under $ScriptRoot"
     }
     $Image = 'flowtest-console-probe:local'
-    docker build --file (Join-Path $context 'Dockerfile') --tag $Image $context
-    if ($LASTEXITCODE -ne 0) { throw 'failed to build the console probe image' }
+    $build = Invoke-Docker build --file (Join-Path $context 'Dockerfile') --tag $Image $context
+    Write-Host $build.Output
+    if ($build.ExitCode -ne 0) { throw 'failed to build the console probe image' }
     Write-Ok "built $Image"
     Write-Host '  No engine image, no staged config and no stack are involved - this'
     Write-Host '  measures the RUNTIME, which is what the question is actually about.'
@@ -148,29 +177,29 @@ foreach ($v in $variants) {
     $name = "$NamePrefix-$($v.Key -replace '\+','-')"
     Write-Step "$($v.Key)  ($($v.Note))"
 
-    docker rm -f $name 2>&1 | Out-Null
+    Remove-ContainerQuietly $name
 
     $createArgs = @('create', '--name', $name) + $v.Flags + @($Image)
-    docker @createArgs | Out-Null
-    if ($LASTEXITCODE -ne 0) { Write-Bad 'docker create failed'; continue }
+    $create = Invoke-Docker @createArgs
+    if ($create.ExitCode -ne 0) { Write-Bad "docker create failed: $($create.Output.Trim())"; continue }
 
     # Engine images need config delivered before start - see run-engine.ps1.
     # The probe carries everything it needs.
     if ($copyConfig) {
-        docker cp "$ConfigDir\." "${name}:${target}/" 2>&1 | Out-Null
-        if ($LASTEXITCODE -ne 0) { Write-Bad 'docker cp failed'; docker rm -f $name | Out-Null; continue }
+        $cp = Invoke-Docker cp "$ConfigDir\." "${name}:${target}/"
+        if ($cp.ExitCode -ne 0) { Write-Bad "docker cp failed: $($cp.Output.Trim())"; Remove-ContainerQuietly $name; continue }
     }
 
     $started = Get-Date
-    docker start $name | Out-Null
-    if ($LASTEXITCODE -ne 0) { Write-Bad 'docker start failed'; docker rm -f $name | Out-Null; continue }
+    $start = Invoke-Docker start $name
+    if ($start.ExitCode -ne 0) { Write-Bad "docker start failed: $($start.Output.Trim())"; Remove-ContainerQuietly $name; continue }
 
     $died = $null
     $elapsed = 0
     while ($elapsed -lt $WatchSeconds) {
         Start-Sleep -Seconds $PollSeconds
         $elapsed = [int]((Get-Date) - $started).TotalSeconds
-        $state = "$((docker inspect -f '{{.State.Status}}' $name) 2>&1)".Trim()
+        $state = (Invoke-Docker inspect -f '{{.State.Status}}' $name).Output.Trim()
         if ($state -ne 'running') {
             $died = $elapsed
             Write-Bad "stopped after ~${elapsed}s (state: $state)"
@@ -179,8 +208,8 @@ foreach ($v in $variants) {
         Write-Host "    ${elapsed}s: running"
     }
 
-    $exitCode = "$((docker inspect -f '{{.State.ExitCode}}' $name) 2>&1)".Trim()
-    $logs     = "$((docker logs --tail 60 $name) 2>&1)"
+    $exitCode = (Invoke-Docker inspect -f '{{.State.ExitCode}}' $name).Output.Trim()
+    $logs     = (Invoke-Docker logs --tail 60 $name).Output
 
     # Two signatures. The probe reports the control event by name; the real
     # engine reports its own. Finding either is the difference between "the
@@ -204,7 +233,7 @@ foreach ($v in $variants) {
         ConsoleEvt = if ($probeEvent.Success) { $probeEvent.Groups[1].Value } elseif ($engineEvent) { 'SIGINT' } else { 'none' }
     })
 
-    if (-not $KeepContainers) { docker rm -f $name 2>&1 | Out-Null }
+    if (-not $KeepContainers) { Remove-ContainerQuietly $name }
     else { Write-Warn "kept container $name for inspection" }
 }
 
