@@ -50,6 +50,11 @@
 [CmdletBinding()]
 param(
     [string]$PlanFile,
+    # Written by this script when it genuinely finishes. Passed by the bootstrap
+    # so that a run which needs a reboot can resume and STILL satisfy the
+    # readiness contract - see the reboot handling in Enable-ContainerFeatures.
+    [string]$ReadyMarker,
+
     [switch]$SkipReboot,
     [switch]$SkipNetworks
 )
@@ -340,14 +345,52 @@ function Enable-ContainerFeatures {
     }
 
     if ($rebootNeeded) {
+        # EXIT 3010, NOT 0. 3010 is the standard Windows "success, reboot
+        # required" code, and the distinction is load-bearing.
+        #
+        # This used to exit 0. The bootstrap in UserData only checks
+        # $LASTEXITCODE -eq 0, so it wrote the READY marker and reported
+        # BOOTSTRAP COMPLETE for a host that had installed the Containers
+        # feature and NOTHING ELSE - no container runtime, no docker.exe. The
+        # readiness gates passed, the pipeline reported success, and the fault
+        # only surfaced when someone tried to run a container by hand days
+        # later.
+        #
+        # Exiting 3010 lets the caller tell "finished" from "needs a reboot to
+        # continue", which is the difference between a usable host and one that
+        # only looks usable.
+        Write-Warn 'REBOOT REQUIRED before the container runtime can be installed.'
         if ($SkipReboot) {
-            Write-Warn 'REBOOT REQUIRED. Re-run this script after rebooting.'
-            exit 0
+            Write-Warn 'Re-run this script after rebooting to continue.'
+            exit 3010
         }
-        Write-Warn 'Rebooting in 15 seconds. Re-run this script after the reboot to continue.'
+
+        # Arrange to CONTINUE after the reboot. UserData runs once per instance
+        # and never again, so without this the host comes back with the
+        # Containers feature installed and nothing else - which is exactly what
+        # happened: the runtime was never installed, yet the host was reported
+        # ready and the gates passed on it.
+        #
+        # RunOnce fires once, as SYSTEM, at next boot. Nothing to clean up and no
+        # way for it to repeat.
+        $self = $MyInvocation.MyCommand.Path
+        if (-not $self) { $self = $PSCommandPath }
+        $resumeArgs = "-NoProfile -ExecutionPolicy Bypass -File `"$self`""
+        if ($PlanFile)    { $resumeArgs += " -PlanFile `"$PlanFile`"" }
+        if ($ReadyMarker) { $resumeArgs += " -ReadyMarker `"$ReadyMarker`"" }
+        try {
+            Set-ItemProperty -Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\RunOnce' `
+                -Name 'FlowTestBootstrapResume' -Value "powershell.exe $resumeArgs" -ErrorAction Stop
+            Write-Ok 'resume registered; this script will continue automatically after the reboot'
+        } catch {
+            Write-Fail "could not register the resume: $($_.Exception.Message)"
+            Write-Warn 'The host will reboot WITHOUT resuming. Re-run this script by hand afterwards.'
+        }
+
+        Write-Warn 'Rebooting in 15 seconds.'
         Start-Sleep -Seconds 15
         Restart-Computer -Force
-        exit 0
+        exit 3010
     }
 }
 
@@ -723,6 +766,26 @@ function Test-Prerequisites {
     }
     Write-Host ''
     Write-Ok 'All Windows host prerequisites satisfied.'
+
+    # Write the readiness marker HERE, at the only point where the host is
+    # genuinely usable.
+    #
+    # It used to be written solely by the bootstrap, on exit code 0 - and the
+    # reboot path exited 0, so a host with the Containers feature and no
+    # container runtime was marked ready. Owning the marker here means it can
+    # only appear after verification has actually passed, including on a run
+    # that resumed after a reboot.
+    if ($ReadyMarker) {
+        try {
+            $dir = Split-Path -Parent $ReadyMarker
+            if ($dir -and -not (Test-Path $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
+            Set-Content -Path $ReadyMarker -Value (Get-Date -Format o) -Encoding ASCII
+            Write-Ok "readiness marker written: $ReadyMarker"
+        } catch {
+            Write-Fail "could not write the readiness marker: $($_.Exception.Message)"
+            exit 1
+        }
+    }
 }
 
 # ----------------------------- main -----------------------------
