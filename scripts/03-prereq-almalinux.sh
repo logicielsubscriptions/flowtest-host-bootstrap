@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 #
-# 03-prereq-almalinux.sh — Prerequisite installation for an AlmaLinux container
+# 03-prereq-almalinux.sh - Prerequisite installation for an AlmaLinux container
 # host that runs containers on caller-specified static IPs.
 #
 # Prepares an AlmaLinux 9 EC2 instance to host containers whose addresses are
 # dictated by a plan file (see the usage note below). This script is deliberately
-# generic: it declares no addresses, hostnames or workloads of its own —
+# generic: it declares no addresses, hostnames or workloads of its own -
 # everything comes from the plan.
 #
 # Installs:
@@ -26,21 +26,21 @@
 # Usage:
 #   03-prereq-almalinux.sh [/path/to/flow-plan-linux.json]
 #
-# Nothing about the flow is hardcoded here — networks, container addresses and
+# Nothing about the flow is hardcoded here - networks, container addresses and
 # peers all come from the plan file produced by generator/generate_cfn.py.
 # Instance UserData passes it in automatically; supply it by hand only when
 # re-running manually. Without a plan, tooling is installed but no Docker
 # networks are created.
 #
 # Run as root. CloudFormation now creates the ENIs, assigns the exact production
-# addresses as secondary private IPs, and disables source/dest check — so no
+# addresses as secondary private IPs, and disables source/dest check - so no
 # AWS-side preparation is needed here.
 #
 # Idempotent: safe to re-run.
 #
 set -euo pipefail
 
-# ─────────────────────────── configuration ───────────────────────────
+# --------------------------- configuration ---------------------------
 # Host-level constants only. Flow specifics come from the plan file.
 
 PLAN_FILE="${1:-/opt/flowtest/bootstrap/flow-plan-linux.json}"
@@ -61,7 +61,7 @@ PLAN_FLOW=""
 declare -a NET_NAMES=() NET_SUBNETS=() NET_GATEWAYS=() NET_HOST_IPS=() NET_CONTAINER_IPS=()
 declare -a PLAN_PEERS=()
 
-# ─────────────────────────── helpers ───────────────────────────
+# --------------------------- helpers ---------------------------
 C_CYAN='\033[0;36m'; C_GREEN='\033[0;32m'; C_YELLOW='\033[0;33m'
 C_RED='\033[0;31m';  C_GREY='\033[0;90m';  C_OFF='\033[0m'
 
@@ -73,6 +73,8 @@ fail() { printf '%b  [FAIL] %b%s\n'  "$C_RED"   "$C_OFF" "$*"; }
 die()  { fail "$*"; exit 1; }
 
 VERIFY_FAILURES=()
+# Reported, never fatal: a missing optional tool must not block the READY marker.
+ADVISORY_FAILURES=()
 
 assert_root() {
   [[ ${EUID} -eq 0 ]] || die "must run as root (try: sudo $0)"
@@ -101,7 +103,7 @@ load_flow_plan() {
   step "Flow plan"
 
   if [[ ! -f "$PLAN_FILE" ]]; then
-    warn "no plan file at $PLAN_FILE — installing tooling only, skipping Docker networks"
+    warn "no plan file at $PLAN_FILE - installing tooling only, skipping Docker networks"
     warn "generate one with: python3 generator/generate_cfn.py --flow <FLOW> ..."
     return 0
   fi
@@ -155,7 +157,7 @@ load_flow_plan() {
   fi
 }
 
-# ─────────────────────────── steps ───────────────────────────
+# --------------------------- steps ---------------------------
 
 install_base_packages() {
   step "Base packages"
@@ -226,7 +228,7 @@ configure_route_priority() {
 
 install_ssm_agent() {
   step "AWS SSM Agent"
-  # AlmaLinux AMIs do NOT ship the SSM Agent — unlike Amazon Linux and the AWS
+  # AlmaLinux AMIs do NOT ship the SSM Agent - unlike Amazon Linux and the AWS
   # Windows AMIs. Without it, `aws ssm start-session` fails with
   # "TargetNotConnected" no matter how correct the instance profile is, and the
   # host is unreachable if no key pair was set. Install it early, before the long
@@ -296,7 +298,7 @@ install_docker() {
   if systemctl is-active --quiet docker; then
     ok "docker service active"
   else
-    die "docker service failed to start — check: journalctl -u docker -n 50"
+    die "docker service failed to start - check: journalctl -u docker -n 50"
   fi
 }
 
@@ -364,7 +366,7 @@ configure_kernel_networking() {
   if modprobe ipvlan 2>/dev/null; then
     ok "ipvlan module loaded"
   else
-    warn "could not modprobe ipvlan — it may be built into the kernel"
+    warn "could not modprobe ipvlan - it may be built into the kernel"
   fi
   echo 'ipvlan' > /etc/modules-load.d/ipvlan.conf
   ok "ipvlan set to load at boot"
@@ -384,7 +386,7 @@ net.ipv6.conf.all.disable_ipv6 = 1
 SYSCTL
   sysctl -p "$sysctl_file" >/dev/null
   ok "sysctl applied ($sysctl_file)"
-  printf '%b    ip_forward=1, rp_filter=2 (loose) — required for asymmetric multi-NIC paths%b\n' "$C_GREY" "$C_OFF"
+  printf '%b    ip_forward=1, rp_filter=2 (loose) - required for asymmetric multi-NIC paths%b\n' "$C_GREY" "$C_OFF"
 }
 
 # Echo the interface name carrying an address inside the given /24, or empty.
@@ -398,7 +400,7 @@ find_interface_for_subnet() {
 configure_firewalld() {
   step "firewalld"
   if ! systemctl is-active --quiet firewalld; then
-    skip "firewalld not active — nothing to do"
+    skip "firewalld not active - nothing to do"
     return
   fi
 
@@ -406,7 +408,7 @@ configure_firewalld() {
   # prod-mirroring NICs in the trusted zone; the intra-VPC-only security group
   # remains the real containment boundary.
   if [[ "$PLAN_LOADED" -ne 1 ]]; then
-    skip "no flow plan — no prod-mirroring NICs to place in the trusted zone"
+    skip "no flow plan - no prod-mirroring NICs to place in the trusted zone"
     return
   fi
 
@@ -414,7 +416,7 @@ configure_firewalld() {
   for subnet in "${NET_SUBNETS[@]}"; do
     iface="$(find_interface_for_subnet "$subnet")"
     if [[ -z "$iface" ]]; then
-      warn "no interface found for $subnet — skipping firewalld zone assignment"
+      warn "no interface found for $subnet - skipping firewalld zone assignment"
       continue
     fi
     if firewall-cmd --zone=trusted --query-interface="$iface" &>/dev/null; then
@@ -450,7 +452,7 @@ create_ipvlan_network() {
   local iface
   iface="$(find_interface_for_subnet "$subnet")"
   if [[ -z "$iface" ]]; then
-    warn "no interface carrying an address in $subnet — skipping '$name'"
+    warn "no interface carrying an address in $subnet - skipping '$name'"
     warn "check the secondary ENI is attached and has an IP:  ip -br addr"
     VERIFY_FAILURES+=("network:$name")
     return
@@ -532,14 +534,14 @@ initialize_networks() {
     return
   fi
   if [[ "$PLAN_LOADED" -ne 1 ]]; then
-    skip "no flow plan — nothing to create"
+    skip "no flow plan - nothing to create"
     return
   fi
   local i
   for i in "${!NET_NAMES[@]}"; do
     create_ipvlan_network "${NET_NAMES[$i]}" "${NET_SUBNETS[$i]}" "${NET_GATEWAYS[$i]}" "${NET_CONTAINER_IPS[$i]}"
   done
-  warn "ipvlan containers cannot reach their OWN parent host's IP — by design, do not rely on it"
+  warn "ipvlan containers cannot reach their OWN parent host's IP - by design, do not rely on it"
 }
 
 pull_images() {
@@ -593,9 +595,22 @@ initialize_directories() {
 verify() {
   step "Verification"
 
-  local checks=(
+  # REQUIRED vs ADVISORY.
+  #
+  # Build 49 failed here: sqlcmd was in the same list as docker, so an optional
+  # tool that install_mssql_tools explicitly treats as non-fatal ("Continuing -
+  # only the DB stages need these") still failed the whole bootstrap, no READY
+  # marker was written, and the pipeline sat on PENDING for 25 minutes. The host
+  # was fine - docker, both prod networks and every container address were up.
+  #
+  # Only docker is genuinely required to stand the environment up. Everything
+  # else is tooling for later stages and must not block readiness; a missing
+  # sqlcmd should fail the DB restore, loudly, at the point it is needed.
+  local required=(
     "docker:docker --version"
     "docker compose:docker compose version"
+  )
+  local advisory=(
     "git:git --version"
     "aws:aws --version"
     "java:java -version"
@@ -603,13 +618,22 @@ verify() {
     "sqlcmd:sqlcmd -?"
   )
   local entry label cmd out
-  for entry in "${checks[@]}"; do
+  for entry in "${required[@]}"; do
     label="${entry%%:*}"; cmd="${entry#*:}"
     if out="$(eval "$cmd" 2>&1 | head -n1)"; then
       ok "$label: $out"
     else
-      fail "$label not working"
+      fail "$label not working (REQUIRED)"
       VERIFY_FAILURES+=("$label")
+    fi
+  done
+  for entry in "${advisory[@]}"; do
+    label="${entry%%:*}"; cmd="${entry#*:}"
+    if out="$(eval "$cmd" 2>&1 | head -n1)"; then
+      ok "$label: $out"
+    else
+      warn "$label not working (advisory - later stages that need it will fail there)"
+      ADVISORY_FAILURES+=("$label")
     fi
   done
 
@@ -643,6 +667,10 @@ verify() {
   fi
 
   printf '\n'
+  if [[ ${#ADVISORY_FAILURES[@]} -gt 0 ]]; then
+    warn "optional tooling missing: ${ADVISORY_FAILURES[*]}"
+    warn "The host is usable. Stages that need these will fail where they need them."
+  fi
   if [[ ${#VERIFY_FAILURES[@]} -gt 0 ]]; then
     fail "incomplete: ${VERIFY_FAILURES[*]}"
     exit 1
@@ -696,7 +724,7 @@ print_next_steps() {
 }
 
 main() {
-  printf '\n  VCVW Flow — AlmaLinux container host prerequisites\n'
+  printf '\n  VCVW Flow - AlmaLinux container host prerequisites\n'
   printf '%b  -------------------------------------------------%b\n' "$C_GREY" "$C_OFF"
 
   assert_root
