@@ -269,7 +269,11 @@ function Install-MsiFromUrl {
         else                { Write-Warn "  re-downloading $DisplayName (attempt $attempt of $attempts) ..." }
         Invoke-Download -Uri $Uri -OutFile $installer
 
-        $size = (Get-Item $installer -ErrorAction SilentlyContinue).Length
+        # Test-Path first: if the download produced nothing at all, Get-Item
+        # returns $null and dotting .Length off it throws under StrictMode -
+        # aborting the script for what is meant to be a HANDLED failure, which
+        # would defeat the retry immediately below.
+        $size = if (Test-Path $installer) { (Get-Item $installer).Length } else { 0 }
         if (-not $size -or $size -lt $minBytes) {
             Write-Warn "  downloaded file is only $size bytes - that is too small to be a valid MSI"
             if ($attempt -lt $attempts) { continue }
@@ -389,9 +393,20 @@ function Test-PendingReboot {
     foreach ($k in $keys) {
         if (Test-Path $k) { return $true }
     }
+    # PendingFileRenameOperations usually does NOT exist, which is the whole
+    # difficulty. Get-ItemProperty -Name <missing> returns $null even with
+    # -ErrorAction SilentlyContinue, and this script runs under
+    # Set-StrictMode -Version Latest, so dotting a property off that $null is the
+    # same fault that killed the reboot path in Enable-ContainerFeatures. Worse,
+    # it would fire on the HEALTHY host - the one with no reboot pending, which
+    # is precisely the case that has to work.
+    #
+    # Read the key, then ask whether the property is there before touching it.
     $sm = 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager'
-    $pending = (Get-ItemProperty -Path $sm -Name PendingFileRenameOperations -ErrorAction SilentlyContinue).PendingFileRenameOperations
-    if ($pending) { return $true }
+    $smKey = Get-ItemProperty -Path $sm -ErrorAction SilentlyContinue
+    if ($smKey -and ($smKey.PSObject.Properties.Name -contains 'PendingFileRenameOperations')) {
+        if ($smKey.PendingFileRenameOperations) { return $true }
+    }
     return $false
 }
 
@@ -549,8 +564,29 @@ function Enable-ContainerFeatures {
         #
         # RunOnce fires once, as SYSTEM, at next boot. Nothing to clean up and no
         # way for it to repeat.
-        $self = $MyInvocation.MyCommand.Path
-        if (-not $self) { $self = $PSCommandPath }
+        # $PSCommandPath, NOT $MyInvocation.MyCommand.Path.
+        #
+        # This line used to read:
+        #     $self = $MyInvocation.MyCommand.Path
+        #     if (-not $self) { $self = $PSCommandPath }
+        # Inside a FUNCTION, $MyInvocation.MyCommand is the FunctionInfo for
+        # Enable-ContainerFeatures, and a FunctionInfo has no Path property. This
+        # script runs under Set-StrictMode -Version Latest (line 69), where
+        # reading a property that does not exist THROWS rather than returning
+        # $null - so the fallback on the next line could never run. The guard was
+        # unreachable by construction, and the reboot path died with
+        #     The property 'Path' cannot be found on this object
+        # after the platform gate had correctly decided a reboot was needed.
+        #
+        # $PSCommandPath is the script's own path regardless of scope, which is
+        # what Register-RoutePriorityTask above already uses. The two should not
+        # have differed; that inconsistency is what let this through.
+        $self = $PSCommandPath
+        if (-not $self -or -not (Test-Path $self)) {
+            Write-Fail 'cannot resolve this script path, so the post-reboot resume cannot be registered.'
+            Write-Warn 'Reboot manually, then re-run this script to continue.'
+            exit 3010
+        }
         $resumeArgs = "-NoProfile -ExecutionPolicy Bypass -File `"$self`""
         if ($PlanFile)    { $resumeArgs += " -PlanFile `"$PlanFile`"" }
         if ($ReadyMarker) { $resumeArgs += " -ReadyMarker `"$ReadyMarker`"" }
