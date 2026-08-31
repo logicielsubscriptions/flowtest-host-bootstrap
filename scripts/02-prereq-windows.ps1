@@ -467,6 +467,69 @@ function Install-ChocoPackages {
                 [Environment]::GetEnvironmentVariable('Path', 'User')
 }
 
+function Install-GitFallback {
+    <#
+        Install git WITHOUT Chocolatey.
+
+        Chocolatey's git package failed on a real host with exit 4, and git is
+        needed by later stages, so "optional and skipped" was the wrong outcome
+        for something this easy to get another way.
+
+        MinGit is the portable Git for Windows build: a ~37 MB zip with no
+        installer, no admin prompt and no reboot. Extract it, put its cmd
+        directory on the machine PATH, done. Fewer moving parts than an installer,
+        and nothing to uninstall.
+    #>
+    if (Test-CommandExists 'git') {
+        Write-Skip "git already present ($(git --version))"
+        return
+    }
+
+    Write-Step 'git (Chocolatey fallback: MinGit)'
+    $target = 'C:\FlowTest\tools\MinGit'
+    $binDir = Join-Path $target 'cmd'
+
+    if (Test-Path (Join-Path $binDir 'git.exe')) {
+        Write-Skip "MinGit already extracted at $target"
+        $null = Add-MachinePathEntry -Directory $binDir -Label 'git'
+        return
+    }
+
+    try {
+        # Resolve the current release rather than pinning a version that rots.
+        # The API is unauthenticated and rate-limited per IP; a failure here is
+        # not fatal, it just means no git.
+        $rel = Invoke-RestMethod -Uri 'https://api.github.com/repos/git-for-windows/git/releases/latest' `
+            -Headers @{ 'User-Agent' = 'flowtest-bootstrap' } -TimeoutSec 60
+
+        $asset = $rel.assets |
+            Where-Object { $_.name -like 'MinGit-*-64-bit.zip' -and $_.name -notlike '*busybox*' } |
+            Select-Object -First 1
+        if (-not $asset) { throw 'no MinGit 64-bit asset in the latest release' }
+
+        $zip = Join-Path $env:TEMP $asset.name
+        Write-Host "  downloading $($asset.name) ($([math]::Round($asset.size / 1MB)) MB) ..."
+        Invoke-Download -Uri $asset.browser_download_url -OutFile $zip
+
+        New-Item -ItemType Directory -Path $target -Force | Out-Null
+        Expand-Archive -Path $zip -DestinationPath $target -Force
+        Remove-Item $zip -Force -ErrorAction SilentlyContinue
+
+        if (-not (Test-Path (Join-Path $binDir 'git.exe'))) {
+            throw "extracted, but no git.exe under $binDir"
+        }
+        $null = Add-MachinePathEntry -Directory $binDir -Label 'git'
+        Write-Ok "git installed: $(& (Join-Path $binDir 'git.exe') --version)"
+    }
+    catch {
+        # Still not fatal. git is needed by later stages, and they will say so
+        # where they need it - which is better than failing a host that is
+        # otherwise complete.
+        Write-Warn "MinGit fallback failed: $($_.Exception.Message)"
+        Write-Warn 'git is unavailable. Stages that need it will fail where they need it.'
+    }
+}
+
 function Install-ContainerRuntime {
     Write-Step 'Mirantis Container Runtime'
     if (Test-CommandExists 'docker') {
@@ -640,7 +703,13 @@ function New-L2BridgeNetwork {
     & docker @dockerArgs | Out-Null
     if ($LASTEXITCODE -ne 0) {
         Write-Fail "failed to create network '$Name'"
-        Write-Warn 'l2bridge on EC2 is open item #1 in the architecture doc. Capture the error and spike it before proceeding.'
+        # l2bridge on EC2 was proven on hardware 2026-08-17, so a failure here is
+        # a fault with THIS host, not an unanswered design question. The usual
+        # causes, in order:
+        Write-Warn 'l2bridge works on EC2 (proven 2026-08-17), so this is a fault with this host. Check:'
+        Write-Warn '  - the adapter above is the right prod NIC and is UP'
+        Write-Warn '  - the host address on it does not collide with a planned container address'
+        Write-Warn '  - the docker service is running and in Windows container mode'
         return
     }
     Write-Ok "network '$Name' created ($Subnet via $($adapter.InterfaceAlias))"
@@ -803,6 +872,10 @@ try {
     Enable-ContainerFeatures
     Install-Chocolatey
     Install-ChocoPackages
+    # Runs only if git is still missing. Chocolatey's git package has failed on a
+    # real host (exit 4) and the packages are installed non-fatally, so without
+    # this a host silently ends up without git.
+    Install-GitFallback
     Install-ContainerRuntime
     Install-SqlClientTools
     Install-HnsModule
@@ -820,28 +893,21 @@ try {
 
     Write-Host "`nNext steps" -ForegroundColor Gray
     Write-Host @"
-  1. Verify l2bridge honours a static IP before building anything:
-       docker run --rm -it --network $exampleNet --ip $exampleIp ``
-         $img cmd /c ipconfig
-"@ -ForegroundColor Gray
+  1. Build the engine images for the tags in the plan:
+       .\build-images.ps1 -GitHubTokenSecretId flowtest/github-pat
+     Tags already in ECR are skipped, so this is a no-op for an unchanged flow.
 
-    if ($sharedGroup) {
-        Write-Host @"
-  2. Verify shared network namespaces work for Windows containers. This decides
-     whether co-located services share one address via a namespace holder, or
-     collapse into a single container with a supervisor entrypoint:
-       docker run -d --name $($sharedGroup.namespaceContainer) ``
-         --network $($sharedGroup.dockerNetwork) --ip $($sharedGroup.ip) ``
-         $img cmd /c "ping -t 127.0.0.1"
-       docker run --rm --network container:$($sharedGroup.namespaceContainer) ``
-         $img cmd /c ipconfig
-     Affected group: $($sharedGroup.prodHost) -> $(($sharedGroup.services | ForEach-Object { $_.serviceName }) -join ', ')
+  2. Before any flow uses an oe or oe-risk image, run the console probe once:
+       .\test-oe-console.ps1
+     The order execution server has been seen dying ~45s after launch when it
+     does not own its console. Inside a flow that looks like a network fault.
+
 "@ -ForegroundColor Gray
-    }
 
     Write-Host @'
-  3. Register this host as a Jenkins agent (JDK 17 is installed).
-  4. Build the engine images for the tags named in the plan.
+  3. Stage the configs and start the containers with run-engine.ps1, which
+     copies config INTO the engine directory - the engine has no config-path
+     argument, so a mount alongside it will not be found.
 
 '@ -ForegroundColor Gray
 }
