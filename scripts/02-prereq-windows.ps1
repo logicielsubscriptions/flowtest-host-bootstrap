@@ -321,6 +321,45 @@ function Set-ProdNicRoutePriority {
     }
 }
 
+# Windows sets these when a servicing operation has staged changes that only
+# take effect at boot. Chocolatey reads them, which is why its output said
+# "a pending system reboot request has been detected" on a host where this
+# script had just decided no reboot was necessary.
+function Test-PendingReboot {
+    $keys = @(
+        'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending',
+        'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired',
+        'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootInProgress'
+    )
+    foreach ($k in $keys) {
+        if (Test-Path $k) { return $true }
+    }
+    $sm = 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager'
+    $pending = (Get-ItemProperty -Path $sm -Name PendingFileRenameOperations -ErrorAction SilentlyContinue).PendingFileRenameOperations
+    if ($pending) { return $true }
+    return $false
+}
+
+# The DIRECT test, and the one that actually matters.
+#
+# The Containers feature installs the Host Compute Service (vmcompute). Until
+# that service exists AND can run, the Docker engine cannot start a Windows
+# container - and `Start-Service docker` fails with nothing useful in the
+# message. Asking vmcompute is asking the real question; asking
+# Install-WindowsFeature's RestartNeeded field is asking a proxy that lies.
+function Test-ContainerPlatformLive {
+    $vmcompute = Get-Service -Name vmcompute -ErrorAction SilentlyContinue
+    if (-not $vmcompute) { return $false }
+    if ($vmcompute.Status -eq 'Running') { return $true }
+    try {
+        Start-Service -Name vmcompute -ErrorAction Stop
+        return $true
+    }
+    catch {
+        return $false
+    }
+}
+
 function Enable-ContainerFeatures {
     Write-Step 'Windows container features'
     $rebootNeeded = $false
@@ -328,12 +367,39 @@ function Enable-ContainerFeatures {
     $containers = Get-WindowsFeature -Name Containers -ErrorAction SilentlyContinue
     if ($containers -and -not $containers.Installed) {
         Write-Host '  installing Containers feature ...'
-        $result = Install-WindowsFeature -Name Containers -ErrorAction Stop
+        $null = Install-WindowsFeature -Name Containers -ErrorAction Stop
         Write-Ok 'Containers feature installed'
-        if ($result.RestartNeeded -ne 'No') { $rebootNeeded = $true }
+        # DELIBERATELY NOT $result.RestartNeeded. See below.
     }
     elseif ($containers) {
         Write-Skip 'Containers feature already installed'
+    }
+
+    # DO NOT TRUST Install-WindowsFeature's RestartNeeded FIELD.
+    #
+    # This code used to read:
+    #     if ($result.RestartNeeded -ne 'No') { $rebootNeeded = $true }
+    # On Server 2022 that field comes back 'No' for the Containers feature even
+    # though the container drivers are NOT live until the machine reboots. So
+    # the script sailed past the reboot gate, installed MCR, and died on
+    #     Start-Service : Failed to start service 'Docker Engine (docker)'
+    # with no indication why - because from Docker's point of view there was
+    # nothing to say: the platform underneath it simply was not there yet.
+    # Chocolatey, running moments earlier in the same session, had already
+    # detected the pending reboot and printed it four times.
+    #
+    # So test the two things that are actually true or false: is a servicing
+    # reboot pending, and is the Host Compute Service able to run?
+    if (Test-PendingReboot) {
+        Write-Warn 'a servicing reboot is pending (registry), so container drivers are not live yet'
+        $rebootNeeded = $true
+    }
+    elseif (-not (Test-ContainerPlatformLive)) {
+        Write-Warn 'the Host Compute Service (vmcompute) is absent or will not start'
+        $rebootNeeded = $true
+    }
+    else {
+        Write-Ok 'container platform is live (vmcompute running, no reboot pending)'
     }
 
     # Hyper-V is only needed for Hyper-V isolated containers. Process isolation
@@ -544,10 +610,46 @@ function Install-ContainerRuntime {
     Write-Host "  downloading $($Config.McrInstallUrl) ..."
     Invoke-Download -Uri $Config.McrInstallUrl -OutFile $installer
 
+    # A container platform that is not live is the single most likely reason for
+    # this installer to fail, and it fails in a way that names Docker rather than
+    # the platform. Say so BEFORE spending several minutes on a download that
+    # cannot succeed.
+    if (-not (Test-ContainerPlatformLive)) {
+        Write-Fail 'the Host Compute Service (vmcompute) is not running.'
+        Write-Warn 'The Containers feature needs a reboot to take effect. Reboot and re-run.'
+        throw 'Container platform is not live; refusing to install the runtime.'
+    }
+
     Write-Host '  running MCR installer (this can take several minutes) ...'
-    & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $installer
-    if ($LASTEXITCODE -ne 0) {
-        Write-Fail "MCR installer exited with $LASTEXITCODE"
+    # $ErrorActionPreference is 'Stop' for this script, and in PS 5.1 ANY stderr
+    # output from a native command becomes a terminating ErrorRecord under that
+    # setting. The MCR installer writes its own Start-Service failure to stderr,
+    # so this line threw before the $LASTEXITCODE check below could run - and the
+    # stack trace pointed here, at a `& powershell.exe` line, for a fault that
+    # happened inside the installer. That is what made build 55 hard to read.
+    #
+    # Same hazard, same fix as Invoke-Docker in test-oe-console.ps1: drop to
+    # 'Continue' for the call, capture, and decide from the exit code.
+    $prevEap = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        $mcrOutput = & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $installer 2>&1 | Out-String
+        $mcrExit = $LASTEXITCODE
+    }
+    finally {
+        $ErrorActionPreference = $prevEap
+    }
+    if ($mcrOutput) { Write-Host ($mcrOutput.TrimEnd()) }
+
+    if ($mcrExit -ne 0) {
+        Write-Fail "MCR installer exited with $mcrExit"
+        if ($mcrOutput -match 'Failed to start service') {
+            Write-Warn 'It could not start the Docker engine service. That is almost always the'
+            Write-Warn 'container platform not being live yet rather than a Docker fault.'
+            $vm = Get-Service -Name vmcompute -ErrorAction SilentlyContinue
+            Write-Warn "  vmcompute: $(if ($vm) { $vm.Status } else { 'NOT PRESENT' })"
+            Write-Warn "  reboot pending: $(Test-PendingReboot)"
+        }
         Write-Warn 'Alternative: containerd + nerdctl, or the Windows Admin Center Containers extension.'
         throw 'Container runtime installation failed.'
     }

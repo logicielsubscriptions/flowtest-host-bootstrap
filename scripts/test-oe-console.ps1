@@ -218,6 +218,32 @@ foreach ($v in $variants) {
     $engineEvent = $logs -match 'Signal Handler Activated'
     $shutdown    = $logs -match 'shutting down'
 
+    # WHETHER THE HANDLER INSTALLED IS PART OF THE RESULT, NOT A DETAIL.
+    #
+    # "no console event was delivered" means two very different things:
+    #
+    #   registered True  - a handler WAS listening and nothing arrived. The
+    #                      runtime does not send console events unprompted.
+    #   registered False - SetConsoleCtrlHandler failed because the process has
+    #                      no console. Then "no event" is trivially true and says
+    #                      nothing about what the runtime would send. It is still
+    #                      useful (the engine's own handler would not install
+    #                      either) but it is a DIFFERENT finding.
+    #
+    # The first run to survive reported the first conclusion without either the
+    # script or anyone reading it knowing which case had occurred, because this
+    # line was only ever printed inside the container log - and the log is only
+    # dumped when the container dies. Put it in the results table.
+    $regMatch   = [regex]::Match($logs, 'handler registered:\s*(True|False)')
+    $handlerReg = if ($regMatch.Success) { $regMatch.Groups[1].Value } else { '?' }
+    if ($handlerReg -eq 'False') {
+        Write-Warn 'SetConsoleCtrlHandler returned FALSE - this process has no console.'
+        Write-Warn 'Survival therefore does not show the runtime withholds events; there was nothing to receive them.'
+    }
+    elseif ($handlerReg -eq '?' -and $Mode -eq 'probe') {
+        Write-Warn 'could not find the "handler registered" line in the probe log - treat the result as unconfirmed.'
+    }
+
     if (-not $died) { Write-Ok "still running after ${WatchSeconds}s" }
     if ($probeEvent.Success) {
         Write-Warn "console event $($probeEvent.Groups[1].Value) delivered at $($probeEvent.Groups[2].Value)s"
@@ -225,11 +251,34 @@ foreach ($v in $variants) {
     if ($engineEvent) { Write-Warn 'log contains "Signal Handler Activated" - the console interrupt reached the engine' }
     if ($shutdown)    { Write-Warn 'log contains "shutting down" - it terminated itself, it was not killed' }
 
+    # PRINT THE LOGS WHEN THE CONTAINER DIED.
+    #
+    # $logs was captured, regex-matched and then discarded, while the summary at
+    # the end said "look at the container logs above" - logs that were never
+    # printed. So the first real failure reported four dead variants, exit code 1
+    # and no console event, and the one thing that explained it (a C# compile
+    # error inside the probe) was invisible. Diagnosing it needed another run.
+    #
+    # A container that died is exactly the case where the log is the answer, so
+    # show it rather than describing where it would have been.
+    if ($died) {
+        if ($logs -and $logs.Trim()) {
+            Write-Host '    --- container log ---'
+            foreach ($line in ($logs.TrimEnd() -split "`r?`n")) { Write-Host "    $line" }
+            Write-Host '    --- end ---'
+        }
+        else {
+            Write-Warn 'the container produced NO output at all before exiting.'
+            Write-Warn 'That usually means the image failed to start rather than the process failing.'
+        }
+    }
+
     $null = $results.Add([pscustomobject]@{
         Variant    = $v.Key
         Survived   = (-not $died)
         DiedAtSec  = if ($died) { $died } else { '-' }
         ExitCode   = if ($died) { $exitCode } else { '-' }
+        HandlerReg = $handlerReg
         ConsoleEvt = if ($probeEvent.Success) { $probeEvent.Groups[1].Value } elseif ($engineEvent) { 'SIGINT' } else { 'none' }
     })
 

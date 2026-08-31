@@ -43,7 +43,17 @@ Write-Host "console-probe starting; will run for $seconds seconds"
 # It returns false - "not handled" - so the default action still occurs. We are
 # here to OBSERVE the behaviour, not suppress it; suppressing would tell us an
 # event arrived but not whether it is fatal.
-Add-Type -Namespace FlowTest -Name ConsoleProbe -UsingNamespace System -MemberDefinition @'
+# NO -UsingNamespace HERE. Add-Type -MemberDefinition already emits `using
+# System;` around the generated class, so passing -UsingNamespace System made it
+# a duplicate and the compile failed with
+#     error CS0105: The using directive for 'System' appeared previously
+# Add-Type surfaces that as a terminating error, so the probe died inside
+# Add-Type before registering anything. Every variant then exited 1 in ~12s with
+# no console event - which reads exactly like "something else is killing it",
+# the one outcome that sends you looking in the wrong place. The member
+# definition below is fully qualified (System.DateTime, System.Console), so the
+# parameter bought nothing even when it worked.
+Add-Type -Namespace FlowTest -Name ConsoleProbe -MemberDefinition @'
     public delegate bool Handler(uint ctrlType);
 
     [System.Runtime.InteropServices.DllImport("Kernel32", SetLastError = true)]
