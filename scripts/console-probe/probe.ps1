@@ -8,9 +8,13 @@
     - the parent console goes away and the child is signalled.
 
     In a container the engine is the entrypoint process with no interactive
-    console at all, and nobody knows what happens. That question does not need
-    the engine to answer it: it needs ANY process that registers the same
-    handler and reports what arrives.
+    console at all. That question does not need the engine to answer it: it
+    needs ANY process that registers the same handler and reports what arrives.
+
+    ANSWERED 2026-08-31 on the flow-test host: this probe registered its handler
+    successfully ("handler registered: True") and received NOTHING in 120s, in
+    all four container shapes. The runtime does not send console control events
+    unprompted.
 
     Three outcomes, all informative:
 

@@ -17,8 +17,17 @@
     Only a foreground interactive session worked.
 
     In a container the engine is the entrypoint process with no interactive
-    console at all. Whether it survives that is unverified, and 6 of our 12
-    images are order-execution-server family.
+    console at all, and 6 of our 12 images are order-execution-server family.
+
+    RESULT, 2026-08-31, on the flow-test host (Server 2022 build 20348, MCR
+    25.0.7m9): all four container shapes survived 120s, and every one reported
+    "handler registered: True" - a real SetConsoleCtrlHandler handler WAS
+    listening and nothing arrived. So the runtime does not deliver console
+    control events unprompted, and the ~45s death on the host was the parent
+    console going away, which a container entrypoint does not have.
+
+    That measured the RUNTIME. -Mode image below is what confirms it for the
+    engine itself.
 
     TWO MODES
 
@@ -27,8 +36,10 @@
         console control handler and reports what arrives. Needs NO engine image,
         NO staged config and NO flow-test stack - just a Server 2022 host with
         Docker. That matters, because the console question is a property of the
-        RUNTIME, and making it wait for artifact staging would leave the highest
-        risk in the project untested for weeks.
+        RUNTIME, and making it wait for artifact staging would have left the
+        highest risk in the project untested for weeks. That decoupling is what
+        let the question be answered on 2026-08-31, before any engine image
+        existed.
 
     -Mode image -Image <ref> -ConfigDir <dir>
         The real thing, once an OE image and its config exist. Same four console
@@ -297,9 +308,23 @@ if ($survivors.Count -eq $results.Count -and $anyEvent.Count -eq 0) {
     Write-Ok "every variant survived ${WatchSeconds}s and no console event was delivered"
     Write-Host ''
     Write-Host 'What this means:'
-    Write-Host '  The container runtime does not send console control events unprompted.'
-    Write-Host '  The order execution server dying at ~45s on the HOST was the parent'
-    Write-Host '  console going away - and a container does not have one to lose.'
+
+    # The conclusion depends on whether anything was LISTENING. Do not print the
+    # confident version unless the handler actually installed.
+    $registered = @($results | Where-Object { $_.HandlerReg -eq 'True' })
+    if ($Mode -ne 'probe' -or $registered.Count -eq $results.Count) {
+        Write-Host '  The container runtime does not send console control events unprompted.'
+        Write-Host '  The order execution server dying at ~45s on the HOST was the parent'
+        Write-Host '  console going away - and a container does not have one to lose.'
+    }
+    else {
+        Write-Warn '  The handler did NOT install in every variant, so "no event" is weaker'
+        Write-Warn '  than it looks: nothing was listening. What this does show is that the'
+        Write-Warn '  process is not killed within the window - and that the engine own'
+        Write-Warn '  console handler would not install either, so it cannot be signalled'
+        Write-Warn '  through one. Good news for containerising it, different reasoning.'
+        Write-Warn "  Variants with a registered handler: $($registered.Count)/$($results.Count)"
+    }
     Write-Host ''
     if ($Mode -eq 'probe') {
         Write-Host '  This is strong evidence, not proof for the engine itself. Re-run with'

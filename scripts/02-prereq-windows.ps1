@@ -56,7 +56,13 @@ param(
     [string]$ReadyMarker,
 
     [switch]$SkipReboot,
-    [switch]$SkipNetworks
+    [switch]$SkipNetworks,
+
+    # Run ONLY the route-priority fix and exit. This is what the boot-triggered
+    # scheduled task invokes: the prod-NIC default routes come back from DHCP on
+    # every reboot, and UserData runs once per instance, so without a task at
+    # boot a host that reboots on day three silently loses egress.
+    [switch]$RoutesOnly
 )
 
 $ErrorActionPreference = 'Stop'
@@ -244,17 +250,54 @@ function Install-MsiFromUrl {
         [string[]]$ExtraArgs = @()
     )
     $installer = Join-Path $env:TEMP $FileName
-    Write-Host "  downloading $DisplayName ..."
-    Invoke-Download -Uri $Uri -OutFile $installer
 
-    $msiArgs = @('/i', "`"$installer`"", '/qn', '/norestart') + $ExtraArgs
-    $proc = Start-Process -FilePath 'msiexec.exe' -ArgumentList $msiArgs -Wait -PassThru
-    # 3010 = success, reboot required
-    if ($proc.ExitCode -notin @(0, 3010)) {
-        throw "$DisplayName installation failed with exit code $($proc.ExitCode)"
+    # RETRY, because the observed failure was a bad DOWNLOAD, not a bad package.
+    #
+    # mssql-tools18 failed on a real host with msiexec exit code 1620,
+    # ERROR_INSTALL_PACKAGE_INVALID - "this installation package could not be
+    # opened". That is what a truncated or corrupted file looks like, and the
+    # original code reported it as an installation failure and moved on, which
+    # sends you looking at the package instead of the transfer.
+    #
+    # An MSI that did not finish downloading is also usually implausibly small,
+    # so check the size before handing it to msiexec and say so plainly.
+    $minBytes = 100KB
+    $attempts = 2
+    for ($attempt = 1; $attempt -le $attempts; $attempt++) {
+        Remove-Item $installer -Force -ErrorAction SilentlyContinue
+        if ($attempt -eq 1) { Write-Host "  downloading $DisplayName ..." }
+        else                { Write-Warn "  re-downloading $DisplayName (attempt $attempt of $attempts) ..." }
+        Invoke-Download -Uri $Uri -OutFile $installer
+
+        $size = (Get-Item $installer -ErrorAction SilentlyContinue).Length
+        if (-not $size -or $size -lt $minBytes) {
+            Write-Warn "  downloaded file is only $size bytes - that is too small to be a valid MSI"
+            if ($attempt -lt $attempts) { continue }
+            throw "$DisplayName download produced a $size byte file after $attempts attempts."
+        }
+
+        $msiArgs = @('/i', "`"$installer`"", '/qn', '/norestart') + $ExtraArgs
+        $proc = Start-Process -FilePath 'msiexec.exe' -ArgumentList $msiArgs -Wait -PassThru
+        # 3010 = success, reboot required
+        if ($proc.ExitCode -in @(0, 3010)) {
+            Remove-Item $installer -Force -ErrorAction SilentlyContinue
+            Write-Ok "$DisplayName installed"
+            return
+        }
+
+        if ($proc.ExitCode -eq 1620 -and $attempt -lt $attempts) {
+            Write-Warn "  msiexec 1620 (package could not be opened) on a $size byte file - retrying the download"
+            continue
+        }
+
+        $hint = switch ($proc.ExitCode) {
+            1620    { ' (ERROR_INSTALL_PACKAGE_INVALID - the file is corrupt or is not an MSI)' }
+            1603    { ' (ERROR_INSTALL_FAILURE - a generic msiexec failure; check the MSI log)' }
+            1618    { ' (ERROR_INSTALL_ALREADY_RUNNING - another install holds the installer mutex)' }
+            default { '' }
+        }
+        throw "$DisplayName installation failed with exit code $($proc.ExitCode)$hint"
     }
-    Remove-Item $installer -Force -ErrorAction SilentlyContinue
-    Write-Ok "$DisplayName installed"
 }
 
 # ----------------------------- steps -----------------------------
@@ -262,16 +305,28 @@ function Install-MsiFromUrl {
 function Set-ProdNicRoutePriority {
     Write-Step 'Route priority (keep egress on the management NIC)'
 
-    # DEFENSIVE, not corrective. Measured on a real host (2026-08-17): Windows
-    # kept one default route via the management NIC and egress worked, so a
-    # blackhole route was NOT what broke bootstrap or SSM registration - that was
-    # transient network readiness at boot.
+    # CORRECTIVE, and it fires. This comment used to say "defensive, not
+    # corrective", on the strength of one host on 2026-08-17 where Windows kept a
+    # single default route via the management NIC and the function was a no-op.
     #
-    # Retained as cheap insurance, because the failure mode would be silent and
-    # confusing if it ever occurred: every VPC subnet offers its .1 as a gateway
-    # over DHCP, and the prod-mirroring subnets have no 0.0.0.0/0 route by design.
-    # This function is a no-op on a correctly-routed host. It also serves as a
-    # diagnostic: it prints the live default routes and tests egress.
+    # A reboot on 2026-08-31 settled it the other way. Same host, same NIC,
+    # before and after:
+    #
+    #   before reboot   [skip] ifIndex <a> (<prod-nic-ip>) has no default route
+    #   after  reboot   [ok]   removed default route on ifIndex <b> (<prod-nic-ip>)
+    #
+    # DHCP re-adds a 0.0.0.0/0 route on every prod NIC at every boot, and the
+    # interface indices are renumbered too, so nothing that pins an index
+    # survives either. Every VPC subnet offers its .1 as a gateway,
+    # and the prod-mirroring subnets have no route to the internet by design - so
+    # those routes are blackholes.
+    #
+    # UserData runs ONCE per instance. That is why Register-RoutePriorityTask
+    # exists: a host that reboots later needs this to run again, or egress dies
+    # and it presents as an SSM or image-pull fault rather than a routing one.
+    #
+    # It also serves as a diagnostic: it prints the live default routes and tests
+    # egress.
     if (-not $Plan) {
         Write-Skip 'no flow plan - cannot identify prod NICs'
         return
@@ -357,6 +412,61 @@ function Test-ContainerPlatformLive {
     }
     catch {
         return $false
+    }
+}
+
+function Register-RoutePriorityTask {
+    Write-Step 'Persist route priority across reboots'
+
+    # THE SCRIPT IS COPIED TO A STABLE PATH ON PURPOSE.
+    #
+    # This script normally runs from the extracted tarball directory, whose name
+    # carries the bootstrap commit sha:
+    #   C:\FlowTest\bootstrap\tooling\<owner>-<repo>-7043887\scripts\...
+    # A scheduled task pointing there breaks the moment the host is bootstrapped
+    # from a different commit, and it breaks SILENTLY - the task runs, fails to
+    # find the file, and egress dies at the next reboot with nothing to link the
+    # two events. Copying to a fixed path keeps one source of the route logic
+    # (no duplicated function to drift) at an address that does not move.
+    $stableDir  = 'C:\FlowTest\bootstrap'
+    $stablePath = Join-Path $stableDir 'route-priority.ps1'
+    $planPath   = if ($PlanFile) { (Resolve-Path $PlanFile -ErrorAction SilentlyContinue).Path } else { $null }
+    if (-not $planPath) {
+        Write-Skip 'no resolvable plan file - cannot register the boot task'
+        return
+    }
+
+    $self = $PSCommandPath
+    if (-not $self -or -not (Test-Path $self)) {
+        Write-Skip 'cannot resolve this script path - skipping the boot task'
+        return
+    }
+
+    try {
+        if (-not (Test-Path $stableDir)) { $null = New-Item -ItemType Directory -Path $stableDir -Force }
+        Copy-Item -Path $self -Destination $stablePath -Force
+
+        $taskName = 'FlowTestRoutePriority'
+        $argument = '-NoProfile -ExecutionPolicy Bypass -File "{0}" -PlanFile "{1}" -RoutesOnly' -f $stablePath, $planPath
+        $action    = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument $argument
+        $trigger   = New-ScheduledTaskTrigger -AtStartup
+        $principal = New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccount -RunLevel Highest
+        # A short delay: at AtStartup the NICs may not have finished DHCP, and
+        # removing a route that has not been added yet accomplishes nothing.
+        $settings  = New-ScheduledTaskSettingsSet -StartWhenAvailable -AllowStartIfOnBatteries `
+                        -DontStopIfGoingOnBatteries -ExecutionTimeLimit (New-TimeSpan -Minutes 10)
+        $trigger.Delay = 'PT45S'
+
+        Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $trigger `
+            -Principal $principal -Settings $settings -Force -ErrorAction Stop | Out-Null
+        Write-Ok "scheduled task '$taskName' registered (at startup, +45s, as SYSTEM)"
+        Write-Host "         runs: $stablePath -RoutesOnly"
+    }
+    catch {
+        # Not fatal. The routes are correct RIGHT NOW because
+        # Set-ProdNicRoutePriority already ran; this only protects a later reboot.
+        Write-Warn "could not register the boot task: $($_.Exception.Message)"
+        Write-Warn 'Egress is correct now but may not survive a reboot. Re-run this script after one.'
     }
 }
 
@@ -531,6 +641,31 @@ function Install-ChocoPackages {
     }
     $env:Path = [Environment]::GetEnvironmentVariable('Path', 'Machine') + ';' +
                 [Environment]::GetEnvironmentVariable('Path', 'User')
+
+    # Temurin installs cleanly and still leaves java unreachable.
+    #
+    # On a real host the package reported
+    #     Deployed to 'C:\Program Files\Eclipse Adoptium\jdk-17.0.17.10-hotspot\'
+    # and verification then said "java not available". The MSI does not extend the
+    # machine PATH, so nothing after it can find java - the same class of problem
+    # already fixed for docker and for git, and worth fixing the same way rather
+    # than leaving a tool that is installed but unusable.
+    if (-not (Test-CommandExists 'java')) {
+        $jdkBin = Get-ChildItem 'C:\Program Files\Eclipse Adoptium' -Directory -ErrorAction SilentlyContinue |
+                  Where-Object { Test-Path (Join-Path $_.FullName 'bin\java.exe') } |
+                  Sort-Object Name -Descending |
+                  Select-Object -First 1
+        if ($jdkBin) {
+            $binDir = Join-Path $jdkBin.FullName 'bin'
+            if (Add-MachinePathEntry -Directory $binDir -Label 'java') {
+                $env:Path = "$env:Path;$binDir"
+            }
+            if (Test-CommandExists 'java') { Write-Ok "java now resolvable: $((& java -version 2>&1 | Select-Object -First 1))" }
+        }
+        else {
+            Write-Skip 'no Eclipse Adoptium JDK found to add to PATH (java stays unavailable, it is optional)'
+        }
+    }
 }
 
 function Install-GitFallback {
@@ -967,9 +1102,21 @@ try {
     Write-Host '  ------------------------------------------------' -ForegroundColor DarkGray
 
     Assert-Administrator
+
+    # -RoutesOnly is the boot-task entry point. It must do the minimum and get
+    # out: at startup this runs before anything else needs the host, and a full
+    # prerequisite pass at every boot would be both slow and surprising.
+    if ($RoutesOnly) {
+        Import-FlowPlan
+        Set-ProdNicRoutePriority
+        Write-Ok 'route priority reapplied after boot'
+        exit 0
+    }
+
     Assert-SupportedOs
     Import-FlowPlan
     Set-ProdNicRoutePriority   # must precede anything that needs the network
+    Register-RoutePriorityTask # ...and must keep being applied after a reboot
 
     Enable-ContainerFeatures
     Install-Chocolatey
@@ -999,10 +1146,12 @@ try {
        .\build-images.ps1 -GitHubTokenSecretId flowtest/github-pat
      Tags already in ECR are skipped, so this is a no-op for an unchanged flow.
 
-  2. Before any flow uses an oe or oe-risk image, run the console probe once:
-       .\test-oe-console.ps1
-     The order execution server has been seen dying ~45s after launch when it
-     does not own its console. Inside a flow that looks like a network fault.
+  2. The console question is ANSWERED for the runtime (probed 2026-08-31): a real
+     console handler installed and NO event arrived in 120s across four container
+     shapes, so the runtime sends nothing unprompted. Still worth confirming for
+     the engine itself once an OE image exists:
+       .\test-oe-console.ps1 -Mode image -Image <ref> -ConfigDir <dir>
+     Use plain detached - no -i, no -t.
 
 "@ -ForegroundColor Gray
 
