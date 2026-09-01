@@ -171,6 +171,43 @@ function Test-CommandExists {
     return [bool](Get-Command $Name -ErrorAction SilentlyContinue)
 }
 
+function Get-CommandVersion {
+    <#
+        ONE definition of "does this tool work", returning both the verdict and
+        what the tool said. Everything that asks the question uses this.
+
+        It exists because two different implementations disagreed on the same
+        host: the installer path used Get-Command (satisfied by a Chocolatey
+        shim) and skipped its own fix, while the verification pass invoked the
+        tool inside a scriptblock under $ErrorActionPreference='Stop' and
+        reported it unavailable. Under PS 5.1 any native stderr becomes a
+        terminating ErrorRecord when EAP is 'Stop', and `java -version` writes
+        its banner to stderr - so a working java can be reported as missing.
+        Dropping to 'Continue' for the call removes that whole class of error.
+    #>
+    param(
+        [string] $Name,
+        [string[]] $Arguments = @()
+    )
+    if (-not (Test-CommandExists $Name)) {
+        return [pscustomobject]@{ Ok = $false; Text = 'not found on PATH'; Exit = $null }
+    }
+    $prev = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        $out  = & $Name @Arguments 2>&1 | Out-String
+        $code = $LASTEXITCODE
+        $first = ($out.Trim() -split "`r?`n" | Select-Object -First 1)
+        # Some tools report a version and exit non-zero (usage screens do this).
+        # Treat "said something" as working and record the code for the log.
+        return [pscustomobject]@{ Ok = [bool]($out.Trim()); Text = $first; Exit = $code }
+    }
+    catch {
+        return [pscustomobject]@{ Ok = $false; Text = $_.Exception.Message; Exit = $null }
+    }
+    finally { $ErrorActionPreference = $prev }
+}
+
 function Test-CommandRuns {
     <#
         RESOLVING is not the same as WORKING, and the difference cost a run.
@@ -973,8 +1010,22 @@ function Install-SqlClientTools {
     if (Test-CommandExists 'sqlcmd') {
         Write-Skip 'sqlcmd already present'
     } else {
+        # THE LICENSE PROPERTY NAME IS PACKAGE-SPECIFIC, and getting it wrong
+        # produces msiexec 1603 - a completely generic "install failure" that
+        # says nothing about a missing property.
+        #
+        # We passed IACCEPTMSSQLTOOLSLICENSETERMS, which belongs to the older
+        # mssql-tools package and does not exist in this MSI at all. Reading the
+        # MSI's own strings shows what it actually declares:
+        #     IACCEPTMSSQLCMDLNUTILSLICENSETERMS
+        # With the launch condition unsatisfied, the install aborts as 1603.
+        #
+        # Both are passed because an unknown property is harmless to msiexec (it
+        # just becomes a property nobody reads), so this survives Microsoft
+        # renaming the package again.
         Install-MsiFromUrl -Uri $Config.MsSqlToolsUrl -FileName 'mssql-tools18.msi' `
-            -DisplayName 'mssql-tools18 (sqlcmd)' -ExtraArgs @('IACCEPTMSSQLTOOLSLICENSETERMS=YES')
+            -DisplayName 'mssql-tools18 (sqlcmd)' `
+            -ExtraArgs @('IACCEPTMSSQLCMDLNUTILSLICENSETERMS=YES', 'IACCEPTMSSQLTOOLSLICENSETERMS=YES')
         # Same helper as docker. This used to call SetEnvironmentVariable(...,
         # 'Machine'), which rewrites PATH as REG_SZ and stops %SystemRoot% style
         # entries expanding, and it matched on substring so a similarly named
@@ -1129,12 +1180,20 @@ function Test-Prerequisites {
 
     # Only the container runtime is REQUIRED. Everything else is convenience
     # tooling for later pipeline stages and must not fail this host.
+    # Name + Arguments, resolved through Get-CommandVersion, NOT ad-hoc
+    # scriptblocks. The scriptblocks ran under $ErrorActionPreference='Stop',
+    # where PS 5.1 turns native stderr into a terminating error - and
+    # `java -version` writes its banner to stderr. So this loop could report a
+    # perfectly working tool as "not available", which is exactly what it did:
+    # the install path (asking a different way) saw java working and correctly
+    # skipped its PATH fix, while this loop warned java was missing. One of the
+    # two was lying and there was no way to tell which from the log.
     $checks = @(
-        @{ Label = 'docker';  Required = $true;  Script = { docker --version } },
-        @{ Label = 'git';     Required = $false; Script = { git --version } },
-        @{ Label = 'aws';     Required = $false; Script = { aws --version } },
-        @{ Label = 'java';    Required = $false; Script = { java -version 2>&1 | Select-Object -First 1 } },
-        @{ Label = 'sqlcmd';  Required = $false; Script = { sqlcmd -? 2>&1 | Select-Object -First 1 } }
+        @{ Label = 'docker';  Required = $true;  Name = 'docker'; Arguments = @('--version') },
+        @{ Label = 'git';     Required = $false; Name = 'git';    Arguments = @('--version') },
+        @{ Label = 'aws';     Required = $false; Name = 'aws';    Arguments = @('--version') },
+        @{ Label = 'java';    Required = $false; Name = 'java';   Arguments = @('-version') },
+        @{ Label = 'sqlcmd';  Required = $false; Name = 'sqlcmd'; Arguments = @('-?') }
     )
     # Verify the PERSISTED PATH, not just this session's. $env:Path was patched
     # in-process during the install, so a check that only looks there would pass
@@ -1152,16 +1211,18 @@ function Test-Prerequisites {
     }
 
     foreach ($check in $checks) {
-        try {
-            $out = & $check.Script 2>&1 | Out-String
-            Write-Ok "$($check.Label): $($out.Trim() -split "`n" | Select-Object -First 1)"
-        } catch {
-            if ($check.Required) {
-                Write-Fail "$($check.Label) not working (REQUIRED)"
-                $failures += $check.Label
-            } else {
-                Write-Warn "$($check.Label) not available (optional)"
-            }
+        $result = Get-CommandVersion -Name $check.Name -Arguments $check.Arguments
+        if ($result.Ok) {
+            Write-Ok "$($check.Label): $($result.Text)"
+        }
+        elseif ($check.Required) {
+            Write-Fail "$($check.Label) not working (REQUIRED): $($result.Text)"
+            $failures += $check.Label
+        }
+        else {
+            # Say WHY, not just that it is missing. "java not available" sent us
+            # looking for an install problem when the tool was on PATH.
+            Write-Warn "$($check.Label) not available (optional): $($result.Text)"
         }
     }
 
