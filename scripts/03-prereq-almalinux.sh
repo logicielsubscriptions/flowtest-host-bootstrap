@@ -40,6 +40,11 @@
 #
 set -euo pipefail
 
+# Printed first, every run. See the note in 02-prereq-windows.ps1: without a
+# version in the output a stale fetch is invisible, and a retest can silently
+# re-run old code while looking like a fresh result.
+SCRIPT_VERSION='2026-09-01.1-cmdversion-license'
+
 # --------------------------- configuration ---------------------------
 # Host-level constants only. Flow specifics come from the plan file.
 
@@ -725,6 +730,7 @@ print_next_steps() {
 
 main() {
   printf '\n  VCVW Flow - AlmaLinux container host prerequisites\n'
+  printf '%b  script version %s%b\n' "$C_GREY" "$SCRIPT_VERSION" "$C_OFF"
   printf '%b  -------------------------------------------------%b\n' "$C_GREY" "$C_OFF"
 
   assert_root

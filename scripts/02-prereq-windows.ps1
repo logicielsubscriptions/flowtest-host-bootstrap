@@ -68,6 +68,18 @@ param(
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 
+# PRINTED FIRST, ON EVERY RUN. Bump it with every published change.
+#
+# Four host-side retests were run without this, and one of them produced output
+# byte-identical to the previous run because the repo had not been republished -
+# a stale fetch is invisible when nothing in the output identifies the code. The
+# whole round was spent re-diagnosing fixes that were never on the host.
+#
+# The same lesson as PIPELINE_VERSION in Jenkinsfile-generate-cfn, which was
+# itself once left un-bumped so a build reported a version that did not describe
+# the code it ran. Cheap marker, expensive absence.
+$script:ScriptVersion = '2026-09-01.1-cmdversion-license'
+
 # ----------------------------- configuration -----------------------------
 
 # Host-level constants only. Everything flow-specific comes from $PlanFile.
@@ -1286,6 +1298,7 @@ function Test-Prerequisites {
 try {
     Write-Host ''
     Write-Host '  VCVW Flow - Windows container host prerequisites' -ForegroundColor White
+    Write-Host "  script version $ScriptVersion" -ForegroundColor DarkGray
     Write-Host '  ------------------------------------------------' -ForegroundColor DarkGray
 
     Assert-Administrator
