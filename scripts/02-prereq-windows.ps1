@@ -75,8 +75,24 @@ $script:Config = @{
     BaseImage      = 'mcr.microsoft.com/windows/servercore:ltsc2022'
     JdkPackage     = 'openjdk17'
     McrInstallUrl  = 'https://get.mirantis.com/install.ps1'
-    OdbcUrl        = 'https://go.microsoft.com/fwlink/?linkid=2280794'   # msodbcsql18 x64
-    MsSqlToolsUrl  = 'https://go.microsoft.com/fwlink/?linkid=2280795'   # mssql-tools18 x64
+    # DO NOT TRUST A FWLINK ID BECAUSE IT USED TO WORK. Microsoft RECYCLES them.
+    #
+    # linkid=2280795 was the mssql-tools18 x64 installer. As of 2026-09-01 it
+    # 302s to a Microsoft Learn RSS feed for an unrelated product
+    # (dynamics365-remote-assist-242) and returns 873 bytes of XML. The host
+    # downloaded that 873-byte file, handed it to msiexec, and got exit 1620
+    # (ERROR_INSTALL_PACKAGE_INVALID) - which reads as "corrupt download" and
+    # sends you looking at the transfer instead of the URL. Two retries produced
+    # the same 873 bytes, which is what proved it was not truncation.
+    #
+    # Both IDs below were verified on 2026-09-01 to return real MSIs whose
+    # Subject matches the expected product. If sqlcmd starts failing again, check
+    # what the fwlink actually resolves to BEFORE assuming a network fault:
+    #   curl -sSL -o /tmp/x -w '%{url_effective} %{size_download}\n' <fwlink>
+    # Current source of truth:
+    # learn.microsoft.com/en-us/sql/tools/sqlcmd/sqlcmd-download-install
+    OdbcUrl        = 'https://go.microsoft.com/fwlink/?linkid=2280794'   # msodbcsql18 x64, verified
+    MsSqlToolsUrl  = 'https://go.microsoft.com/fwlink/?linkid=2370127'   # cmd line utils 17.0.4055.5 x64, verified
     WorkRoot       = 'C:\FlowTest'
 }
 
@@ -153,6 +169,37 @@ function Assert-SupportedOs {
 function Test-CommandExists {
     param([string]$Name)
     return [bool](Get-Command $Name -ErrorAction SilentlyContinue)
+}
+
+function Test-CommandRuns {
+    <#
+        RESOLVING is not the same as WORKING, and the difference cost a run.
+
+        Chocolatey leaves shims in C:\ProgramData\chocolatey\bin, which is on the
+        machine PATH. After its openjdk17 package installed, `Get-Command java`
+        succeeded - so the PATH fallback below decided there was nothing to fix -
+        while the verification pass, which actually runs `java -version`, reported
+        java unavailable. Two checks for the same fact, disagreeing, and the
+        weaker one gating the fix for the stronger one.
+
+        This runs the command and requires it to exit 0 AND say something. Native
+        tools often write their version banner to stderr (java does), so 2>&1 is
+        required, and $ErrorActionPreference must drop to Continue for the call:
+        under 'Stop', PS 5.1 turns any native stderr into a terminating error.
+    #>
+    param(
+        [string] $Name,
+        [string[]] $Arguments = @()
+    )
+    if (-not (Test-CommandExists $Name)) { return $false }
+    $prev = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        $out = & $Name @Arguments 2>&1 | Out-String
+        return [bool]($LASTEXITCODE -eq 0 -and $out.Trim())
+    }
+    catch { return $false }
+    finally { $ErrorActionPreference = $prev }
 }
 
 function Add-MachinePathEntry {
@@ -274,8 +321,40 @@ function Install-MsiFromUrl {
         # aborting the script for what is meant to be a HANDLED failure, which
         # would defeat the retry immediately below.
         $size = if (Test-Path $installer) { (Get-Item $installer).Length } else { 0 }
-        if (-not $size -or $size -lt $minBytes) {
-            Write-Warn "  downloaded file is only $size bytes - that is too small to be a valid MSI"
+
+        # CHECK WHAT THE FILE ACTUALLY IS, not just how big it is.
+        #
+        # An MSI is an OLE compound document and always starts D0 CF 11 E0. A
+        # recycled fwlink hands back an HTML or XML error page instead, and the
+        # size check alone reported that as "too small", which reads as a
+        # truncated transfer and invites a retry that cannot help. Retrying a
+        # wrong URL is just doing the wrong thing twice: linkid 2280795 returned
+        # the same 873-byte RSS feed on both attempts.
+        $isMsi = $false
+        $head  = ''
+        if ($size -ge 8) {
+            $bytes = [IO.File]::ReadAllBytes($installer)[0..7]
+            $isMsi = ($bytes[0] -eq 0xD0 -and $bytes[1] -eq 0xCF -and $bytes[2] -eq 0x11 -and $bytes[3] -eq 0xE0)
+            if (-not $isMsi) {
+                try { $head = ([IO.File]::ReadAllText($installer)).Substring(0, [Math]::Min(160, $size)) } catch { }
+            }
+        }
+
+        if (-not $isMsi) {
+            if ($head -match '(?i)<\?xml|<html|<rss|<!DOCTYPE') {
+                # Unambiguous: the URL is serving a web page. Do not retry.
+                Write-Fail "  the download URL returned a web page, not an MSI ($size bytes)."
+                Write-Warn  "  $($head -replace '\s+', ' ')"
+                throw ("$DisplayName URL does not serve an installer. Check where it redirects - " +
+                       'Microsoft recycles fwlink ids onto unrelated products. See the Config block.')
+            }
+            Write-Warn "  downloaded $size bytes that are not a valid MSI (bad magic bytes)"
+            if ($attempt -lt $attempts) { continue }
+            throw "$DisplayName download produced a $size byte non-MSI file after $attempts attempts."
+        }
+
+        if ($size -lt $minBytes) {
+            Write-Warn "  MSI is only $size bytes, which is implausibly small"
             if ($attempt -lt $attempts) { continue }
             throw "$DisplayName download produced a $size byte file after $attempts attempts."
         }
@@ -678,25 +757,36 @@ function Install-ChocoPackages {
     $env:Path = [Environment]::GetEnvironmentVariable('Path', 'Machine') + ';' +
                 [Environment]::GetEnvironmentVariable('Path', 'User')
 
-    # Temurin installs cleanly and still leaves java unreachable.
+    # Temurin installs cleanly and still leaves java unusable.
     #
     # On a real host the package reported
     #     Deployed to 'C:\Program Files\Eclipse Adoptium\jdk-17.0.17.10-hotspot\'
-    # and verification then said "java not available". The MSI does not extend the
-    # machine PATH, so nothing after it can find java - the same class of problem
-    # already fixed for docker and for git, and worth fixing the same way rather
-    # than leaving a tool that is installed but unusable.
-    if (-not (Test-CommandExists 'java')) {
+    # and verification still said "java not available". The MSI does not extend
+    # the machine PATH - the same class of problem already fixed for docker and
+    # for git.
+    #
+    # Test-CommandRuns, NOT Test-CommandExists. The first attempt at this fix
+    # used Test-CommandExists and did nothing at all, silently: Chocolatey's
+    # openjdk17 package leaves a java.exe shim on the machine PATH, so the
+    # command RESOLVED and the whole block was skipped, while `java -version`
+    # still failed. Neither branch below printed anything, which is how a fix
+    # that never ran looked identical to a fix that ran and worked.
+    if (-not (Test-CommandRuns -Name 'java' -Arguments @('-version'))) {
         $jdkBin = Get-ChildItem 'C:\Program Files\Eclipse Adoptium' -Directory -ErrorAction SilentlyContinue |
                   Where-Object { Test-Path (Join-Path $_.FullName 'bin\java.exe') } |
                   Sort-Object Name -Descending |
                   Select-Object -First 1
         if ($jdkBin) {
             $binDir = Join-Path $jdkBin.FullName 'bin'
-            if (Add-MachinePathEntry -Directory $binDir -Label 'java') {
-                $env:Path = "$env:Path;$binDir"
+            $null = Add-MachinePathEntry -Directory $binDir -Label 'java'
+            # PREPEND, not append. A broken Chocolatey shim earlier on the PATH
+            # would otherwise keep winning over the real JDK we just added.
+            $env:Path = "$binDir;$env:Path"
+            if (Test-CommandRuns -Name 'java' -Arguments @('-version')) {
+                Write-Ok 'java now works from the Adoptium JDK'
+            } else {
+                Write-Warn 'java still does not run after adding the JDK to PATH (optional, continuing)'
             }
-            if (Test-CommandExists 'java') { Write-Ok "java now resolvable: $((& java -version 2>&1 | Select-Object -First 1))" }
         }
         else {
             Write-Skip 'no Eclipse Adoptium JDK found to add to PATH (java stays unavailable, it is optional)'
