@@ -78,7 +78,7 @@ Set-StrictMode -Version Latest
 # The same lesson as PIPELINE_VERSION in Jenkinsfile-generate-cfn, which was
 # itself once left un-bumped so a build reported a version that did not describe
 # the code it ran. Cheap marker, expensive absence.
-$script:ScriptVersion = '2026-09-01.1-cmdversion-license'
+$script:ScriptVersion = '2026-09-01.2-buildimages-routerepeat'
 
 # ----------------------------- configuration -----------------------------
 
@@ -592,17 +592,41 @@ function Register-RoutePriorityTask {
         $taskName = 'FlowTestRoutePriority'
         $argument = '-NoProfile -ExecutionPolicy Bypass -File "{0}" -PlanFile "{1}" -RoutesOnly' -f $stablePath, $planPath
         $action    = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument $argument
-        $trigger   = New-ScheduledTaskTrigger -AtStartup
+        # AT STARTUP IS NOT ENOUGH. Observed on a real host, 2026-09-01, across
+        # three consecutive runs with NO reboot between them:
+        #
+        #   run 1   [ok]   removed default route on ifIndex 14/17
+        #   run 2   [skip] ifIndex 14/17 has no default route
+        #   run 3   [ok]   removed default route on ifIndex 14/17
+        #
+        # The blackhole routes came back from a DHCP LEASE RENEWAL, not a reboot.
+        # A boot-only trigger would have already run and "succeeded" hours before
+        # egress died, and the symptom would present as an SSM or image-pull
+        # fault. So the task repeats for the life of the host.
+        #
+        # The work is idempotent and costs nothing when there is nothing to do -
+        # it prints [skip] and exits - so a frequent interval is cheap insurance
+        # against a failure mode that is otherwise silent and badly misleading.
         $principal = New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccount -RunLevel Highest
-        # A short delay: at AtStartup the NICs may not have finished DHCP, and
-        # removing a route that has not been added yet accomplishes nothing.
         $settings  = New-ScheduledTaskSettingsSet -StartWhenAvailable -AllowStartIfOnBatteries `
                         -DontStopIfGoingOnBatteries -ExecutionTimeLimit (New-TimeSpan -Minutes 10)
-        $trigger.Delay = 'PT45S'
 
-        Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $trigger `
+        # Boot trigger, delayed: at AtStartup the NICs may not have finished DHCP,
+        # and removing a route that has not been added yet accomplishes nothing.
+        $bootTrigger = New-ScheduledTaskTrigger -AtStartup
+        $bootTrigger.Delay = 'PT45S'
+
+        # Repeating trigger for lease renewals. Registered as a SECOND trigger
+        # rather than by setting Repetition on the boot trigger: a boot trigger's
+        # repetition is not honoured consistently across Windows versions, and
+        # this failing silently is exactly what it is meant to prevent.
+        $repeatTrigger = New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(5) `
+                            -RepetitionInterval (New-TimeSpan -Minutes 15)
+
+        Register-ScheduledTask -TaskName $taskName -Action $action `
+            -Trigger @($bootTrigger, $repeatTrigger) `
             -Principal $principal -Settings $settings -Force -ErrorAction Stop | Out-Null
-        Write-Ok "scheduled task '$taskName' registered (at startup, +45s, as SYSTEM)"
+        Write-Ok "scheduled task '$taskName' registered (at startup +45s, then every 15 min, as SYSTEM)"
         Write-Host "         runs: $stablePath -RoutesOnly"
     }
     catch {
