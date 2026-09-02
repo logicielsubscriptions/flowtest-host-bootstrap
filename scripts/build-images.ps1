@@ -58,7 +58,7 @@ $ErrorActionPreference = 'Stop'
 # Printed on every run. See the note in scripts/02-prereq-windows.ps1: without a
 # version in the output a stale fetch is invisible, and a retest can silently
 # re-run old code while looking like a fresh result.
-$ScriptVersion = '2026-09-01.3-ssm-reregister'
+$ScriptVersion = '2026-09-01.4-native-wrappers'
 Write-Host "  script version $ScriptVersion" -ForegroundColor DarkGray
 $ProgressPreference = 'SilentlyContinue'
 
@@ -66,6 +66,61 @@ $ProgressPreference = 'SilentlyContinue'
 # output helpers. Everything diagnostic goes to the host; only the summary is
 # meant to be read by a human at the end.
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# NATIVE COMMAND WRAPPERS. Use these for aws / docker / curl - never call them
+# bare, and never rely on a trailing 2>&1.
+#
+# This script sets $ErrorActionPreference = 'Stop', and in PS 5.1 ANY output a
+# native command writes to stderr then becomes a TERMINATING error - before the
+# next line can look at $LASTEXITCODE. Worse, the resulting NativeCommandError
+# usually has an EMPTY .Exception.Message, so the catch at the bottom printed a
+# bare "[FAIL]" with nothing after it.
+#
+# The old code tried to defend with:
+#     $null = (aws ecr describe-repositories --repository-names $x) 2>&1
+# but 2>&1 there binds to the PARENTHESISED EXPRESSION, not to the native
+# command, so aws's stderr still reached PowerShell unredirected. The first ECR
+# call - describe-repositories on a repository that does not exist yet, which
+# legitimately writes RepositoryNotFoundException to stderr and exits non-zero -
+# killed the whole run.
+#
+# Nine call sites had that pattern, and docker build / docker push had no
+# redirect at all even though docker writes its progress to stderr. So this
+# script could not have completed on any host.
+#
+# Invoke-Native  captures output and returns it with the exit code.
+# Invoke-NativeLive streams output through (for multi-minute builds and pushes,
+#                where losing progress to a capture buffer is worse than useless)
+#                and returns the exit code.
+# ---------------------------------------------------------------------------
+function Invoke-Native {
+    param(
+        [Parameter(Mandatory = $true)] [string] $File,
+        [Parameter(ValueFromRemainingArguments = $true)] [string[]] $Arguments
+    )
+    $prev = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        $out = & $File @Arguments 2>&1 | Out-String
+        return [pscustomobject]@{ ExitCode = $LASTEXITCODE; Output = $out.TrimEnd() }
+    }
+    finally { $ErrorActionPreference = $prev }
+}
+
+function Invoke-NativeLive {
+    param(
+        [Parameter(Mandatory = $true)] [string] $File,
+        [Parameter(ValueFromRemainingArguments = $true)] [string[]] $Arguments
+    )
+    $prev = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        & $File @Arguments 2>&1 | ForEach-Object { Write-Host "    $_" }
+        return $LASTEXITCODE
+    }
+    finally { $ErrorActionPreference = $prev }
+}
+
 function Write-Step { param([string] $Message) Write-Host ''; Write-Host "==> $Message" -ForegroundColor Cyan }
 function Write-Ok   { param([string] $Message) Write-Host "  [ok]   $Message" -ForegroundColor Green }
 function Write-Skip { param([string] $Message) Write-Host "  [skip] $Message" -ForegroundColor DarkGray }
@@ -102,7 +157,7 @@ function Test-Prerequisites {
             throw 'docker not found on PATH or at C:\Program Files\Docker. Run 02-prereq-windows.ps1 first.'
         }
     }
-    Write-Ok "docker: $((docker --version) 2>&1)"
+    Write-Ok "docker: $((Invoke-Native docker --version).Output)"
 
     if (-not (Get-Command aws -ErrorAction SilentlyContinue)) {
         throw 'aws CLI not found on PATH. 02-prereq-windows.ps1 installs it.'
@@ -125,11 +180,7 @@ function Test-Prerequisites {
         Write-Warn '(build 17763 -> ltsc2019). Continuing, but the built image will not match this host.'
     }
 
-    # 2>&1 on a native command under EAP=Stop turns stderr into a terminating
-    # error. Ask for the value without merging the streams.
-    $prevEap = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
-    $info = & docker info --format '{{.OSType}}' 2>$null
-    $ErrorActionPreference = $prevEap
+    $info = (Invoke-Native docker info --format '{{.OSType}}').Output
     if ("$info".Trim() -ne 'windows') {
         throw "the Docker daemon is in '$info' mode, not windows. Switch to Windows containers before building."
     }
@@ -236,7 +287,8 @@ function Get-GitHubToken {
     if ($GitHubTokenSecretId) {
         # Preferred: the instance role reads it. Nothing is typed, nothing is
         # stored on the host, and rotation happens in one place.
-        $value = (aws secretsmanager get-secret-value --secret-id $GitHubTokenSecretId --region $Region --query SecretString --output text) 2>&1
+        $r = Invoke-Native aws secretsmanager get-secret-value --secret-id $GitHubTokenSecretId --region $Region --query SecretString --output text
+        $value = $r.Output
         if ($LASTEXITCODE -ne 0) { throw "could not read secret '$GitHubTokenSecretId': $value" }
         # Accept either a bare token or {"token":"..."}
         $text = "$value".Trim()
@@ -265,8 +317,9 @@ The token needs read access to the deployment repos only (contents: read).
 # ---------------------------------------------------------------------------
 function Get-EcrRegistry {
     Write-Step 'ECR registry'
-    $account = (aws sts get-caller-identity --query Account --output text) 2>&1
-    if ($LASTEXITCODE -ne 0) { throw "aws sts get-caller-identity failed: $account" }
+    $r = Invoke-Native aws sts get-caller-identity --query Account --output text
+    $account = $r.Output
+    if ($r.ExitCode -ne 0) { throw "aws sts get-caller-identity failed: $account" }
     $registry = "$("$account".Trim()).dkr.ecr.$Region.amazonaws.com"
     Write-Ok $registry
     return $registry
@@ -275,15 +328,15 @@ function Get-EcrRegistry {
 function Confirm-EcrRepository {
     param([string] $RepoName)
 
-    $null = (aws ecr describe-repositories --repository-names $RepoName --region $Region) 2>&1
-    if ($LASTEXITCODE -eq 0) { return }
+    # A missing repository is a NORMAL result here, and aws reports it on stderr
+    # with a non-zero exit. That is exactly why this must not run bare.
+    if ((Invoke-Native aws ecr describe-repositories --repository-names $RepoName --region $Region).ExitCode -eq 0) { return }
 
     if ($DryRun) { Write-Skip "would create ECR repository $RepoName"; return }
 
-    $out = (aws ecr create-repository --repository-name $RepoName --region $Region `
-                --image-scanning-configuration scanOnPush=true `
-                --image-tag-mutability IMMUTABLE) 2>&1
-    if ($LASTEXITCODE -ne 0) { throw "could not create ECR repository ${RepoName}: $out" }
+    $r = Invoke-Native aws ecr create-repository --repository-name $RepoName --region $Region `
+             --image-scanning-configuration scanOnPush=true --image-tag-mutability IMMUTABLE
+    if ($r.ExitCode -ne 0) { throw "could not create ECR repository ${RepoName}: $($r.Output)" }
     # IMMUTABLE on purpose: an engine tag is a released build. If a tag could be
     # overwritten, two runs could use different code under one name and the
     # difference would surface as a replay mismatch.
@@ -292,8 +345,8 @@ function Confirm-EcrRepository {
 
 function Test-ImageExists {
     param([string] $RepoName, [string] $Tag)
-    $null = (aws ecr describe-images --repository-name $RepoName --image-ids "imageTag=$Tag" --region $Region) 2>&1
-    return ($LASTEXITCODE -eq 0)
+    # Absent tag = non-zero exit + stderr, which is a normal answer, not a fault.
+    return ((Invoke-Native aws ecr describe-images --repository-name $RepoName --image-ids "imageTag=$Tag" --region $Region).ExitCode -eq 0)
 }
 
 # ---------------------------------------------------------------------------
@@ -330,7 +383,8 @@ function Get-EngineSource {
     Set-Content -Path $cfg -Value $lines -Encoding ASCII
 
     try {
-        $out = (curl.exe --config $cfg) 2>&1
+        $cr  = Invoke-Native curl.exe --config $cfg
+        $out = $cr.Output
         if ($LASTEXITCODE -ne 0) {
             throw "download failed for $Repo@${Tag} (curl exit $LASTEXITCODE): $out"
         }
@@ -369,8 +423,9 @@ function Invoke-EcrLogin {
 
     # The password comes from the instance role. It is piped straight into docker
     # login and never written down.
-    $pw = (aws ecr get-login-password --region $Region) 2>&1
-    if ($LASTEXITCODE -ne 0) { throw "aws ecr get-login-password failed: $pw" }
+    $r  = Invoke-Native aws ecr get-login-password --region $Region
+    $pw = $r.Output
+    if ($r.ExitCode -ne 0) { throw "aws ecr get-login-password failed: $pw" }
     $prevEap = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
     $out = ("$pw" | & docker login --username AWS --password-stdin $Registry 2>&1 | Out-String)
     $loginExit = $LASTEXITCODE
@@ -441,7 +496,11 @@ To rebuild locally without pushing, add -SkipPush.
         $sha = Get-EngineSource -Repo $item.EngineRepo -Tag $item.Tag -Token $token -ContextDir $item.Context
 
         Write-Host "  building $imageRef"
-        docker build `
+        # Invoke-NativeLive, not a bare call: docker writes its build progress to
+        # STDERR, which under EAP=Stop is a terminating error on the first layer.
+        # Live rather than captured because this runs for minutes on a multi-GB
+        # engine tree and a silent terminal is indistinguishable from a hang.
+        $buildExit = Invoke-NativeLive docker build `
             --file (Join-Path $item.Context 'Dockerfile') `
             --tag $imageRef `
             --build-arg "ENGINE_REPO=$($item.EngineRepo)" `
@@ -449,7 +508,7 @@ To rebuild locally without pushing, add -SkipPush.
             --build-arg "SOURCE_COMMIT=$sha" `
             --build-arg "BINARY=$($item.Binary)" `
             $item.Context
-        if ($LASTEXITCODE -ne 0) { throw "docker build failed for $imageRef" }
+        if ($buildExit -ne 0) { throw "docker build failed for $imageRef (exit $buildExit)" }
         Write-Ok "built $imageRef"
 
         # The extracted engine tree is multi-GB in some repos. Do not leave it in
@@ -462,8 +521,9 @@ To rebuild locally without pushing, add -SkipPush.
             continue
         }
 
-        docker push $imageRef
-        if ($LASTEXITCODE -ne 0) { throw "docker push failed for $imageRef" }
+        # Same reasoning as the build: docker reports push progress on stderr.
+        $pushExit = Invoke-NativeLive docker push $imageRef
+        if ($pushExit -ne 0) { throw "docker push failed for $imageRef (exit $pushExit)" }
         Write-Ok "pushed $imageRef"
         $null = $results.Add([pscustomobject]@{ Image = "$($item.ImageFamily):$($item.Tag)"; Result = 'pushed'; Revision = $sha })
     }

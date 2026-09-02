@@ -64,7 +64,7 @@ $ErrorActionPreference = 'Stop'
 # Printed on every run. See the note in scripts/02-prereq-windows.ps1: without a
 # version in the output a stale fetch is invisible, and a retest can silently
 # re-run old code while looking like a fresh result.
-$ScriptVersion = '2026-09-01.3-ssm-reregister'
+$ScriptVersion = '2026-09-01.4-native-wrappers'
 Write-Host "  script version $ScriptVersion" -ForegroundColor DarkGray
 
 function Write-Step { param([string] $m) Write-Host ''; Write-Host "==> $m" -ForegroundColor Cyan }
@@ -158,7 +158,14 @@ Start-Sleep -Seconds 3
 $state = (Invoke-Docker inspect -f '{{.State.Status}}' $Name).Output.Trim()
 if ("$state".Trim() -ne 'running') {
     Write-Warn "container is '$state' three seconds after start. Last output:"
-    docker logs --tail 30 $Name
+    # Invoke-Docker, not a bare call. A container's own stderr comes back on
+    # stderr, so under EAP=Stop this line threw instead of printing the logs -
+    # losing exactly the diagnostic it exists to show, at the moment an engine
+    # failed to stay up. Every other docker call in this file already routes
+    # through the helper; this one was missed.
+    $logs = (Invoke-Docker logs --tail 30 $Name).Output
+    if ($logs) { foreach ($line in ($logs.TrimEnd() -split "`r?`n")) { Write-Host "    $line" } }
+    else { Write-Warn 'the container produced no output at all.' }
     throw "$Name did not stay running"
 }
 Write-Ok "running as $((Invoke-Docker inspect -f '{{.Config.Entrypoint}}' $Name).Output.Trim())"

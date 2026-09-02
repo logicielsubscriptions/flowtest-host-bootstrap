@@ -21,7 +21,7 @@ set -euo pipefail
 
 # Printed on every run. See the note in scripts/02-prereq-windows.ps1: without a
 # version in the output a stale fetch is invisible.
-SCRIPT_VERSION='2026-09-01.3-ssm-reregister'
+SCRIPT_VERSION='2026-09-01.4-native-wrappers'
 echo "  script version $SCRIPT_VERSION"
 
 PLAN_FILE=""
