@@ -28,6 +28,30 @@
     Everything after the handoff lives here: the FAILED marker, running the
     prereq script, interpreting its exit code, and writing READY.
 
+    WHY USERDATA RESTARTS THE SSM AGENT (step 1d), AND WHY IT IS NOT COSMETIC
+
+    Build 59 failed with "windows host never registered with SSM" while the
+    Linux host registered normally. It is a RACE, not a permanent fault:
+
+      boot            The SSM Agent starts. DHCP may have handed a prod NIC a
+                      default route that beats the management NIC - and the
+                      prod-mirroring subnets have no route to the internet by
+                      design, so that route is a blackhole.
+      agent           Cannot reach the SSM endpoints. Enters retry backoff.
+      UserData 1b     Removes the blackhole routes. Egress now works.
+      nothing         Restarts the agent, so it waits out its own backoff.
+      Jenkins gate 2  Times out, and the build fails on a host that would have
+                      registered a few minutes later.
+
+    The prod NICs sometimes come up with NO default route at all - we have
+    logged both outcomes on the same flow - which is why earlier builds passed.
+    We were winning the race, not avoiding it.
+
+    The prereq script only WARNED about this. Its own restart, in
+    Sync-ServiceEnvironment, runs much later and only when the PATH changed, so
+    it cannot help a readiness gate that has already given up. Restarting in
+    UserData the moment egress is confirmed costs about two seconds.
+
     THE READY / FAILED CONTRACT
 
     The pipeline polls for two marker files and nothing else:
@@ -53,7 +77,7 @@ $ErrorActionPreference = 'Stop'
 
 # Printed first, every run. See the note in 02-prereq-windows.ps1: without this
 # a stale fetch is invisible, and a retest can silently re-run old code.
-$ScriptVersion = '2026-09-01.2-buildimages-routerepeat'
+$ScriptVersion = '2026-09-01.3-ssm-reregister'
 Write-Host "bootstrap script version $ScriptVersion"
 
 if (-not $ReadyMarker) { $ReadyMarker = Join-Path $Root 'READY' }

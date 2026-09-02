@@ -17,6 +17,18 @@
 # write the flow plan, deprioritise the prod NICs, wait for egress, resolve the
 # GitHub token, fetch and extract the tooling tarball, then run this.
 #
+# WHY USERDATA RESTARTS THE SSM AGENT (step 1d)
+#
+# The SSM Agent starts at boot, before UserData removes the blackhole default
+# routes that DHCP puts on the prod-mirroring NICs. If it tries to reach the SSM
+# endpoints in that window it fails and enters retry backoff, and nothing wakes
+# it again - so a readiness gate can time out on a host that would have
+# registered minutes later. Build 59 failed exactly that way on the Windows side.
+#
+# Linux has been winning this race rather than avoiding it, so UserData restarts
+# the agent here too, immediately after egress is confirmed. Never fatal:
+# bootstrap itself does not need SSM.
+#
 # THE READY / FAILED CONTRACT
 #
 # The pipeline polls for two marker files and nothing else:
@@ -33,7 +45,7 @@ set -euo pipefail
 # Printed first, every run. See the note in 02-prereq-windows.ps1: without a
 # version in the output, a stale fetch is invisible and a retest can silently
 # re-run old code.
-SCRIPT_VERSION='2026-09-01.2-buildimages-routerepeat'
+SCRIPT_VERSION='2026-09-01.3-ssm-reregister'
 echo "bootstrap script version $SCRIPT_VERSION"
 
 ROOT=""
