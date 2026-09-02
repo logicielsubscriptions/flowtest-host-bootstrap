@@ -45,7 +45,7 @@ set -euo pipefail
 # Printed first, every run. See the note in 02-prereq-windows.ps1: without a
 # version in the output, a stale fetch is invisible and a retest can silently
 # re-run old code.
-SCRIPT_VERSION='2026-09-02.3-odbc-quotes'
+SCRIPT_VERSION='2026-09-02.5-vcredist'
 echo "bootstrap script version $SCRIPT_VERSION"
 
 ROOT=""

@@ -77,7 +77,7 @@ $ErrorActionPreference = 'Stop'
 
 # Printed first, every run. See the note in 02-prereq-windows.ps1: without this
 # a stale fetch is invisible, and a retest can silently re-run old code.
-$ScriptVersion = '2026-09-02.3-odbc-quotes'
+$ScriptVersion = '2026-09-02.5-vcredist'
 Write-Host "bootstrap script version $ScriptVersion"
 
 if (-not $ReadyMarker) { $ReadyMarker = Join-Path $Root 'READY' }
