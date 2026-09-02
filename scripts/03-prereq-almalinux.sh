@@ -43,7 +43,7 @@ set -euo pipefail
 # Printed first, every run. See the note in 02-prereq-windows.ps1: without a
 # version in the output a stale fetch is invisible, and a retest can silently
 # re-run old code while looking like a fresh result.
-SCRIPT_VERSION='2026-09-01.4-native-wrappers'
+SCRIPT_VERSION='2026-09-01.5-skippush-ecr'
 
 # --------------------------- configuration ---------------------------
 # Host-level constants only. Flow specifics come from the plan file.
