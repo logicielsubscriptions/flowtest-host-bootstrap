@@ -55,7 +55,7 @@ set -euo pipefail
 
 # Printed first, every run. A stale fetch is otherwise invisible - see the note
 # in 02-prereq-windows.ps1.
-SCRIPT_VERSION='2026-09-03.5-staging'
+SCRIPT_VERSION='2026-09-08.1-staging-fixes'
 
 PLAN_FILE="/opt/flowtest/bootstrap/flow-plan-linux.json"
 DRY_RUN=0
@@ -72,13 +72,26 @@ warn() { printf '%b  [warn] %b%s\n'  "$C_YELLOW" "$C_OFF" "$*"; }
 fail() { printf '%b  [FAIL] %b%s\n'  "$C_RED"   "$C_OFF" "$*"; }
 die()  { fail "$*"; exit 1; }
 
+# "${2:-}", NOT "$2". Build 67 died here with
+#     04-stage-artifacts.sh: line 81: $2: unbound variable
+# because the caller passed a trailing "--github-token-ref" with no value (the
+# Jenkins GitHubTokenRef parameter was empty), and under `set -u` a missing $2
+# is fatal. The message names a line number and a shell variable - it says
+# nothing about which option was wrong, or that the option was simply optional.
+#
+# An empty value is a legitimate way to say "no token": the flag then behaves as
+# if it were absent, and the components that need one are skipped with a reason.
+# Only a MISSING value for an option that needs one is an error, and it now says
+# which option.
+need_value() { [[ -n "${2:-}" ]] || die "$1 needs a value"; }
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --plan-file)        PLAN_FILE="$2"; shift 2 ;;
+    --plan-file)        need_value "$1" "${2:-}"; PLAN_FILE="$2"; shift 2 ;;
     --dry-run)          DRY_RUN=1; shift ;;
-    --only)             ONLY="$2"; shift 2 ;;
+    --only)             need_value "$1" "${2:-}"; ONLY="$2"; shift 2 ;;
     --skip-captures)    SKIP_CAPTURES=1; shift ;;
-    --github-token-ref) GITHUB_TOKEN_REF="$2"; shift 2 ;;
+    # Optional by design: an absent or empty value means "no token available".
+    --github-token-ref) GITHUB_TOKEN_REF="${2:-}"; shift; [[ $# -gt 0 ]] && shift ;;
     -h|--help)          sed -n '2,50p' "$0"; exit 0 ;;
     *)                  die "unknown argument: $1" ;;
   esac
