@@ -78,7 +78,7 @@ Set-StrictMode -Version Latest
 # The same lesson as PIPELINE_VERSION in Jenkinsfile-generate-cfn, which was
 # itself once left un-bumped so a build reported a version that did not describe
 # the code it ran. Cheap marker, expensive absence.
-$script:ScriptVersion = '2026-09-02.6-linux-guards'
+$script:ScriptVersion = '2026-09-03.5-staging'
 
 # ----------------------------- configuration -----------------------------
 
@@ -181,6 +181,35 @@ function Assert-SupportedOs {
 function Test-CommandExists {
     param([string]$Name)
     return [bool](Get-Command $Name -ErrorAction SilentlyContinue)
+}
+
+function Test-TcpListener {
+    <#
+        Is something ACCEPTING on this address and port?
+
+        Test-NetConnection would do, but it is slow and chatty, and on some hosts
+        it emits a warning stream that has to be suppressed. A raw async connect
+        with an explicit timeout is predictable and quiet.
+
+        Returns $false on any failure, deliberately: this is a report, not a
+        gate. Nothing in the prereq script fails because a container has not been
+        started yet.
+    #>
+    param(
+        [string] $Address,
+        [int]    $Port,
+        [int]    $TimeoutMs = 3000
+    )
+    $client = New-Object System.Net.Sockets.TcpClient
+    try {
+        $async = $client.BeginConnect($Address, $Port, $null, $null)
+        if (-not $async.AsyncWaitHandle.WaitOne($TimeoutMs, $false)) { return $false }
+        # Throws if the connection was refused; that is a $false, not an error.
+        $client.EndConnect($async)
+        return $true
+    }
+    catch { return $false }
+    finally { $client.Close() }
 }
 
 function Get-CommandVersion {
@@ -1278,12 +1307,63 @@ function Test-Prerequisites {
         ForEach-Object { Write-Host ("    {0,-18} {1}" -f $_.IPAddress, $_.InterfaceAlias) }
 
     if ($Plan -and $Plan.peers -and $Plan.peers.Count -gt 0) {
-        Write-Host "`n  Cross-host reachability (peers from the flow plan):"
-        foreach ($target in $Plan.peers) {
-            if (Test-Connection -ComputerName $target -Count 1 -Quiet -ErrorAction SilentlyContinue) {
-                Write-Ok "$target reachable"
-            } else {
-                Write-Warn "$target unreachable (expected until the other host has bootstrapped)"
+        # A PING PROVES THE ADDRESS IS PLUMBED, NOT THAT ANYTHING IS THERE.
+        #
+        # Dev's correction, 2026-09-02. This block used to print
+        #     [ok] <db-address> reachable
+        # and that was read - by us, in a progress report - as "the component is
+        # up". It is not. The host answers ICMP for every secondary address it
+        # carries, listening or not. The database address replied for weeks with
+        # nothing behind it at all, because the SQL container has never been
+        # started.
+        #
+        # So connect where a port is known, and where it is not, SAY that this is
+        # only an addressing check. Three distinct outcomes, never conflated.
+        #
+        # Nothing here fails the host. At bootstrap time no container is running
+        # yet, so an absent listener is the expected state - reporting it as a
+        # failure would make every single bootstrap red.
+        Write-Host "`n  Peer addresses (from the flow plan):"
+
+        $probes = $null
+        if ($Plan.PSObject.Properties.Name -contains 'probes') { $probes = $Plan.probes }
+
+        if (-not $probes) {
+            # An older plan, generated before probes existed. Be explicit that
+            # this is the weaker check rather than silently looking the same.
+            Write-Warn 'this plan has no probe list; falling back to ping, which only proves addressing'
+            foreach ($target in $Plan.peers) {
+                if (Test-Connection -ComputerName $target -Count 1 -Quiet -ErrorAction SilentlyContinue) {
+                    Write-Skip "$target address plumbed (ping only - no listener check)"
+                } else {
+                    Write-Warn "$target unreachable"
+                }
+            }
+        }
+        else {
+            foreach ($probe in $probes) {
+                $addr    = $probe.address
+                $pinged  = Test-Connection -ComputerName $addr -Count 1 -Quiet -ErrorAction SilentlyContinue
+                $port    = $null
+                if ($probe.PSObject.Properties.Name -contains 'port') { $port = $probe.port }
+
+                if ($port) {
+                    if (Test-TcpListener -Address $addr -Port $port) {
+                        Write-Ok "${addr}:${port} LISTENER present - $($probe.label)"
+                    }
+                    elseif ($pinged) {
+                        Write-Skip "${addr}:${port} address plumbed, nothing listening yet - $($probe.label)"
+                    }
+                    else {
+                        Write-Warn "$addr unreachable - $($probe.label)"
+                    }
+                }
+                elseif ($pinged) {
+                    Write-Skip "$addr address plumbed; NO listener check - $($probe.portUnknownReason)"
+                }
+                else {
+                    Write-Warn "$addr unreachable - $($probe.label)"
+                }
             }
         }
     }
@@ -1370,12 +1450,14 @@ try {
        .\build-images.ps1 -GitHubTokenSecretId flowtest/github-pat
      Tags already in ECR are skipped, so this is a no-op for an unchanged flow.
 
-  2. The console question is ANSWERED for the runtime (probed 2026-08-31): a real
-     console handler installed and NO event arrived in 120s across four container
-     shapes, so the runtime sends nothing unprompted. Still worth confirming for
-     the engine itself once an OE image exists:
+  2. The console-SIGNAL failure does not reproduce (probed 2026-08-31): a real
+     handler installed and NO event arrived in 120s across four container shapes.
+     That settles ONE of the three failures seen on the host. The nohup run
+     hard-faulted inside MarketDataClient with no signal involved, and the probe
+     exercises nothing like that subsystem - so it is untested, not refuted.
        .\test-oe-console.ps1 -Mode image -Image <ref> -ConfigDir <dir>
-     Use plain detached - no -i, no -t.
+     Use plain detached - no -i, no -t. Pass requires the engine's own startup
+     log (Subscribed To: and ALGO MODULE INITIALIZED), not merely survival.
 
 "@ -ForegroundColor Gray
 

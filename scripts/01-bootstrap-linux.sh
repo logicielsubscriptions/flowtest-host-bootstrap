@@ -45,7 +45,7 @@ set -euo pipefail
 # Printed first, every run. See the note in 02-prereq-windows.ps1: without a
 # version in the output, a stale fetch is invisible and a retest can silently
 # re-run old code.
-SCRIPT_VERSION='2026-09-02.6-linux-guards'
+SCRIPT_VERSION='2026-09-03.5-staging'
 echo "bootstrap script version $SCRIPT_VERSION"
 
 ROOT=""
@@ -98,6 +98,26 @@ prereq="$(find "$ROOT" -name 03-prereq-almalinux.sh -print -quit 2>/dev/null || 
 }
 chmod +x "$prereq"
 echo "running $prereq"
+
+# COPY THE STAGING SCRIPT TO A STABLE PATH.
+#
+# The tarball extracts into a directory whose name carries the bootstrap commit
+# sha, so nothing may reference a path inside it: the next commit changes the
+# name and the reference breaks SILENTLY. The route-priority task learned this
+# already and points at a stable copy for the same reason.
+#
+# Staging is invoked later by the pipeline over SSM, which has to name a path, so
+# the copy lives at $ROOT and is the one thing that path can rely on. Not fatal
+# if absent - staging is a separate stage and an older bootstrap repo simply
+# will not have it, which the pipeline reports rather than crashing on.
+stager="$(find "$ROOT" -name 04-stage-artifacts.sh -print -quit 2>/dev/null || true)"
+if [[ -n "$stager" && "$stager" != "$ROOT/04-stage-artifacts.sh" ]]; then
+  cp -f "$stager" "$ROOT/04-stage-artifacts.sh"
+  chmod +x "$ROOT/04-stage-artifacts.sh"
+  echo "staged artifact script -> $ROOT/04-stage-artifacts.sh"
+elif [[ -z "$stager" ]]; then
+  echo 'note: 04-stage-artifacts.sh not in this tooling archive; the Stage artifacts step will report it missing'
+fi
 
 # Tee the child's output to its OWN log, for the same reason the Windows side
 # does: the caller's log does not capture it, and the exit code alone is not a

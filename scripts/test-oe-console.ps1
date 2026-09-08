@@ -229,6 +229,30 @@ foreach ($v in $variants) {
     $engineEvent = $logs -match 'Signal Handler Activated'
     $shutdown    = $logs -match 'shutting down'
 
+    # SURVIVAL IS NOT A PASS IN IMAGE MODE. Dev's correction, 2026-09-02.
+    #
+    # The host produced THREE distinct failures, and this script was built to
+    # test one of them:
+    #
+    #   Start-Process   SIGINT-killed when the parent console closed  <- probed
+    #   cmd /c start    exited after seconds
+    #   nohup           HARD FAULT inside MarketDataClient            <- NOT probed
+    #
+    # A SIGINT kill is a graceful shutdown and leaves "Signal Handler Activated"
+    # in the log. A hard fault in the market-data client is a crash in one
+    # subsystem with no signal involved - a different failure entirely, and the
+    # probe (which registers a handler and idles) exercises nothing like it.
+    #
+    # So "alive at N seconds" would be satisfied by an engine whose market-data
+    # client never connected. Dev's words: with no book, every routing decision
+    # degrades to the no-market fallback while message counts still match - a
+    # green run testing the wrong behaviour, which is worse than a red one.
+    #
+    # A healthy start says both of these. Both are required for a pass.
+    $mdSubscribed = $logs -match 'Subscribed To:'
+    $algoInit     = $logs -match 'ALGO MODULE INITIALIZED'
+    $healthyStart = $mdSubscribed -and $algoInit
+
     # WHETHER THE HANDLER INSTALLED IS PART OF THE RESULT, NOT A DETAIL.
     #
     # "no console event was delivered" means two very different things:
@@ -262,6 +286,19 @@ foreach ($v in $variants) {
     if ($engineEvent) { Write-Warn 'log contains "Signal Handler Activated" - the console interrupt reached the engine' }
     if ($shutdown)    { Write-Warn 'log contains "shutting down" - it terminated itself, it was not killed' }
 
+    if ($Mode -eq 'image') {
+        if ($healthyStart) {
+            Write-Ok 'market data subscribed AND algo module initialised - a real healthy start'
+        }
+        else {
+            Write-Fail 'the engine did NOT start healthily, regardless of whether it survived:'
+            Write-Warn "  Subscribed To:          $(if ($mdSubscribed) { 'present' } else { 'ABSENT' })"
+            Write-Warn "  ALGO MODULE INITIALIZED $(if ($algoInit) { 'present' } else { 'ABSENT' })"
+            Write-Warn 'An engine alive with no market data is the worst outcome: routing silently'
+            Write-Warn 'degrades to the no-market fallback while message counts still match.'
+        }
+    }
+
     # PRINT THE LOGS WHEN THE CONTAINER DIED.
     #
     # $logs was captured, regex-matched and then discarded, while the summary at
@@ -291,6 +328,8 @@ foreach ($v in $variants) {
         ExitCode   = if ($died) { $exitCode } else { '-' }
         HandlerReg = $handlerReg
         ConsoleEvt = if ($probeEvent.Success) { $probeEvent.Groups[1].Value } elseif ($engineEvent) { 'SIGINT' } else { 'none' }
+        # Only meaningful in image mode; the probe has no market data client.
+        Healthy    = if ($Mode -eq 'image') { $healthyStart } else { 'n/a' }
     })
 
     if (-not $KeepContainers) { Remove-ContainerQuietly $name }
@@ -304,8 +343,33 @@ $results | Format-Table -AutoSize | Out-String | Write-Host
 $survivors = @($results | Where-Object { $_.Survived })
 $anyEvent  = @($results | Where-Object { $_.ConsoleEvt -ne 'none' })
 
+# IMAGE MODE HAS A STRICTER BAR, and it is checked before the survival verdict.
+#
+# Survival alone is not a pass for a real engine - an OE alive with no market
+# data is the worst outcome available, because routing degrades to the no-market
+# fallback while message counts still match. So in image mode, a variant that
+# survived without a healthy start is a FAILURE, and it must not be allowed to
+# reach the reassuring branch below.
+if ($Mode -eq 'image') {
+    $unhealthy = @($results | Where-Object { $_.Survived -and $_.Healthy -ne $true })
+    if ($unhealthy.Count -gt 0) {
+        Write-Fail "$($unhealthy.Count) variant(s) stayed alive WITHOUT a healthy start."
+        Write-Host ''
+        Write-Host 'This is not a pass. The engine ran, so the console constraint did not'
+        Write-Host 'kill it - but its market data or algo module did not come up, and a'
+        Write-Host 'replay on that engine would silently use the no-market fallback path.'
+        Write-Host 'Look at the container log for what failed to initialise, and check the'
+        Write-Host 'staged configuration for that component before reading anything else here.'
+        exit 1
+    }
+}
+
 if ($survivors.Count -eq $results.Count -and $anyEvent.Count -eq 0) {
-    Write-Ok "every variant survived ${WatchSeconds}s and no console event was delivered"
+    if ($Mode -eq 'image') {
+        Write-Ok "every variant survived ${WatchSeconds}s, no console event, and started healthily"
+    } else {
+        Write-Ok "every variant survived ${WatchSeconds}s and no console event was delivered"
+    }
     Write-Host ''
     Write-Host 'What this means:'
 
@@ -314,8 +378,16 @@ if ($survivors.Count -eq $results.Count -and $anyEvent.Count -eq 0) {
     $registered = @($results | Where-Object { $_.HandlerReg -eq 'True' })
     if ($Mode -ne 'probe' -or $registered.Count -eq $results.Count) {
         Write-Host '  The container runtime does not send console control events unprompted.'
-        Write-Host '  The order execution server dying at ~45s on the HOST was the parent'
+        Write-Host '  The order execution server being SIGINT-killed on the HOST was the parent'
         Write-Host '  console going away - and a container does not have one to lose.'
+        Write-Host ''
+        Write-Host '  ONE OF THREE HOST FAILURES, not all three. The nohup run hard-faulted'
+        Write-Host '  inside MarketDataClient with no signal involved - a crash in one'
+        Write-Host '  subsystem, not a console event. This tells you nothing about that.'
+        if ($Mode -eq 'probe') {
+            Write-Host '  Probe mode cannot: it registers a handler and idles. Only -Mode image'
+            Write-Host '  against a real engine, judged on its own startup log, covers it.'
+        }
     }
     else {
         Write-Warn '  The handler did NOT install in every variant, so "no event" is weaker'

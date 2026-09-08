@@ -43,7 +43,7 @@ set -euo pipefail
 # Printed first, every run. See the note in 02-prereq-windows.ps1: without a
 # version in the output a stale fetch is invisible, and a retest can silently
 # re-run old code while looking like a fresh result.
-SCRIPT_VERSION='2026-09-02.6-linux-guards'
+SCRIPT_VERSION='2026-09-03.5-staging'
 
 # --------------------------- configuration ---------------------------
 # Host-level constants only. Flow specifics come from the plan file.
@@ -659,14 +659,48 @@ verify() {
   printf '    ip_forward = %s\n' "$(cat /proc/sys/net/ipv4/ip_forward)"
   printf '    rp_filter  = %s (2 = loose, required)\n' "$(cat /proc/sys/net/ipv4/conf/all/rp_filter)"
 
-  if [[ ${#PLAN_PEERS[@]} -gt 0 ]]; then
-    printf '\n  Cross-host reachability (peers from the flow plan):\n'
+  # A PING PROVES THE ADDRESS IS PLUMBED, NOT THAT ANYTHING IS THERE.
+  #
+  # Dev's correction, 2026-09-02. This block used to print "<addr> reachable",
+  # and that got read - by us, in a progress report - as "the component is up".
+  # The host answers ICMP for every secondary address it carries, listening or
+  # not: the database address replied for weeks with nothing behind it, because
+  # the SQL container has never been started.
+  #
+  # So connect where the plan gives a port, and where it does not, say plainly
+  # that this is only an addressing check. Nothing here fails the host - at
+  # bootstrap time no container is running, so an absent listener is expected.
+  if [[ -f "$PLAN_FILE" ]] && jq -e '.probes' "$PLAN_FILE" >/dev/null 2>&1; then
+    printf '\n  Peer addresses (from the flow plan):\n'
+    local addr port label reason
+    while IFS=$'\t' read -r addr port label reason; do
+      [[ -n "$addr" ]] || continue
+      local pinged=0
+      ping -c1 -W2 "$addr" &>/dev/null && pinged=1
+      if [[ -n "$port" && "$port" != "null" ]]; then
+        # bash's /dev/tcp is enough and needs no extra package.
+        if timeout 3 bash -c "exec 3<>/dev/tcp/${addr}/${port}" 2>/dev/null; then
+          ok "${addr}:${port} LISTENER present - ${label}"
+        elif [[ "$pinged" -eq 1 ]]; then
+          skip "${addr}:${port} address plumbed, nothing listening yet - ${label}"
+        else
+          warn "${addr} unreachable - ${label}"
+        fi
+      elif [[ "$pinged" -eq 1 ]]; then
+        skip "${addr} address plumbed; NO listener check - ${reason}"
+      else
+        warn "${addr} unreachable - ${label}"
+      fi
+    done < <(jq -r '.probes[] | [.address, (.port // "null"), .label, (.portUnknownReason // "")] | @tsv' "$PLAN_FILE")
+  elif [[ ${#PLAN_PEERS[@]} -gt 0 ]]; then
+    printf '\n  Peer addresses (from the flow plan):\n'
+    warn "this plan has no probe list; falling back to ping, which only proves addressing"
     local target
     for target in "${PLAN_PEERS[@]}"; do
       if ping -c1 -W2 "$target" &>/dev/null; then
-        ok "$target reachable"
+        skip "$target address plumbed (ping only - no listener check)"
       else
-        warn "$target unreachable (expected until the other host has bootstrapped)"
+        warn "$target unreachable"
       fi
     done
   fi

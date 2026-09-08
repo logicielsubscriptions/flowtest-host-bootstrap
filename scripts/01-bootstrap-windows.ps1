@@ -77,7 +77,7 @@ $ErrorActionPreference = 'Stop'
 
 # Printed first, every run. See the note in 02-prereq-windows.ps1: without this
 # a stale fetch is invisible, and a retest can silently re-run old code.
-$ScriptVersion = '2026-09-02.6-linux-guards'
+$ScriptVersion = '2026-09-03.5-staging'
 Write-Host "bootstrap script version $ScriptVersion"
 
 if (-not $ReadyMarker) { $ReadyMarker = Join-Path $Root 'READY' }
@@ -110,6 +110,30 @@ try {
               Select-Object -First 1
     if (-not $prereq) { throw '02-prereq-windows.ps1 not found under the tooling archive' }
     Write-Host "running $($prereq.FullName)"
+
+    # COPY THE STAGING SCRIPT TO A STABLE PATH.
+    #
+    # The tarball extracts into a directory whose name carries the bootstrap
+    # commit sha, so nothing may reference a path inside it - the next commit
+    # renames it and the reference breaks SILENTLY. Register-RoutePriorityTask
+    # in the prereq script learned this already and points at a stable copy for
+    # exactly the same reason.
+    #
+    # Staging runs later, invoked by the pipeline over SSM, which has to name a
+    # path. This copy at $Root is the one path that can be relied on. Absent is
+    # not fatal: staging is a separate stage, and an older bootstrap repo simply
+    # will not carry the script - which the pipeline reports rather than
+    # crashing on.
+    $stager = Get-ChildItem -Path $Root -Recurse -Filter '04-stage-artifacts.ps1' -ErrorAction SilentlyContinue |
+              Select-Object -First 1
+    $stableStager = Join-Path $Root '04-stage-artifacts.ps1'
+    if ($stager -and $stager.FullName -ne $stableStager) {
+        Copy-Item -LiteralPath $stager.FullName -Destination $stableStager -Force
+        Write-Host "staged artifact script -> $stableStager"
+    }
+    elseif (-not $stager) {
+        Write-Host 'note: 04-stage-artifacts.ps1 not in this tooling archive; the Stage artifacts step will report it missing'
+    }
 
     # Tee the child's output to its OWN log. Start-Transcript records the calling
     # session and does NOT capture a child started with & powershell.exe, so
