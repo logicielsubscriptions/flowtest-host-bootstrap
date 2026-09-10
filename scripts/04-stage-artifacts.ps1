@@ -61,7 +61,7 @@ param(
     [switch] $DryRun,
     [string] $Only,
     [switch] $SkipCaptures,
-    [string] $GitHubTokenRef
+    [string] $ConfigRepoTokenRef
 )
 
 Set-StrictMode -Version Latest
@@ -69,7 +69,7 @@ $ErrorActionPreference = 'Stop'
 
 # Printed first, every run. Without it a stale fetch is invisible and a retest
 # can silently re-run old code while looking like a fresh result.
-$script:ScriptVersion = '2026-09-08.2-staging-manifest'
+$script:ScriptVersion = '2026-09-10.1-flowtest-secret-prefix'
 
 function Write-Step { param([string] $Message) Write-Host "`n=== $Message ===" -ForegroundColor Cyan }
 function Write-Ok   { param([string] $Message) Write-Host "  [ok]   $Message" -ForegroundColor Green }
@@ -230,12 +230,12 @@ Write-Ok "identity $($identity.Output)"
 $script:GitHubToken = $null
 function Resolve-GitHubToken {
     if ($script:GitHubToken) { return $true }
-    if (-not $GitHubTokenRef) { return $false }
-    $raw = if ($GitHubTokenRef.StartsWith('/')) {
-        (Invoke-Aws @('ssm','get-parameter','--name',$GitHubTokenRef,'--with-decryption',
+    if (-not $ConfigRepoTokenRef) { return $false }
+    $raw = if ($ConfigRepoTokenRef.StartsWith('/')) {
+        (Invoke-Aws @('ssm','get-parameter','--name',$ConfigRepoTokenRef,'--with-decryption',
                       '--query','Parameter.Value','--output','text') -AllowFailure).Output
     } else {
-        (Invoke-Aws @('secretsmanager','get-secret-value','--secret-id',$GitHubTokenRef,
+        (Invoke-Aws @('secretsmanager','get-secret-value','--secret-id',$ConfigRepoTokenRef,
                       '--query','SecretString','--output','text') -AllowFailure).Output
     }
     if (-not $raw) { return $false }
@@ -320,7 +320,7 @@ function Stage-Config {
 
         'git-serverconfigs' {
             if (-not (Resolve-GitHubToken)) {
-                Write-Warn "${Name}: config lives in the private $($cs.gitRepo) repo and no usable -GitHubTokenRef was given"
+                Write-Warn "${Name}: config lives in the private $($cs.gitRepo) repo and no usable -ConfigRepoTokenRef was given"
                 Add-Result $Name 'config' 'skipped' @{
                     reason = 'private repo and no GitHub token reference supplied'
                     repo = $cs.gitRepo; path = $cs.gitPath }
@@ -522,7 +522,23 @@ else {
         items         = $script:Results
         summary       = $summary
     }
-    $document | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $manifestPath -Encoding UTF8
+    # UTF-8 WITHOUT A BOM, and not via Set-Content.
+    #
+    # `Set-Content -Encoding UTF8` in PowerShell 5.1 writes a byte-order mark:
+    # the file begins EF BB BF and only then '{'. Build 73 lost a complete,
+    # correct Windows manifest to exactly that. Staging succeeded, the manifest
+    # was written, SSM returned it - and the pipeline's sanity check
+    #     head -c 1 staged-windows.json | grep -q '{'
+    # read 0xEF, decided nothing had come back, and deleted the file. The
+    # contract then reported staging for one host instead of two.
+    #
+    # A BOM is also a hazard for any strict JSON parser downstream;
+    # emit_environment.py happens to open with utf-8-sig and would have coped,
+    # which is precisely why this would have kept slipping through.
+    [System.IO.File]::WriteAllText(
+        $manifestPath,
+        ($document | ConvertTo-Json -Depth 8),
+        (New-Object System.Text.UTF8Encoding($false)))
     Write-Ok "wrote $manifestPath"
     $summary.GetEnumerator() | Sort-Object Name | ForEach-Object { Write-Host "    $($_.Key): $($_.Value)" }
 }

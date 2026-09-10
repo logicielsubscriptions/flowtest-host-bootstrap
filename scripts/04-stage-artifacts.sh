@@ -11,7 +11,7 @@
 #
 # Usage:
 #   04-stage-artifacts.sh [--plan-file PATH] [--dry-run] [--only NAME]
-#                         [--skip-captures] [--github-token-ref REF]
+#                         [--skip-captures] [--config-repo-token-ref REF]
 #
 # Everything about the flow comes from the plan. This script declares no
 # addresses, buckets, host names or product names of its own, which is what lets
@@ -55,13 +55,13 @@ set -euo pipefail
 
 # Printed first, every run. A stale fetch is otherwise invisible - see the note
 # in 02-prereq-windows.ps1.
-SCRIPT_VERSION='2026-09-08.2-staging-manifest'
+SCRIPT_VERSION='2026-09-10.1-flowtest-secret-prefix'
 
 PLAN_FILE="/opt/flowtest/bootstrap/flow-plan-linux.json"
 DRY_RUN=0
 ONLY=""
 SKIP_CAPTURES=0
-GITHUB_TOKEN_REF=""
+CONFIG_REPO_TOKEN_REF=""
 
 C_CYAN='\033[0;36m'; C_GREEN='\033[0;32m'; C_YELLOW='\033[0;33m'
 C_RED='\033[0;31m';  C_GREY='\033[0;90m';  C_OFF='\033[0m'
@@ -74,9 +74,9 @@ die()  { fail "$*"; exit 1; }
 
 # "${2:-}", NOT "$2". Build 67 died here with
 #     04-stage-artifacts.sh: line 81: $2: unbound variable
-# because the caller passed a trailing "--github-token-ref" with no value (the
-# Jenkins GitHubTokenRef parameter was empty), and under `set -u` a missing $2
-# is fatal. The message names a line number and a shell variable - it says
+# because the caller passed a trailing token flag with no value (the Jenkins
+# parameter behind it was empty), and under `set -u` a missing $2 is fatal. The
+# message names a line number and a shell variable - it says
 # nothing about which option was wrong, or that the option was simply optional.
 #
 # An empty value is a legitimate way to say "no token": the flag then behaves as
@@ -91,7 +91,7 @@ while [[ $# -gt 0 ]]; do
     --only)             need_value "$1" "${2:-}"; ONLY="$2"; shift 2 ;;
     --skip-captures)    SKIP_CAPTURES=1; shift ;;
     # Optional by design: an absent or empty value means "no token available".
-    --github-token-ref) GITHUB_TOKEN_REF="${2:-}"; shift; [[ $# -gt 0 ]] && shift ;;
+    --config-repo-token-ref) CONFIG_REPO_TOKEN_REF="${2:-}"; shift; [[ $# -gt 0 ]] && shift ;;
     -h|--help)          sed -n '2,50p' "$0"; exit 0 ;;
     *)                  die "unknown argument: $1" ;;
   esac
@@ -223,12 +223,12 @@ resolve_dated() {
 # is one mechanism to understand and nothing lands in an argument list.
 GITHUB_TOKEN=""
 resolve_github_token() {
-  [[ -n "$GITHUB_TOKEN_REF" ]] || return 1
+  [[ -n "$CONFIG_REPO_TOKEN_REF" ]] || return 1
   local secret=""
-  case "$GITHUB_TOKEN_REF" in
-    /*) secret="$(aws ssm get-parameter --name "$GITHUB_TOKEN_REF" --with-decryption \
+  case "$CONFIG_REPO_TOKEN_REF" in
+    /*) secret="$(aws ssm get-parameter --name "$CONFIG_REPO_TOKEN_REF" --with-decryption \
                     --query Parameter.Value --output text 2>/dev/null || true)" ;;
-    *)  secret="$(aws secretsmanager get-secret-value --secret-id "$GITHUB_TOKEN_REF" \
+    *)  secret="$(aws secretsmanager get-secret-value --secret-id "$CONFIG_REPO_TOKEN_REF" \
                     --query SecretString --output text 2>/dev/null || true)" ;;
   esac
   [[ -n "$secret" ]] || return 1
@@ -296,7 +296,7 @@ stage_config() {
       branch="$(printf '%s' "$cs" | jq -r '.gitBranch')"
       owner="$(jq -r '.engineRepoOwner' "$PLAN_FILE")"
       if ! resolve_github_token; then
-        warn "$name: config lives in the private $repo repo and no usable --github-token-ref was given"
+        warn "$name: config lives in the private $repo repo and no usable --config-repo-token-ref was given"
         record "$name" config skipped \
           "$(jq -n --arg r "$repo" --arg p "$gitpath" \
                 '{reason:"private repo and no GitHub token reference supplied", repo:$r, path:$p}')"
