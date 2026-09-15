@@ -146,10 +146,25 @@ ok "capture root $CAPTURE_ROOT"
 # The identity actually in use. A staging failure is far more often the wrong
 # role than the wrong key, and this line makes that a one-glance answer instead
 # of a round of guessing.
-if ident="$(aws sts get-caller-identity --output json 2>/dev/null)"; then
+# Retried for the same reason as the Windows counterpart. The Linux host uses
+# ipvlan rather than l2bridge and has not lost IMDS in any build so far, but the
+# two scripts staying symmetrical matters more than saving 90 seconds on a
+# failure path: a difference between them is a thing someone has to rediscover.
+ident=""
+for try in 1 2 3 4 5 6; do
+  if ident="$(aws sts get-caller-identity --output json 2>/dev/null)"; then break; fi
+  ident=""
+  if [[ $try -lt 6 ]]; then
+    warn "sts get-caller-identity failed (attempt $try of 6). IMDS may be mid-reconfiguration from the container network; retrying in 15s."
+    sleep 15
+  fi
+done
+if [[ -n "$ident" ]]; then
+  [[ ${try:-1} -gt 1 ]] && warn "identity resolved only on attempt $try - IMDS was briefly unavailable."
   ok "identity $(printf '%s' "$ident" | jq -r '.Arn')"
 else
-  die "aws sts get-caller-identity failed. The instance profile is missing or has no credentials."
+  fail "aws sts get-caller-identity failed 6 times over 90s. The instance profile is missing, or IMDS is unreachable."
+  die  "Check on the host: 'ip route get 169.254.169.254' should resolve. If it does not, the container network took the route and did not put it back."
 fi
 
 # --------------------------- date discovery ---------------------------
@@ -350,7 +365,15 @@ stage_config() {
               clone --quiet --depth 1 --branch "$branch" --filter=blob:none --sparse \
               "https://github.com/$owner/$repo.git" repo || exit 1
           cd repo || exit 1
-          git sparse-checkout set --no-cone "${gitpath//\\//}" >/dev/null 2>&1 || true
+          # DO NOT SILENCE THIS. It was ">/dev/null 2>&1 || true", and build 78
+          # is the cost: the clone succeeded, sparse-checkout produced nothing,
+          # and the only symptom was the directory test below reporting the path
+          # "not present in the repo" - for a path that demonstrably exists on
+          # main. An error hidden here is indistinguishable from a missing folder.
+          if ! git sparse-checkout set --no-cone "${gitpath//\\//}" 2>&1; then
+            echo "sparse-checkout set failed for '${gitpath//\\//}'" >&2
+            exit 2
+          fi
           exit 0
         ) || { fail "$name: clone of $repo@$branch failed - the path in the repo has NOT been checked."
                fail "$name: if stderr says \"could not read Username for 'https://github.com'\" the token was rejected, not missing: git fell back to prompting after a 401."
@@ -361,22 +384,49 @@ stage_config() {
                return 0; }
         mkdir -p "$dest"
         local src="$work/repo/${gitpath//\\//}"
-        if [[ -d "$src" ]]; then
+        # THE FILES MAY BE ONE LEVEL DOWN, IN config/. The repo convention puts
+        # them under <host>/<engine>/config, while the plan's gitPath names the
+        # <engine> folder. Build 78 cloned successfully, found the engine folder
+        # holding only a config/ subdirectory, copied nothing at -maxdepth 1 and
+        # reported the path as absent. Try the declared path first, then its
+        # config/ child, and SAY which one was used - guessing silently is how
+        # the wrong layout gets baked in.
+        local used=""
+        if [[ -d "$src" ]] && [[ -n "$(find "$src" -maxdepth 1 -type f 2>/dev/null)" ]]; then
+          used="$src"
+        elif [[ -d "$src/config" ]] && [[ -n "$(find "$src/config" -maxdepth 1 -type f 2>/dev/null)" ]]; then
+          used="$src/config"
+          warn "$name: no files directly in $gitpath; using its config/ subfolder. If that is the repo convention, put it in the plan's gitPath instead of relying on this fallback."
+        fi
+        if [[ -n "$used" ]]; then
           # -maxdepth 1: config at the directory root, matching the snapshot
           # layout and .staged.layout. Nested folders are NOT flattened into the
           # root, because two files of the same name in different subfolders
           # would silently overwrite each other.
-          find "$src" -maxdepth 1 -type f -exec cp {} "$dest/" \;
+          find "$used" -maxdepth 1 -type f -exec cp {} "$dest/" \;
+        elif [[ -d "$src" ]]; then
+          warn "$name: $gitpath exists in $repo@$branch but holds no files at its root or in config/"
         else
-          warn "$name: $gitpath not present in $repo@$branch"
+          warn "$name: $gitpath not present in the CHECKOUT of $repo@$branch. The clone succeeded, so this means either the path is wrong or sparse-checkout did not materialise it - check the sparse-checkout stderr above before assuming the repo lacks it."
         fi
         rm -rf "$work"
       fi
       local count=0
       [[ $DRY_RUN -eq 0 ]] && count="$(find "$dest" -maxdepth 1 -type f 2>/dev/null | wc -l)"
-      record "$name" config staged \
-        "$(jq -n --arg r "$repo" --arg b "$branch" --arg p "$gitpath" --argjson c "$count" --arg d "$dest" \
-              '{source:"git-serverconfigs", repo:$r, branch:$b, path:$p, files:$c, dest:$d}')"
+      # ZERO FILES IS NOT 'staged'. This recorded 'staged' unconditionally - the
+      # third place in this script that claimed success without looking at the
+      # result, and the source of build 78's "staged: 1" for a component whose
+      # config directory was empty.
+      if [[ "$count" -gt 0 ]]; then
+        record "$name" config staged \
+          "$(jq -n --arg r "$repo" --arg b "$branch" --arg p "$gitpath" --argjson c "$count" --arg d "$dest" \
+                '{source:"git-serverconfigs", repo:$r, branch:$b, path:$p, files:$c, dest:$d}')"
+      else
+        record "$name" config failed \
+          "$(jq -n --arg r "$repo" --arg b "$branch" --arg p "$gitpath" --arg d "$dest" \
+                '{source:"git-serverconfigs", repo:$r, branch:$b, path:$p, files:0, dest:$d,
+                  reason:"clone succeeded but no config files were found at the declared path"}')"
+      fi
       ;;
 
     *)
@@ -464,12 +514,28 @@ stage_captures() {
       # manifest is what it reads. A gap that reports itself as staged is worse
       # than a missing manifest: the Runner has no reason to look.
       fix_rc=0
+      fix_err=""
       if [[ $DRY_RUN -eq 0 ]]; then
         mkdir -p "$dest/fix"
-        aws s3 cp "s3://$bucket/${prefix%/}/" "$dest/fix/" --recursive --only-show-errors \
-          || fix_rc=$?
+        fix_err="$(aws s3 cp "s3://$bucket/${prefix%/}/" "$dest/fix/" \
+                     --recursive --only-show-errors 2>&1)" || fix_rc=$?
+        # DISTINGUISH ARCHIVED FROM FORBIDDEN. Build 78 returned
+        #   InvalidObjectState: The operation is not valid for the object's
+        #   access tier
+        # on every object. That is not a permission problem - ListBucket had
+        # already succeeded and enumerated the prefixes - it is Glacier or
+        # Intelligent-Tiering archive access. The old message blamed the prefix
+        # or the role, which is where the next person would have looked.
         if [[ $fix_rc -ne 0 ]]; then
-          warn "$name: FIX message fetch failed (exit $fix_rc; prefix may not exist, or the host role lacks s3:ListBucket on the BUCKET arn as well as /*)"
+          if printf '%s' "$fix_err" | grep -q 'InvalidObjectState'; then
+            warn "$name: the FIX objects are ARCHIVED (S3 Glacier / Intelligent-Tiering archive tier), not missing and not forbidden."
+            warn "$name: they must be restored before they can be read - aws s3api restore-object - and a restore takes minutes to hours depending on tier."
+            fix_reason="objects in an archived S3 access tier; restore required"
+          else
+            warn "$name: FIX message fetch failed (exit $fix_rc; prefix may not exist, or the host role lacks s3:ListBucket on the BUCKET arn as well as /*)"
+            fix_reason="aws s3 cp exited $fix_rc"
+          fi
+          printf '%s\n' "$fix_err" | tail -5 >&2
         fi
       fi
       if [[ $fix_rc -eq 0 ]]; then
@@ -477,8 +543,8 @@ stage_captures() {
           "$(jq -n --arg b "$bucket" --arg p "$prefix" '{bucket:$b, prefix:$p}')"
       else
         record "$name" fixArchive failed \
-          "$(jq -n --arg b "$bucket" --arg p "$prefix" --arg rc "$fix_rc" \
-             '{bucket:$b, prefix:$p, reason:"aws s3 cp exited \($rc)"}')"
+          "$(jq -n --arg b "$bucket" --arg p "$prefix" --arg r "${fix_reason:-aws s3 cp exited $fix_rc}" \
+             '{bucket:$b, prefix:$p, reason:$r}')"
       fi
     fi
   fi

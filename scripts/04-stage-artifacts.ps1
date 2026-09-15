@@ -249,11 +249,42 @@ Write-Ok "config root  $configRoot"
 Write-Ok "capture root $captureRoot"
 if ($DryRun) { Write-Warn 'DRY RUN - listing and resolving only, nothing will be written' }
 
-$identity = Invoke-Aws @('sts','get-caller-identity','--query','Arn','--output','text') -AllowFailure
+# RETRY, BECAUSE IMDS GOES AWAY FOR A WHILE ON THIS HOST AND COMES BACK.
+#
+# Build 78 failed here, and the host was healthy 20 minutes later - same
+# instance, same role, `aws sts get-caller-identity` fine. The cause is the
+# l2bridge network: Docker binds a vSwitch to the host NIC, the host address
+# migrates to a vEthernet, and the link-local route to 169.254.169.254 is torn
+# down and re-added around that. `route print` on the host afterwards showed the
+# IMDS route present, On-link, and under "Persistent Routes: None" - so it is
+# re-created at runtime, not pinned. Anything calling AWS inside that window
+# gets no credentials at all.
+#
+# This is a RACE, so a bounded retry is the honest fix: if the profile is really
+# absent it still fails, just 90 seconds later and having said what it tried.
+# What it must never become is an unbounded wait that turns a missing instance
+# profile into a hang.
+#
+# The durable fix belongs in the prereq script - re-assert the IMDS route after
+# the Docker network is created, or pin it with `route ... -p`. Until that lands,
+# this keeps staging off the critical path of a transient.
+$identity   = $null
+$maxTries   = 6
+$delaySec   = 15
+for ($try = 1; $try -le $maxTries; $try++) {
+    $identity = Invoke-Aws @('sts','get-caller-identity','--query','Arn','--output','text') -AllowFailure
+    if ($identity.ExitCode -eq 0) { break }
+    if ($try -lt $maxTries) {
+        Write-Warn "sts get-caller-identity failed (attempt $try of $maxTries). IMDS may be mid-reconfiguration from the container network; retrying in ${delaySec}s."
+        Start-Sleep -Seconds $delaySec
+    }
+}
 if ($identity.ExitCode -ne 0) {
-    Write-Fail 'aws sts get-caller-identity failed. The instance profile is missing or has no credentials.'
+    Write-Fail "aws sts get-caller-identity failed $maxTries times over $($maxTries * $delaySec)s. The instance profile is missing, or IMDS is unreachable."
+    Write-Fail 'Check on the host: route print 169.254.169.254 should show an On-link route for it. If it is absent, the container network took it and did not put it back.'
     exit 1
 }
+if ($try -gt 1) { Write-Warn "identity resolved only on attempt $try - IMDS was briefly unavailable, which is the known l2bridge transition." }
 Write-Ok "identity $($identity.Output)"
 
 # ---------------------------------------------------------------------------
