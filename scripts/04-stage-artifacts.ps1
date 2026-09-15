@@ -61,7 +61,13 @@ param(
     [switch] $DryRun,
     [string] $Only,
     [switch] $SkipCaptures,
-    [string] $ConfigRepoTokenRef
+    [string] $ConfigRepoTokenRef,
+    # Days either side of the market date to accept a dated archive folder.
+    # 3 covers a weekend plus the observed next-morning backup offset without
+    # pulling the years of history under the same prefix. Matches
+    # --archive-window-days in 04-stage-artifacts.sh.
+    [ValidateRange(0, 365)]
+    [int] $ArchiveWindowDays = 3
 )
 
 Set-StrictMode -Version Latest
@@ -102,7 +108,7 @@ trap {
 
 # Printed first, every run. Without it a stale fetch is invisible and a retest
 # can silently re-run old code while looking like a fresh result.
-$script:ScriptVersion = '2026-09-15.1-git-basic-auth'
+$script:ScriptVersion = '2026-09-15.2-dated-window'
 
 function Write-Step { param([string] $Message) Write-Host "`n=== $Message ===" -ForegroundColor Cyan }
 function Write-Ok   { param([string] $Message) Write-Host "  [ok]   $Message" -ForegroundColor Green }
@@ -357,12 +363,37 @@ function Get-GitFolder {
             return $null
         }
         Push-Location "$work\repo"
-        try { & git sparse-checkout set --no-cone $Path.Replace('\', '/') 2>&1 | Out-Null }
+        # DO NOT DISCARD THIS OUTPUT SILENTLY. A sparse-checkout that matches
+        # nothing leaves an empty tree, and the caller then reports the path as
+        # absent from the repo - which is how build 79 blamed the config repo for
+        # a path that exists on main.
+        try {
+            $sparse = & git sparse-checkout set --no-cone $Path.Replace('\', '/') 2>&1
+            if ($LASTEXITCODE -ne 0) {
+                Write-Warn "sparse-checkout failed for '$Path' (git exit $LASTEXITCODE): $sparse"
+                Write-Warn 'The repo path has NOT been checked - do not read the next warning as a missing folder.'
+                return $null
+            }
+        }
         finally { Pop-Location }
     }
     finally { $ErrorActionPreference = $previous }
+
+    # The files may be one level down, in config\. The repo convention puts them
+    # under <host>\<engine>\config while the plan's gitPath names <engine>. Try
+    # the declared path, then its config\ child, and SAY which was used - a
+    # silent guess is how the wrong layout gets baked in. Mirrors the bash side.
     $resolved = Join-Path "$work\repo" $Path.TrimStart('\')
-    if (Test-Path -LiteralPath $resolved) { return $resolved }
+    if ((Test-Path -LiteralPath $resolved) -and
+        @(Get-ChildItem -LiteralPath $resolved -File -ErrorAction SilentlyContinue).Count -gt 0) {
+        return $resolved
+    }
+    $nested = Join-Path $resolved 'config'
+    if ((Test-Path -LiteralPath $nested) -and
+        @(Get-ChildItem -LiteralPath $nested -File -ErrorAction SilentlyContinue).Count -gt 0) {
+        Write-Warn "no files directly in '$Path'; using its config\ subfolder. If that is the repo convention, put it in the plan's gitPath instead of relying on this fallback."
+        return $nested
+    }
     return $null
 }
 
@@ -411,14 +442,28 @@ function Stage-Config {
                     repo = $cs.gitRepo; path = $cs.gitPath }
                 return
             }
-            Write-Ok "${Name}: $($cs.gitRepo)@$($cs.gitBranch) at $($cs.gitPath)"
+            # "fetching", not Write-Ok: this announces intent. It printed [ok]
+            # here and a contradicting [warn] two lines later, which reads as a
+            # step that passed and was then overruled.
+            Write-Host "  [ .. ] ${Name}: fetching $($cs.gitRepo)@$($cs.gitBranch) at $($cs.gitPath)" -ForegroundColor Cyan
             $files = 0
             if (-not $DryRun) {
+                # THREE OUTCOMES, NOT ONE MESSAGE. This said
+                #   "<path> not present in <repo>@<branch>, or the clone failed"
+                # for every failure, so a rejected token, a bad branch and a
+                # genuinely absent folder were indistinguishable. Build 79 proved
+                # the cost on the bash side: the path DOES exist on main, and the
+                # message sent everyone to the repo instead of to git auth.
+                # Get-GitFolder now warns on a non-zero git exit, so a clone
+                # failure has already been reported by the time we get here.
                 $src = Get-GitFolder -Owner $plan.engineRepoOwner -Repo $cs.gitRepo `
                                      -Branch $cs.gitBranch -Path $cs.gitPath
                 if (-not $src) {
-                    Write-Warn "${Name}: $($cs.gitPath) not present in $($cs.gitRepo)@$($cs.gitBranch), or the clone failed"
-                    Add-Result $Name 'config' 'failed' @{ reason = 'git checkout produced nothing'; path = $cs.gitPath }
+                    Write-Warn "${Name}: no files for $($cs.gitPath) in $($cs.gitRepo)@$($cs.gitBranch)."
+                    Write-Warn "${Name}: if a clone failure was reported above, the repo path has NOT been checked - fix that first rather than editing the path."
+                    Add-Result $Name 'config' 'failed' @{
+                        reason = 'git checkout produced nothing - clone failure or absent path; see the warnings above'
+                        repo = $cs.gitRepo; branch = $cs.gitBranch; path = $cs.gitPath }
                     return
                 }
                 New-Item -ItemType Directory -Path $dest -Force | Out-Null
@@ -483,7 +528,16 @@ function Stage-Captures {
     $archive = $Service.logArchive
 
     # FIX message archive. Refused outright on a prefix conflict.
-    if ($archive.PSObject.Properties.Name -contains 'fixArchive' -and $archive.fixArchive) {
+    # Empty-safe for the same reason as the artifacts loop below: if $archive has
+    # no properties at all, .PSObject.Properties is an empty collection and
+    # member-enumerating .Name off it throws under StrictMode instead of
+    # returning nothing. -contains on @() is simply false.
+    $archiveProps = @()
+    if ($archive) {
+        $p = $archive.PSObject.Properties
+        if ($p) { $archiveProps = @($p | ForEach-Object { $_.Name }) }
+    }
+    if ($archiveProps -contains 'fixArchive' -and $archive.fixArchive) {
         $fa = $archive.fixArchive
         if ($fa.hostMismatch) {
             Write-Warn "${Name}: the declared FIX archive is under a DIFFERENT HOST than the engine runs on"
@@ -505,28 +559,143 @@ function Stage-Captures {
             # AccessDenied - and environment.json repeated it, because the
             # manifest is what it reads.
             $fixRc = 0
+            $fixReason = ''
+            $foldersTaken = @()
             if (-not $DryRun) {
                 New-Item -ItemType Directory -Path (Join-Path $dest 'fix') -Force | Out-Null
-                $copy = Invoke-Aws @('s3','cp',"s3://$($fa.bucket)/$($fa.prefix.TrimEnd('/'))/",
-                                     (Join-Path $dest 'fix\'), '--recursive', '--only-show-errors') -AllowFailure
-                $fixRc = $copy.ExitCode
-                if ($fixRc -ne 0) {
-                    Write-Warn "${Name}: FIX message fetch failed (exit $fixRc; prefix may not exist, or the host role lacks s3:ListBucket on the BUCKET arn as well as /*)"
+
+                # ONE WINDOW OF DATED FOLDERS, NOT THE WHOLE PREFIX.
+                #
+                # This was a flat `aws s3 cp --recursive` over the entire prefix,
+                # and THIS HOST is where that hurt: build 79 spent 27 of its 28
+                # minutes inside this single call, pulling FIX logs from 2024 and
+                # 2025 that no 2026 replay will read.
+                #
+                # Selection is on the dated FOLDER NAME, not LastModified:
+                # LastModified is upload time, so a restored or re-uploaded object
+                # reports today and a modified-time window would skip the very
+                # file that was asked for.
+                #
+                # A window rather than one computed folder, because the folder is
+                # not the market date - the backup job writes the following
+                # morning, and that offset is not consistent between engines.
+                # Mirrors 04-stage-artifacts.sh; keep the two in step.
+                $listed = Invoke-Aws @('s3api','list-objects-v2',
+                                       '--bucket', $fa.bucket,
+                                       '--prefix', ($fa.prefix.TrimEnd('/') + '/'),
+                                       '--delimiter', '/',
+                                       '--query', 'CommonPrefixes[].Prefix',
+                                       '--output', 'text') -AllowFailure
+
+                $mkt = [datetime]::ParseExact($plan.marketDate, 'yyyy-MM-dd', $null)
+                if ($listed.ExitCode -eq 0 -and $listed.Output) {
+                    foreach ($raw in ($listed.Output -split '\s+')) {
+                        if (-not $raw) { continue }
+                        $leaf = $raw.TrimEnd('/').Split('/')[-1]
+                        # DD-MM vs MM-DD is ambiguous for day <= 12, so try both
+                        # and keep the folder if EITHER lands in the window. A
+                        # spurious extra day costs seconds; a missing trading day
+                        # costs a wrong replay.
+                        $cands = @()
+                        foreach ($fmt in @('dd-MM-yyyy','MM-dd-yyyy','yyyy-MM-dd')) {
+                            $parsed = [datetime]::MinValue
+                            if ([datetime]::TryParseExact($leaf, $fmt, $null,
+                                    [Globalization.DateTimeStyles]::None, [ref]$parsed)) {
+                                $cands += $parsed
+                            }
+                        }
+                        foreach ($c in $cands) {
+                            if ([math]::Abs(($c - $mkt).Days) -le $ArchiveWindowDays) {
+                                $foldersTaken += $raw
+                                break
+                            }
+                        }
+                    }
+                }
+
+                if ($foldersTaken.Count -eq 0) {
+                    Write-Warn "${Name}: no dated folder within $ArchiveWindowDays day(s) of $($plan.marketDate) under $($fa.prefix)/."
+                    Write-Warn "${Name}: NOT falling back to the whole prefix - that is years of data. Raise -ArchiveWindowDays if the backup offset is larger than expected."
+                    $fixRc = 1
+                    $fixReason = "no dated folder within $ArchiveWindowDays days of the market date"
+                }
+                else {
+                    Write-Ok "${Name}: $($foldersTaken.Count) dated folder(s) within $ArchiveWindowDays day(s) of $($plan.marketDate)"
+                    foreach ($p in $foldersTaken) {
+                        $leaf = $p.TrimEnd('/').Split('/')[-1]
+                        Write-Host "           $leaf"
+                        $copy = Invoke-Aws @('s3','cp',"s3://$($fa.bucket)/$p",
+                                             (Join-Path $dest "fix\$leaf\"),
+                                             '--recursive','--only-show-errors') -AllowFailure
+                        if ($copy.ExitCode -ne 0) {
+                            $fixRc = $copy.ExitCode
+                            # DISTINGUISH ARCHIVED FROM FORBIDDEN, as the bash
+                            # side does. InvalidObjectState is Glacier or
+                            # Intelligent-Tiering archive access - not a
+                            # permission problem, and blaming the prefix or the
+                            # role sends the reader to the wrong place entirely.
+                            if ($copy.Output -match 'InvalidObjectState') {
+                                $fixReason = 'objects in an archived S3 access tier; restore required'
+                            }
+                        }
+                    }
+                    if ($fixRc -ne 0) {
+                        if ($fixReason -like 'objects in an archived*') {
+                            Write-Warn "${Name}: the FIX objects are ARCHIVED (S3 Glacier / Intelligent-Tiering archive tier), not missing and not forbidden."
+                            Write-Warn "${Name}: they must be restored before they can be read - aws s3api restore-object - and a restore takes minutes to hours depending on tier."
+                        }
+                        else {
+                            Write-Warn "${Name}: FIX message fetch failed (exit $fixRc; prefix may not exist, or the host role lacks s3:ListBucket on the BUCKET arn as well as /*)"
+                            $fixReason = "aws s3 cp exited $fixRc"
+                        }
+                    }
                 }
             }
+            # foldersTaken goes in the manifest so the backup-offset convention
+            # can be read off a real run rather than asserted.
+            $leaves = @($foldersTaken | ForEach-Object { $_.TrimEnd('/').Split('/')[-1] })
             if ($fixRc -eq 0) {
-                Add-Result $Name 'fixArchive' 'staged' @{ bucket = $fa.bucket; prefix = $fa.prefix }
+                Add-Result $Name 'fixArchive' 'staged' @{
+                    bucket = $fa.bucket; prefix = $fa.prefix
+                    marketDate = $plan.marketDate; windowDays = $ArchiveWindowDays
+                    foldersTaken = $leaves }
             }
             else {
                 Add-Result $Name 'fixArchive' 'failed' @{
+                    marketDate = $plan.marketDate; windowDays = $ArchiveWindowDays
+                    foldersTaken = $leaves
                     bucket = $fa.bucket; prefix = $fa.prefix
-                    reason = "aws s3 cp exited $fixRc" }
+                    reason = if ($fixReason) { $fixReason } else { "aws s3 cp exited $fixRc" } }
             }
         }
     }
 
-    if (-not $archive.artifacts) { return }
-    foreach ($family in $archive.artifacts.PSObject.Properties.Name) {
+    # DO NOT member-enumerate .Name off .PSObject.Properties.
+    #
+    # This was:
+    #     if (-not $archive.artifacts) { return }
+    #     foreach ($family in $archive.artifacts.PSObject.Properties.Name) {
+    # and it is what aborted Windows staging in builds 76, 78 and 79 with
+    #     The property 'Name' cannot be found on this object.
+    #     FullyQualifiedErrorId : PropertyNotFoundStrict
+    #
+    # A component in one of the flows declares logArchive.artifacts as an EMPTY
+    # object. An empty PSCustomObject is truthy, so the -not guard let it
+    # through; then
+    # .PSObject.Properties is an empty collection, and under
+    # Set-StrictMode -Version Latest, member-enumerating .Name off an empty
+    # collection throws rather than yielding nothing.
+    #
+    # Same shape as $distinct.Count in verify-all.ps1: a member access that works
+    # on one-or-more and throws on zero. Piping to ForEach-Object never
+    # member-enumerates, so it is empty-safe; @() makes .Count always exist.
+    $families = @()
+    if ($archive.artifacts) {
+        $props = $archive.artifacts.PSObject.Properties
+        if ($props) { $families = @($props | ForEach-Object { $_.Name }) }
+    }
+    if ($families.Count -eq 0) { return }
+    foreach ($family in $families) {
         if ($family -eq 'engineConfigs') { continue }   # that IS the config, staged above
         $spec = $archive.artifacts.$family
         $parent = $archive.prefix
@@ -597,7 +766,14 @@ else {
         $copy = Invoke-Aws @('s3','cp',"s3://$($quill.bucket)/$($quill.s3Path)","$quillDest\",'--only-show-errors') -AllowFailure
         $quillRc = $copy.ExitCode
         if ($quillRc -ne 0) {
-            Write-Warn "Quill fetch failed (exit $quillRc). The key is a discovery HINT - the capture date may differ from the market date. A 403 here usually means the host role, not the key."
+            if ($copy.Output -match 'InvalidObjectState') {
+                Write-Warn 'Quill capture is ARCHIVED (S3 Glacier / Intelligent-Tiering archive tier), not missing and not forbidden. Restore it before the replay, or pick a market date whose objects are still warm.'
+                $script:QuillReason = 'object in an archived S3 access tier; restore required'
+            }
+            else {
+                Write-Warn "Quill fetch failed (exit $quillRc). The key is a discovery HINT - the capture date may differ from the market date. A 403 here usually means the host role, not the key."
+                $script:QuillReason = "aws s3 cp exited $quillRc"
+            }
         }
     }
     if ($quillRc -eq 0) {
@@ -606,7 +782,7 @@ else {
     else {
         Add-Result '-' 'quillCapture' 'failed' @{
             bucket = $quill.bucket; key = $quill.s3Path
-            reason = "aws s3 cp exited $quillRc" }
+            reason = if ($script:QuillReason) { $script:QuillReason } else { "aws s3 cp exited $quillRc" } }
     }
 }
 

@@ -55,13 +55,17 @@ set -euo pipefail
 
 # Printed first, every run. A stale fetch is otherwise invisible - see the note
 # in 02-prereq-windows.ps1.
-SCRIPT_VERSION='2026-09-15.1-git-basic-auth'
+SCRIPT_VERSION='2026-09-15.2-dated-window'
 
 PLAN_FILE="/opt/flowtest/bootstrap/flow-plan-linux.json"
 DRY_RUN=0
 ONLY=""
 SKIP_CAPTURES=0
 CONFIG_REPO_TOKEN_REF=""
+# Days either side of the market date to accept a dated archive folder. 3 covers
+# a weekend plus the observed next-morning backup offset without pulling the
+# years of history that sit under the same prefix.
+ARCHIVE_WINDOW_DAYS=3
 
 C_CYAN='\033[0;36m'; C_GREEN='\033[0;32m'; C_YELLOW='\033[0;33m'
 C_RED='\033[0;31m';  C_GREY='\033[0;90m';  C_OFF='\033[0m'
@@ -95,6 +99,14 @@ while [[ $# -gt 0 ]]; do
     --dry-run)          DRY_RUN=1; shift ;;
     --only)             need_value "$1" "${2:-}"; ONLY="$2"; shift 2 ;;
     --skip-captures)    SKIP_CAPTURES=1; shift ;;
+    # How far either side of the market date to take dated archive folders.
+    # Default 3 covers a weekend plus the next-morning backup offset. Raise it if
+    # a component's backup job lags further; do NOT raise it to "everything",
+    # which is what this replaced.
+    --archive-window-days)
+        need_value "$1" "${2:-}"
+        [[ "$2" =~ ^[0-9]+$ ]] || die "--archive-window-days needs a whole number of days, got '$2'"
+        ARCHIVE_WINDOW_DAYS="$2"; shift 2 ;;
     # Optional by design: an absent or empty value means "no token available".
     --config-repo-token-ref) CONFIG_REPO_TOKEN_REF="${2:-}"; shift; [[ $# -gt 0 ]] && shift ;;
     -h|--help)          sed -n '2,50p' "$0"; exit 0 ;;
@@ -517,8 +529,81 @@ stage_captures() {
       fix_err=""
       if [[ $DRY_RUN -eq 0 ]]; then
         mkdir -p "$dest/fix"
-        fix_err="$(aws s3 cp "s3://$bucket/${prefix%/}/" "$dest/fix/" \
-                     --recursive --only-show-errors 2>&1)" || fix_rc=$?
+
+        # ONE WINDOW OF DATED FOLDERS, NOT THE WHOLE PREFIX.
+        #
+        # This was a flat `aws s3 cp --recursive` over the entire prefix. That
+        # prefix holds a folder per day going back years: build 79 spent 27 of
+        # its 28 minutes inside this one call, fetching FIX logs from 2024 and
+        # 2025 that no replay of a 2026 market date will ever read.
+        #
+        # WHY PREFIX NAMES AND NOT LastModified: LastModified is the UPLOAD time.
+        # A restored or re-uploaded object reports today, so a window over it
+        # would quietly skip the file you actually wanted. The folder name is the
+        # content date and is already the authority elsewhere in this project.
+        #
+        # WHY A WINDOW AND NOT ONE COMPUTED FOLDER: the folder is NOT the market
+        # date. Observed on a real prefix, a folder dated D holds logs whose own
+        # filenames carry D-1 - the backup job writes the morning after - and
+        # that offset is not consistent across engines, which is exactly why this
+        # project discovers dates instead of computing them. A window spans the
+        # offset without anyone having to assert it.
+        # The manifest records which folders were taken, so the real convention
+        # can be read off a run rather than guessed; tighten the window once it
+        # is confirmed.
+        fix_window=()
+        while IFS= read -r line; do
+          [[ -n "$line" ]] && fix_window+=("$line")
+        done < <(
+          aws s3api list-objects-v2 --bucket "$bucket" \
+              --prefix "${prefix%/}/" --delimiter '/' \
+              --query 'CommonPrefixes[].Prefix' --output text 2>/dev/null \
+            | tr '\t' '\n' \
+            | ARCHIVE_WINDOW_DAYS="$ARCHIVE_WINDOW_DAYS" MARKET_DATE="$MARKET_DATE" python3 -c '
+import os, re, sys, datetime
+mkt = datetime.date.fromisoformat(os.environ["MARKET_DATE"])
+win = int(os.environ["ARCHIVE_WINDOW_DAYS"])
+# Accept DD-MM-YYYY and YYYY-MM-DD. DD-MM vs MM-DD is genuinely ambiguous for
+# day <= 12, so when both parse we keep the folder - a spurious extra day is
+# cheap, a missing trading day is not.
+for raw in (l.strip() for l in sys.stdin):
+    if not raw:
+        continue
+    leaf = raw.rstrip("/").rsplit("/", 1)[-1]
+    cands = []
+    m = re.fullmatch(r"(\d{2})-(\d{2})-(\d{4})", leaf)
+    if m:
+        a, b, y = int(m.group(1)), int(m.group(2)), int(m.group(3))
+        for d, mo in ((a, b), (b, a)):
+            try:
+                cands.append(datetime.date(y, mo, d))
+            except ValueError:
+                pass
+    m = re.fullmatch(r"(\d{4})-(\d{2})-(\d{2})", leaf)
+    if m:
+        try:
+            cands.append(datetime.date(int(m.group(1)), int(m.group(2)), int(m.group(3))))
+        except ValueError:
+            pass
+    if any(abs((c - mkt).days) <= win for c in cands):
+        print(raw)
+'
+        )
+
+        if [[ ${#fix_window[@]} -eq 0 ]]; then
+          warn "$name: no dated folder within ${ARCHIVE_WINDOW_DAYS} day(s) of $MARKET_DATE under $prefix/."
+          warn "$name: NOT falling back to the whole prefix - that is years of data. Widen --archive-window-days if the backup offset is larger than expected."
+          fix_rc=1
+          fix_reason="no dated folder within ${ARCHIVE_WINDOW_DAYS} days of the market date"
+        else
+          ok "$name: ${#fix_window[@]} dated folder(s) within ${ARCHIVE_WINDOW_DAYS} day(s) of $MARKET_DATE"
+          for p in "${fix_window[@]}"; do
+            leaf="${p%/}"; leaf="${leaf##*/}"
+            printf '           %s\n' "$leaf"
+            fix_err+="$(aws s3 cp "s3://$bucket/$p" "$dest/fix/$leaf/" \
+                          --recursive --only-show-errors 2>&1)" || fix_rc=$?
+          done
+        fi
         # DISTINGUISH ARCHIVED FROM FORBIDDEN. Build 78 returned
         #   InvalidObjectState: The operation is not valid for the object's
         #   access tier
@@ -538,13 +623,20 @@ stage_captures() {
           printf '%s\n' "$fix_err" | tail -5 >&2
         fi
       fi
+      # The chosen folders go in the manifest. Whoever settles the backup-offset
+      # convention can then read it off a real run - "market date 2026-06-05 took
+      # 06-06-2026" - instead of it staying an assertion nobody verified.
+      fix_taken="$(printf '%s\n' "${fix_window[@]:-}" | sed 's:/*$::; s:.*/::' | jq -R . | jq -sc 'map(select(. != ""))')"
       if [[ $fix_rc -eq 0 ]]; then
         record "$name" fixArchive staged \
-          "$(jq -n --arg b "$bucket" --arg p "$prefix" '{bucket:$b, prefix:$p}')"
+          "$(jq -n --arg b "$bucket" --arg p "$prefix" --argjson f "$fix_taken" \
+             --argjson w "$ARCHIVE_WINDOW_DAYS" --arg m "$MARKET_DATE" \
+             '{bucket:$b, prefix:$p, marketDate:$m, windowDays:$w, foldersTaken:$f}')"
       else
         record "$name" fixArchive failed \
           "$(jq -n --arg b "$bucket" --arg p "$prefix" --arg r "${fix_reason:-aws s3 cp exited $fix_rc}" \
-             '{bucket:$b, prefix:$p, reason:$r}')"
+             --argjson f "$fix_taken" --argjson w "$ARCHIVE_WINDOW_DAYS" --arg m "$MARKET_DATE" \
+             '{bucket:$b, prefix:$p, marketDate:$m, windowDays:$w, foldersTaken:$f, reason:$r}')"
       fi
     fi
   fi
