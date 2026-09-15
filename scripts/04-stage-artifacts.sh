@@ -55,7 +55,7 @@ set -euo pipefail
 
 # Printed first, every run. A stale fetch is otherwise invisible - see the note
 # in 02-prereq-windows.ps1.
-SCRIPT_VERSION='2026-09-10.1-flowtest-secret-prefix'
+SCRIPT_VERSION='2026-09-15.1-git-basic-auth'
 
 PLAN_FILE="/opt/flowtest/bootstrap/flow-plan-linux.json"
 DRY_RUN=0
@@ -70,6 +70,11 @@ ok()   { printf '%b  [ok]  %b%s\n'   "$C_GREEN" "$C_OFF" "$*"; }
 skip() { printf '%b  [skip] %s%b\n'  "$C_GREY"  "$*" "$C_OFF"; }
 warn() { printf '%b  [warn] %b%s\n'  "$C_YELLOW" "$C_OFF" "$*"; }
 fail() { printf '%b  [FAIL] %b%s\n'  "$C_RED"   "$C_OFF" "$*"; }
+# For a step ANNOUNCING what it is about to do. Use this rather than ok() before
+# the work has actually succeeded: printing [ok] and then [warn] two lines later
+# reads as a step that passed and was then contradicted, and that is how build
+# 76's failed clone was mistaken for a wrong path in the config repo.
+try()  { printf '%b  [ .. ] %b%s\n'  "$C_CYAN"  "$C_OFF" "$*"; }
 die()  { fail "$*"; exit 1; }
 
 # "${2:-}", NOT "$2". Build 67 died here with
@@ -302,20 +307,58 @@ stage_config() {
                 '{reason:"private repo and no GitHub token reference supplied", repo:$r, path:$p}')"
         return 0
       fi
-      ok "$name: $repo@$branch at $gitpath"
+      # "fetching", not ok: this announces intent. It used to print [ok] here and
+      # then [warn] two lines later, which reads as a step that succeeded and was
+      # then contradicted.
+      try "$name: fetching $repo@$branch at $gitpath"
       if [[ $DRY_RUN -eq 0 ]]; then
         local work; work="$(mktemp -d)"
         # Sparse, depth-1: the config repo holds every host's configuration and a
         # full clone is large and entirely wasted here.
+        #
+        # EVERY COMMAND CARRIES ITS OWN `|| exit`. Do not remove them and rely on
+        # `set -e`: this subshell is the left operand of `||`, and bash disables
+        # errexit inside a compound command whose status is being tested. Build 76
+        # is the proof. The clone failed on auth, `cd repo` then failed, and the
+        # last statement was `git sparse-checkout ... || true`, so the SUBSHELL
+        # EXITED 0. The `clone failed` branch below never ran; the code fell
+        # through to the directory test and reported the requested path as "not
+        # present in the config repo" - sending everyone hunting for a wrong path
+        # when the actual fault was the GitHub token being rejected.
+        # BASIC, NOT BEARER. Measured on 2026-09-10 against the private config
+        # repo with a valid classic PAT:
+        #   Authorization: Bearer <pat>  -> git ls-remote FAILED (401)
+        #   Authorization: Basic  <b64>  -> git ls-remote OK
+        # while the SAME token returned 200 from both api.github.com/user and the
+        # repo's REST endpoint. api.github.com and the git transport (/info/refs,
+        # git-upload-pack) are different endpoints with different accepted
+        # schemes, so a REST probe does NOT prove git will authenticate - that is
+        # what made build 76 look like a wrong path in the config repo.
+        # x-access-token as the username works for classic PATs, fine-grained
+        # PATs and App installation tokens alike, so this survives a rotation to
+        # a different token type.
+        local b64
+        b64="$(printf 'x-access-token:%s' "$GITHUB_TOKEN" | base64 | tr -d '\n')"
         (
-          cd "$work"
-          git -c credential.helper= -c "http.extraheader=Authorization: Bearer $GITHUB_TOKEN" \
+          cd "$work" || exit 1
+          # GIT_TERMINAL_PROMPT=0: on a 401 git otherwise falls back to asking for
+          # a username, which on a headless host reports
+          #   "could not read Username for 'https://github.com'"
+          # - a message that describes the fallback, not the rejection.
+          GIT_TERMINAL_PROMPT=0 \
+          git -c credential.helper= -c "http.extraheader=Authorization: Basic $b64" \
               clone --quiet --depth 1 --branch "$branch" --filter=blob:none --sparse \
-              "https://github.com/$owner/$repo.git" repo
-          cd repo
+              "https://github.com/$owner/$repo.git" repo || exit 1
+          cd repo || exit 1
           git sparse-checkout set --no-cone "${gitpath//\\//}" >/dev/null 2>&1 || true
-        ) || { fail "$name: clone failed"; rm -rf "$work"
-               record "$name" config failed "$(jq -n '{reason:"git clone failed"}')"; return 0; }
+          exit 0
+        ) || { fail "$name: clone of $repo@$branch failed - the path in the repo has NOT been checked."
+               fail "$name: if stderr says \"could not read Username for 'https://github.com'\" the token was rejected, not missing: git fell back to prompting after a 401."
+               rm -rf "$work"
+               record "$name" config failed \
+                 "$(jq -n --arg r "$repo" --arg b "$branch" --arg p "$gitpath" \
+                    '{reason:"git clone failed - token rejected or branch missing; repo path unverified", repo:$r, branch:$b, path:$p}')"
+               return 0; }
         mkdir -p "$dest"
         local src="$work/repo/${gitpath//\\//}"
         if [[ -d "$src" ]]; then
@@ -414,12 +457,29 @@ stage_captures() {
       record "$name" fixArchive skipped "$(jq -n '{reason:"no archive path available"}')"
     else
       ok "$name: FIX messages s3://$bucket/$prefix/"
+      # THE COPY'S EXIT CODE DECIDES THE STATUS. It used to record 'staged'
+      # unconditionally, one line after warning that the fetch had failed, so
+      # build 76 reported "staged: 3" for a host on which all three fetches
+      # failed with AccessDenied - and environment.json repeated it, because the
+      # manifest is what it reads. A gap that reports itself as staged is worse
+      # than a missing manifest: the Runner has no reason to look.
+      fix_rc=0
       if [[ $DRY_RUN -eq 0 ]]; then
         mkdir -p "$dest/fix"
         aws s3 cp "s3://$bucket/${prefix%/}/" "$dest/fix/" --recursive --only-show-errors \
-          || warn "$name: FIX message fetch failed (prefix may not exist)"
+          || fix_rc=$?
+        if [[ $fix_rc -ne 0 ]]; then
+          warn "$name: FIX message fetch failed (exit $fix_rc; prefix may not exist, or the host role lacks s3:ListBucket on the BUCKET arn as well as /*)"
+        fi
       fi
-      record "$name" fixArchive staged "$(jq -n --arg b "$bucket" --arg p "$prefix" '{bucket:$b, prefix:$p}')"
+      if [[ $fix_rc -eq 0 ]]; then
+        record "$name" fixArchive staged \
+          "$(jq -n --arg b "$bucket" --arg p "$prefix" '{bucket:$b, prefix:$p}')"
+      else
+        record "$name" fixArchive failed \
+          "$(jq -n --arg b "$bucket" --arg p "$prefix" --arg rc "$fix_rc" \
+             '{bucket:$b, prefix:$p, reason:"aws s3 cp exited \($rc)"}')"
+      fi
     fi
   fi
 
@@ -498,12 +558,27 @@ else
   qb="$(printf '%s' "$QUILL" | jq -r '.bucket')"
   qk="$(printf '%s' "$QUILL" | jq -r '.s3Path')"
   ok "s3://$qb/$qk"
+  # Same correction as the FIX archive above: the copy's exit code decides the
+  # status. A failed Quill fetch recorded as 'staged' is the worst of the three,
+  # because the simulator then starts with no book and the replay looks green
+  # while exercising the no-market fallback path.
+  quill_rc=0
   if [[ $DRY_RUN -eq 0 ]]; then
     mkdir -p "$CAPTURE_ROOT/_quill"
-    aws s3 cp "s3://$qb/$qk" "$CAPTURE_ROOT/_quill/" --only-show-errors \
-      || warn "Quill fetch failed. The key is a discovery HINT - the capture date may differ from the market date."
+    aws s3 cp "s3://$qb/$qk" "$CAPTURE_ROOT/_quill/" --only-show-errors || quill_rc=$?
+    if [[ $quill_rc -ne 0 ]]; then
+      warn "Quill fetch failed (exit $quill_rc). The key is a discovery HINT - the capture date may differ from the market date. A 403 here usually means the host role, not the key."
+    fi
   fi
-  record "-" quillCapture staged "$(jq -n --arg b "$qb" --arg k "$qk" --arg d "$CAPTURE_ROOT/_quill" '{bucket:$b, key:$k, dest:$d}')"
+  if [[ $quill_rc -eq 0 ]]; then
+    record "-" quillCapture staged \
+      "$(jq -n --arg b "$qb" --arg k "$qk" --arg d "$CAPTURE_ROOT/_quill" \
+         '{bucket:$b, key:$k, dest:$d}')"
+  else
+    record "-" quillCapture failed \
+      "$(jq -n --arg b "$qb" --arg k "$qk" --arg rc "$quill_rc" \
+         '{bucket:$b, key:$k, reason:"aws s3 cp exited \($rc)"}')"
+  fi
 fi
 
 # --------------------------- manifest ---------------------------

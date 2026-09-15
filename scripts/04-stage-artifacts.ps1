@@ -67,9 +67,42 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
+# TWO JOBS, AND THE SECOND ONE MATTERS MORE.
+#
+# Build 76: this script hit a strict-mode error, PowerShell printed
+#     The property 'Name' cannot be found on this object.
+#     FullyQualifiedErrorId : PropertyNotFoundStrict
+# and the process still exited 0, because `powershell -File` reports the
+# INTERPRETER's exit status, not whether the script finished. So:
+#   * SSM recorded Status=Success
+#   * the pipeline echoed "windows: staging status Success"
+#   * no manifest was written, and the build was green
+# A host staged nothing and every layer above it said the environment was ready.
+#
+# 1. PRINT THE LINE NUMBER. The message above named a property and nothing else -
+#    no file, no line - so it could not be traced to a statement. The bash
+#    counterpart reported "line 315" and was diagnosed in minutes.
+# 2. EXIT NON-ZERO, so SSM reports Failed and the stage stops claiming success.
+#
+# Do not replace this with a try/catch around main(): a trap catches terminating
+# errors raised anywhere, including inside functions called from functions, which
+# is where this one came from.
+trap {
+    $inv = $_.InvocationInfo
+    Write-Host ''
+    Write-Host '  [FAIL] staging aborted on an unhandled error'
+    Write-Host "         line    : $($inv.ScriptLineNumber)"
+    Write-Host "         statement: $($inv.Line.Trim())"
+    Write-Host "         message : $($_.Exception.Message)"
+    Write-Host "         category: $($_.CategoryInfo.Category) / $($_.FullyQualifiedErrorId)"
+    Write-Host ''
+    Write-Host '  No manifest was written. Nothing on this host should be treated as staged.'
+    exit 1
+}
+
 # Printed first, every run. Without it a stale fetch is invisible and a retest
 # can silently re-run old code while looking like a fresh result.
-$script:ScriptVersion = '2026-09-10.1-flowtest-secret-prefix'
+$script:ScriptVersion = '2026-09-15.1-git-basic-auth'
 
 function Write-Step { param([string] $Message) Write-Host "`n=== $Message ===" -ForegroundColor Cyan }
 function Write-Ok   { param([string] $Message) Write-Host "  [ok]   $Message" -ForegroundColor Green }
@@ -267,10 +300,31 @@ function Get-GitFolder {
     try {
         # The token goes in an http.extraheader, not the URL: a URL with
         # credentials is recorded in .git/config and in any error message.
-        & git -c credential.helper= -c "http.extraheader=Authorization: Bearer $script:GitHubToken" `
+        #
+        # BASIC, NOT BEARER. Measured on 2026-09-10 against the private config
+        # repo with a valid classic PAT:
+        #   Authorization: Bearer <pat>  -> git ls-remote FAILED (401)
+        #   Authorization: Basic  <b64>  -> git ls-remote OK
+        # while the SAME token returned 200 from both api.github.com/user and the
+        # repo's REST endpoint. api.github.com and the git transport are
+        # different endpoints with different accepted schemes, so a REST probe
+        # does NOT prove git will authenticate. x-access-token as the username
+        # works for classic PATs, fine-grained PATs and App installation tokens
+        # alike, so this survives a rotation to a different token type.
+        $basic = [Convert]::ToBase64String(
+            [Text.Encoding]::ASCII.GetBytes("x-access-token:$script:GitHubToken"))
+        # GIT_TERMINAL_PROMPT=0: on a 401 git otherwise falls back to asking for a
+        # username, and on a headless host that surfaces as "could not read
+        # Username for 'https://github.com'" - a message about the fallback, not
+        # about the rejection.
+        $env:GIT_TERMINAL_PROMPT = '0'
+        & git -c credential.helper= -c "http.extraheader=Authorization: Basic $basic" `
               clone --quiet --depth 1 --branch $Branch --filter=blob:none --sparse `
               "https://github.com/$Owner/$Repo.git" "$work\repo" 2>&1 | Out-Null
-        if ($LASTEXITCODE -ne 0) { return $null }
+        if ($LASTEXITCODE -ne 0) {
+            Write-Warn "clone of $Repo@$Branch failed (git exit $LASTEXITCODE). The path in the repo has NOT been checked - do not read this as a missing folder."
+            return $null
+        }
         Push-Location "$work\repo"
         try { & git sparse-checkout set --no-cone $Path.Replace('\', '/') 2>&1 | Out-Null }
         finally { Pop-Location }
@@ -413,13 +467,30 @@ function Stage-Captures {
         }
         else {
             Write-Ok "${Name}: FIX messages s3://$($fa.bucket)/$($fa.prefix)/"
+            # THE COPY'S EXIT CODE DECIDES THE STATUS. This used to record
+            # 'staged' unconditionally, one line after warning that the fetch had
+            # failed. The bash counterpart did the same and build 76 reported
+            # "staged: 3" for a host where all three fetches failed with
+            # AccessDenied - and environment.json repeated it, because the
+            # manifest is what it reads.
+            $fixRc = 0
             if (-not $DryRun) {
                 New-Item -ItemType Directory -Path (Join-Path $dest 'fix') -Force | Out-Null
                 $copy = Invoke-Aws @('s3','cp',"s3://$($fa.bucket)/$($fa.prefix.TrimEnd('/'))/",
                                      (Join-Path $dest 'fix\'), '--recursive', '--only-show-errors') -AllowFailure
-                if ($copy.ExitCode -ne 0) { Write-Warn "${Name}: FIX message fetch failed (prefix may not exist)" }
+                $fixRc = $copy.ExitCode
+                if ($fixRc -ne 0) {
+                    Write-Warn "${Name}: FIX message fetch failed (exit $fixRc; prefix may not exist, or the host role lacks s3:ListBucket on the BUCKET arn as well as /*)"
+                }
             }
-            Add-Result $Name 'fixArchive' 'staged' @{ bucket = $fa.bucket; prefix = $fa.prefix }
+            if ($fixRc -eq 0) {
+                Add-Result $Name 'fixArchive' 'staged' @{ bucket = $fa.bucket; prefix = $fa.prefix }
+            }
+            else {
+                Add-Result $Name 'fixArchive' 'failed' @{
+                    bucket = $fa.bucket; prefix = $fa.prefix
+                    reason = "aws s3 cp exited $fixRc" }
+            }
         }
     }
 
@@ -485,14 +556,27 @@ else {
     $quill = $plan.quillCapture
     Write-Ok "s3://$($quill.bucket)/$($quill.s3Path)"
     $quillDest = Join-Path $captureRoot '_quill'
+    # Same correction as the FIX archive above: the exit code decides the status.
+    # A failed Quill fetch recorded as 'staged' is the worst of the three - the
+    # simulator starts with no book and the replay looks green while exercising
+    # the no-market fallback path.
+    $quillRc = 0
     if (-not $DryRun) {
         New-Item -ItemType Directory -Path $quillDest -Force | Out-Null
         $copy = Invoke-Aws @('s3','cp',"s3://$($quill.bucket)/$($quill.s3Path)","$quillDest\",'--only-show-errors') -AllowFailure
-        if ($copy.ExitCode -ne 0) {
-            Write-Warn 'Quill fetch failed. The key is a discovery HINT - the capture date may differ from the market date.'
+        $quillRc = $copy.ExitCode
+        if ($quillRc -ne 0) {
+            Write-Warn "Quill fetch failed (exit $quillRc). The key is a discovery HINT - the capture date may differ from the market date. A 403 here usually means the host role, not the key."
         }
     }
-    Add-Result '-' 'quillCapture' 'staged' @{ bucket = $quill.bucket; key = $quill.s3Path; dest = $quillDest }
+    if ($quillRc -eq 0) {
+        Add-Result '-' 'quillCapture' 'staged' @{ bucket = $quill.bucket; key = $quill.s3Path; dest = $quillDest }
+    }
+    else {
+        Add-Result '-' 'quillCapture' 'failed' @{
+            bucket = $quill.bucket; key = $quill.s3Path
+            reason = "aws s3 cp exited $quillRc" }
+    }
 }
 
 # ---------------------------------------------------------------------------
