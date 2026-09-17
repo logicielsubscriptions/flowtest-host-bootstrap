@@ -382,7 +382,18 @@ stage_config() {
           # and the only symptom was the directory test below reporting the path
           # "not present in the repo" - for a path that demonstrably exists on
           # main. An error hidden here is indistinguishable from a missing folder.
-          if ! git sparse-checkout set --no-cone "${gitpath//\\//}" 2>&1; then
+          # THE HEADER GOES ON THIS CALL TOO. `git -c ...` configures ONE git
+          # process. --filter=blob:none makes the clone a partial one, so blobs
+          # are fetched lazily - and the fetch happens HERE, in a separate git
+          # process that had no credentials. Build 81:
+          #   fatal: could not read Username for 'https://github.com'
+          #   fatal: could not fetch <sha> from promisor remote
+          # after a clone that had succeeded. Basic auth was already right; it
+          # was simply absent from the call that needed it.
+          if ! GIT_TERMINAL_PROMPT=0 \
+               git -c credential.helper= \
+                   -c "http.extraheader=Authorization: Basic $b64" \
+                   sparse-checkout set --no-cone "${gitpath//\\//}" 2>&1; then
             echo "sparse-checkout set failed for '${gitpath//\\//}'" >&2
             exit 2
           fi
@@ -563,20 +574,57 @@ stage_captures() {
 import os, re, sys, datetime
 mkt = datetime.date.fromisoformat(os.environ["MARKET_DATE"])
 win = int(os.environ["ARCHIVE_WINDOW_DAYS"])
-# Accept DD-MM-YYYY and YYYY-MM-DD. DD-MM vs MM-DD is genuinely ambiguous for
-# day <= 12, so when both parse we keep the folder - a spurious extra day is
-# cheap, a missing trading day is not.
-for raw in (l.strip() for l in sys.stdin):
-    if not raw:
+rows = [l.strip() for l in sys.stdin if l.strip()]
+
+# INFER THE CONVENTION FROM THE LISTING, DO NOT ASSUME IT.
+#
+# Two formats are in use in the same bucket, on different prefixes - build 81
+# saw YYYY-MM-DD under one host's FIX prefix and DD-MM-YYYY under another's. And
+# DD-MM vs MM-DD is ambiguous whenever both numbers are <= 12.
+#
+# The earlier rule was "keep the folder if EITHER reading lands in the window",
+# which pulled 09-07-2026 (9 July) into a window around 10 September because
+# MM-DD read it as 7 September. So: vote. Any leaf with a component > 12 can
+# only be read one way, and those leaves settle the format for the whole prefix.
+# A prefix with a year of history always has some.
+DMY, MDY = 0, 1
+votes = {DMY: 0, MDY: 0}
+pat2 = re.compile(r"(\d{2})-(\d{2})-(\d{4})")
+for raw in rows:
+    m = pat2.fullmatch(raw.rstrip("/").rsplit("/", 1)[-1])
+    if not m:
         continue
+    a, b = int(m.group(1)), int(m.group(2))
+    if a > 12 and b <= 12:
+        votes[DMY] += 1
+    elif b > 12 and a <= 12:
+        votes[MDY] += 1
+
+order = []
+if votes[DMY] > votes[MDY]:
+    order = [DMY]
+elif votes[MDY] > votes[DMY]:
+    order = [MDY]
+else:
+    # No unambiguous evidence either way. Fall back to accepting both, and say
+    # so - a spurious extra folder costs seconds, a missing trading day costs a
+    # wrong replay. Silence here would hide that the format is still a guess.
+    order = [DMY, MDY]
+    sys.stderr.write(
+        "  [warn] could not infer the dated-folder format from this prefix "
+        "(no folder with a component > 12); accepting both DD-MM and MM-DD, "
+        "which may take an extra folder\\n")
+
+for raw in rows:
     leaf = raw.rstrip("/").rsplit("/", 1)[-1]
     cands = []
-    m = re.fullmatch(r"(\d{2})-(\d{2})-(\d{4})", leaf)
+    m = pat2.fullmatch(leaf)
     if m:
-        a, b, y = int(m.group(1)), int(m.group(2)), int(m.group(3))
-        for d, mo in ((a, b), (b, a)):
+        x, y2, yr = int(m.group(1)), int(m.group(2)), int(m.group(3))
+        for kind in order:
+            d, mo = (x, y2) if kind == DMY else (y2, x)
             try:
-                cands.append(datetime.date(y, mo, d))
+                cands.append(datetime.date(yr, mo, d))
             except ValueError:
                 pass
     m = re.fullmatch(r"(\d{4})-(\d{2})-(\d{2})", leaf)

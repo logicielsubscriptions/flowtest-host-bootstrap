@@ -368,7 +368,13 @@ function Get-GitFolder {
         # absent from the repo - which is how build 79 blamed the config repo for
         # a path that exists on main.
         try {
-            $sparse = & git sparse-checkout set --no-cone $Path.Replace('\', '/') 2>&1
+            # The header goes on THIS call too. `git -c ...` configures one git
+            # process, and --filter=blob:none defers blob download, so the fetch
+            # happens here in a separate process. Build 81 failed exactly this
+            # way on the Linux host after a clone that had succeeded.
+            $sparse = & git -c credential.helper= `
+                            -c "http.extraheader=Authorization: Basic $basic" `
+                            sparse-checkout set --no-cone $Path.Replace('\', '/') 2>&1
             if ($LASTEXITCODE -ne 0) {
                 Write-Warn "sparse-checkout failed for '$Path' (git exit $LASTEXITCODE): $sparse"
                 Write-Warn 'The repo path has NOT been checked - do not read the next warning as a missing folder.'
@@ -589,25 +595,43 @@ function Stage-Captures {
 
                 $mkt = [datetime]::ParseExact($plan.marketDate, 'yyyy-MM-dd', $null)
                 if ($listed.ExitCode -eq 0 -and $listed.Output) {
-                    foreach ($raw in ($listed.Output -split '\s+')) {
-                        if (-not $raw) { continue }
+                    $rows = @($listed.Output -split '\s+' | Where-Object { $_ })
+
+                    # INFER THE CONVENTION FROM THE LISTING, DO NOT ASSUME IT.
+                    # Two formats are in use in the same bucket on different
+                    # prefixes - build 81 saw YYYY-MM-DD under this host's FIX
+                    # prefix and DD-MM-YYYY under the Linux host's. And DD-MM vs
+                    # MM-DD is ambiguous whenever both numbers are <= 12.
+                    # Any leaf with a component > 12 can only be read one way,
+                    # and those settle it for the whole prefix. Mirrors the bash
+                    # side; keep the two in step.
+                    $dmy = 0; $mdy = 0
+                    foreach ($raw in $rows) {
                         $leaf = $raw.TrimEnd('/').Split('/')[-1]
-                        # DD-MM vs MM-DD is ambiguous for day <= 12, so try both
-                        # and keep the folder if EITHER lands in the window. A
-                        # spurious extra day costs seconds; a missing trading day
-                        # costs a wrong replay.
-                        $cands = @()
-                        foreach ($fmt in @('dd-MM-yyyy','MM-dd-yyyy','yyyy-MM-dd')) {
+                        if ($leaf -match '^(\d{2})-(\d{2})-(\d{4})$') {
+                            $a = [int]$Matches[1]; $b = [int]$Matches[2]
+                            if ($a -gt 12 -and $b -le 12) { $dmy++ }
+                            elseif ($b -gt 12 -and $a -le 12) { $mdy++ }
+                        }
+                    }
+                    $formats = @('yyyy-MM-dd')
+                    if ($dmy -gt $mdy)      { $formats += 'dd-MM-yyyy' }
+                    elseif ($mdy -gt $dmy)  { $formats += 'MM-dd-yyyy' }
+                    else {
+                        $formats += @('dd-MM-yyyy','MM-dd-yyyy')
+                        Write-Warn "${Name}: could not infer the dated-folder format from this prefix (no folder with a component > 12); accepting both DD-MM and MM-DD, which may take an extra folder"
+                    }
+
+                    foreach ($raw in $rows) {
+                        $leaf = $raw.TrimEnd('/').Split('/')[-1]
+                        foreach ($fmt in $formats) {
                             $parsed = [datetime]::MinValue
                             if ([datetime]::TryParseExact($leaf, $fmt, $null,
                                     [Globalization.DateTimeStyles]::None, [ref]$parsed)) {
-                                $cands += $parsed
-                            }
-                        }
-                        foreach ($c in $cands) {
-                            if ([math]::Abs(($c - $mkt).Days) -le $ArchiveWindowDays) {
-                                $foldersTaken += $raw
-                                break
+                                if ([math]::Abs(($parsed - $mkt).Days) -le $ArchiveWindowDays) {
+                                    $foldersTaken += $raw
+                                    break
+                                }
                             }
                         }
                     }
