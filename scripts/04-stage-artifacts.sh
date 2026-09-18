@@ -55,7 +55,7 @@ set -euo pipefail
 
 # Printed first, every run. A stale fetch is otherwise invisible - see the note
 # in 02-prereq-windows.ps1.
-SCRIPT_VERSION='2026-09-17.1-captures-on-windows'
+SCRIPT_VERSION='2026-09-18.1-claim-bounds'
 
 PLAN_FILE="/opt/flowtest/bootstrap/flow-plan-linux.json"
 DRY_RUN=0
@@ -349,7 +349,11 @@ print((m+datetime.timedelta(days=int('$offset'))).isoformat())
     return 1
   fi
 
-  CONFIG_CHANGE_COUNT="$(grep -c . "$work/between.log" 2>/dev/null || echo 0)"
+  # Same `grep -c` trap as GIT_AFTER_COUNT - see the note there. This line had
+  # the identical bug and would have fired the moment a snapshot fell outside
+  # the window, which is the only path that reaches it.
+  CONFIG_CHANGE_COUNT="$(wc -l < "$work/between.log" 2>/dev/null | tr -d ' ')"
+  CONFIG_CHANGE_COUNT="${CONFIG_CHANGE_COUNT:-0}"
   if [[ "$CONFIG_CHANGE_COUNT" -gt 0 ]]; then
     CONFIG_CHANGE_RESULT="changed"
     CONFIG_CHANGE_NOTE="$CONFIG_CHANGE_COUNT commit(s) to $gp between $since and $MARKET_DATE"
@@ -606,7 +610,21 @@ stage_config() {
         #       before this change that is exactly what was staged.
         GIT_ASOF_SHA="$(cat "$work/asof.sha" 2>/dev/null || true)"
         GIT_ASOF_DATE="$(cat "$work/asof.date" 2>/dev/null || true)"
-        GIT_AFTER_COUNT="$(grep -c . "$work/after.log" 2>/dev/null || echo 0)"
+        # wc -l, NOT `grep -c . || echo 0`.
+        #
+        # `grep -c` on a file with no matching lines PRINTS 0 AND EXITS 1, so the
+        # `|| echo 0` fallback fired as well and the variable became "0\n0". That
+        # is build 83: two lines where a number was expected, so
+        #   [[ "$GIT_AFTER_COUNT" -eq 0 ]]
+        # died with "syntax error in expression (error token is "0")", set -e
+        # took the script down, and Linux wrote NO MANIFEST at all - which the
+        # pipeline correctly reported as UNSTABLE. The message even printed the
+        # newline: "this path has 0\n0 commit(s) AFTER ...".
+        #
+        # wc -l always prints one number and always exits 0. tr -d ' ' because
+        # some wc implementations pad the count.
+        GIT_AFTER_COUNT="$(wc -l < "$work/after.log" 2>/dev/null | tr -d ' ')"
+        GIT_AFTER_COUNT="${GIT_AFTER_COUNT:-0}"
         ok "$name: using ${GIT_ASOF_SHA:0:8} committed ${GIT_ASOF_DATE:-unknown} - the version in force on $MARKET_DATE"
         if [[ "$GIT_AFTER_COUNT" -eq 0 ]]; then
           ok "$name: unchanged since (0 commits to this path after $MARKET_DATE), so this is also the current config"
@@ -802,7 +820,11 @@ stage_captures() {
         # aws prints the literal "None" for an empty CommonPrefixes, which would
         # otherwise be carried through as a candidate folder name.
         [[ "$fix_list" == "None" ]] && fix_list=""
+        # `|| true` happens to be safe here where `|| echo 0` was not - grep
+        # prints its 0 and the fallback adds nothing. Using wc -l anyway so the
+        # fragile form is not left in the file for the next person to copy.
         fix_prefix_count="$(printf '%s' "$fix_list" | tr '\t' '\n' | grep -c . || true)"
+        fix_prefix_count="${fix_prefix_count:-0}"
         ok "$name: $fix_prefix_count dated folder(s) exist under $prefix/"
 
         fix_window=()
