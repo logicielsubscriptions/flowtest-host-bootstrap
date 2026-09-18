@@ -108,7 +108,7 @@ trap {
 
 # Printed first, every run. Without it a stale fetch is invisible and a retest
 # can silently re-run old code while looking like a fresh result.
-$script:ScriptVersion = '2026-09-18.2-git-config-env'
+$script:ScriptVersion = '2026-09-18.3-iso-dates'
 
 function Write-Step { param([string] $Message) Write-Host "`n=== $Message ===" -ForegroundColor Cyan }
 function Write-Ok   { param([string] $Message) Write-Host "  [ok]   $Message" -ForegroundColor Green }
@@ -434,8 +434,17 @@ function Get-GitFolder {
         # absent from the repo - which is how build 79 blamed the config repo for
         # a path that exists on main.
         try {
+            # ISO 'T' SEPARATOR, NOT A SPACE. Build 85:
+            #   [warn] no commit on origin/main at or before 2026-09-10
+            # after a clone that had succeeded. `--before="2026-09-10 23:59:59"`
+            # contains a space, PowerShell 5.1 re-split it, and git received
+            # `23:59:59` as a separate argument - so rev-list failed and returned
+            # nothing. Same trap as the extraheader value in build 82 and the
+            # third time it has bitten in this file. git's approxidate accepts
+            # the T form, which has no space to split on.
+            #
             # 23:59:59 so a commit made ON the market date counts as in force.
-            $asof = (& git rev-list -1 --before="$($plan.marketDate) 23:59:59" "origin/$Branch" 2>&1 |
+            $asof = (& git rev-list -1 "--before=$($plan.marketDate)T23:59:59" "origin/$Branch" 2>&1 |
                      Select-Object -First 1)
             if ($LASTEXITCODE -ne 0 -or -not $asof -or $asof -notmatch '^[0-9a-f]{7,40}$') {
                 Write-Warn "no commit on origin/$Branch at or before $($plan.marketDate) - the branch may be younger than the market date."
@@ -446,9 +455,18 @@ function Get-GitFolder {
             # Commits to this path AFTER the market date. Zero means the config
             # has not changed since, so this version is also the current one -
             # which is the direct answer to "is a year-old config still right?".
-            $after = @(& git log --oneline "$asof..origin/$Branch" -- $Path.Replace('\', '/') 2>$null)
-            $script:GitAfterCount = $after.Count
-            $script:GitAfterLog = $after
+            $after = @(& git log --oneline "$asof..origin/$Branch" -- $Path.Replace('\', '/') 2>&1)
+            if ($LASTEXITCODE -ne 0) {
+                # EMPTY OUTPUT FROM A FAILED COMMAND IS NOT "no commits".
+                # Treating it as zero is how a broken query becomes evidence.
+                Write-Warn "could not count commits after the market date (git exit $LASTEXITCODE); reporting it as unknown rather than as zero."
+                $script:GitAfterCount = $null
+                $script:GitAfterLog = @()
+            }
+            else {
+                $script:GitAfterCount = $after.Count
+                $script:GitAfterLog = $after
+            }
             # The header goes on THIS call too. `git -c ...` configures one git
             # process, and --filter=blob:none defers blob download, so the fetch
             # happens here in a separate process. Build 81 failed exactly this
@@ -470,7 +488,10 @@ function Get-GitFolder {
                 return $null
             }
             Write-Ok "using $($asof.Substring(0,8)) committed $script:GitAsOfDate - the version in force on $($plan.marketDate)"
-            if ($script:GitAfterCount -eq 0) {
+            if ($null -eq $script:GitAfterCount) {
+                Write-Warn "whether this path changed after $($plan.marketDate) is UNKNOWN - the history query failed. The staged version is still the market-date one."
+            }
+            elseif ($script:GitAfterCount -eq 0) {
                 Write-Ok "unchanged since (0 commits to this path after $($plan.marketDate)), so this is also the current config"
             }
             else {
@@ -562,10 +583,29 @@ function Test-ConfigChangedBetween {
         }
         Push-Location "$work\hist"
         try {
-            $between = @(& git log --oneline --since="$since 00:00:00" `
-                             --until="$($plan.marketDate) 23:59:59" -- $gp.Replace('\', '/') 2>$null)
+            # ISO 'T' SEPARATOR, AND THE EXIT CODE IS CHECKED.
+            #
+            # Build 85 reported "stale-but-unchanged" for both OMS engines with
+            # the evidence "no commits between 2026-07-10 and 2026-09-10" - and
+            # that verdict was NOT EVIDENCE. `--since="2026-07-10 00:00:00"`
+            # contains a space, PowerShell re-split it, git got a stray
+            # `00:00:00` argument, and the query returned nothing. Empty output
+            # from a broken command was then read as "no commits found".
+            #
+            # A false "unchanged" is the worst outcome this function can produce:
+            # it converts an unknown into a positive assurance that the staged
+            # config matched the market date. So the date loses its space, and a
+            # non-zero exit now returns UNKNOWN instead of a verdict.
+            $between = @(& git log --oneline "--since=${since}T00:00:00" `
+                             "--until=$($plan.marketDate)T23:59:59" `
+                             -- $gp.Replace('\', '/') 2>&1)
+            $logRc = $LASTEXITCODE
         }
         finally { Pop-Location }
+        if ($logRc -ne 0) {
+            $script:ConfigChangeNote = "the config-repo history query failed (git exit $logRc), so whether the config changed is unknown"
+            return $null
+        }
         $script:ConfigChangeCount = $between.Count
         if ($between.Count -gt 0) {
             $between | ForEach-Object { Write-Warn "    $_" }

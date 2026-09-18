@@ -78,7 +78,7 @@ Set-StrictMode -Version Latest
 # The same lesson as PIPELINE_VERSION in Jenkinsfile-generate-cfn, which was
 # itself once left un-bumped so a build reported a version that did not describe
 # the code it ran. Cheap marker, expensive absence.
-$script:ScriptVersion = '2026-09-18.2-git-config-env'
+$script:ScriptVersion = '2026-09-18.3-iso-dates'
 
 # ----------------------------- configuration -----------------------------
 
@@ -352,12 +352,37 @@ function Sync-ServiceEnvironment {
     #>
     $svc = Get-Service -Name 'AmazonSSMAgent' -ErrorAction SilentlyContinue
     if (-not $svc) { Write-Skip 'SSM Agent not present; nothing to refresh'; return }
-    try {
-        Restart-Service -Name 'AmazonSSMAgent' -Force -ErrorAction Stop
+
+    # STOP AND START SEPARATELY, THEN VERIFY. Not Restart-Service.
+    #
+    # This is the build 80 fault, found still live here on 2026-09-18 by
+    # scripts/check-shell-traps.py - the UserData copy was fixed at the time and
+    # this one was missed, because the fix was applied where the failure had been
+    # observed rather than everywhere the pattern existed.
+    #
+    # Restart-Service is a stop followed by a start. When the start half fails
+    # the service is left STOPPED, and a catch that only warns reads as though
+    # nothing much happened. In build 80 that cost a whole environment: the agent
+    # stayed down, the host never registered with SSM, and the pipeline spent its
+    # full 15-minute gate discovering it.
+    #
+    # The consequence here is milder than in UserData - a stale PATH for remote
+    # commands rather than an unreachable host - but the failure shape is
+    # identical, so the remedy is too.
+    try { Stop-Service -Name 'AmazonSSMAgent' -Force -ErrorAction SilentlyContinue } catch { }
+    $running = $false
+    foreach ($try in 1..3) {
+        try { Start-Service -Name 'AmazonSSMAgent' -ErrorAction Stop } catch {
+            Write-Warn ("SSM Agent start attempt {0} failed: {1}" -f $try, $_.Exception.Message)
+        }
+        Start-Sleep -Seconds 5
+        if ((Get-Service -Name 'AmazonSSMAgent').Status -eq 'Running') { $running = $true; break }
+    }
+    if ($running) {
         Write-Ok 'SSM Agent restarted so remote commands inherit the new PATH'
-    } catch {
-        Write-Warn "could not restart the SSM Agent: $($_.Exception.Message)"
-        Write-Warn 'Remote commands may not see the new PATH until this host reboots.'
+    } else {
+        Write-Fail 'SSM Agent is NOT running after 3 start attempts - this host cannot be reached over SSM.'
+        Write-Warn 'Check: Get-WinEvent -LogName Application -MaxEvents 50 | Where-Object { $_.ProviderName -like "*SSM*" }'
     }
 }
 
@@ -533,7 +558,7 @@ function Set-ProdNicRoutePriority {
 
     if ($changed -gt 0) {
         Write-Warn 'Removed blackhole default route(s). If the SSM Agent was already running it may take'
-        Write-Warn 'a few minutes to register; restart it to speed that up:  Restart-Service AmazonSSMAgent'
+        Write-Warn 'a few minutes to register; restart it to speed that up:  Restart-Service AmazonSSMAgent'  # trap-ok: text in a hint message, not a call
     }
 }
 
@@ -561,7 +586,7 @@ function Test-PendingReboot {
     # Read the key, then ask whether the property is there before touching it.
     $sm = 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager'
     $smKey = Get-ItemProperty -Path $sm -ErrorAction SilentlyContinue
-    if ($smKey -and ($smKey.PSObject.Properties.Name -contains 'PendingFileRenameOperations')) {
+    if ($smKey -and (@($smKey.PSObject.Properties | ForEach-Object { $_.Name }) -contains 'PendingFileRenameOperations')) {
         if ($smKey.PendingFileRenameOperations) { return $true }
     }
     return $false
@@ -1326,7 +1351,7 @@ function Test-Prerequisites {
         Write-Host "`n  Peer addresses (from the flow plan):"
 
         $probes = $null
-        if ($Plan.PSObject.Properties.Name -contains 'probes') { $probes = $Plan.probes }
+        if (@($Plan.PSObject.Properties | ForEach-Object { $_.Name }) -contains 'probes') { $probes = $Plan.probes }
 
         if (-not $probes) {
             # An older plan, generated before probes existed. Be explicit that
@@ -1345,7 +1370,7 @@ function Test-Prerequisites {
                 $addr    = $probe.address
                 $pinged  = Test-Connection -ComputerName $addr -Count 1 -Quiet -ErrorAction SilentlyContinue
                 $port    = $null
-                if ($probe.PSObject.Properties.Name -contains 'port') { $port = $probe.port }
+                if (@($probe.PSObject.Properties | ForEach-Object { $_.Name }) -contains 'port') { $port = $probe.port }
 
                 if ($port) {
                     if (Test-TcpListener -Address $addr -Port $port) {
