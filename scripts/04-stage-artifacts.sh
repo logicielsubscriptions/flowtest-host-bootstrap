@@ -55,16 +55,26 @@ set -euo pipefail
 
 # Printed first, every run. A stale fetch is otherwise invisible - see the note
 # in 02-prereq-windows.ps1.
-SCRIPT_VERSION='2026-09-15.2-dated-window'
+SCRIPT_VERSION='2026-09-17.1-captures-on-windows'
 
 PLAN_FILE="/opt/flowtest/bootstrap/flow-plan-linux.json"
 DRY_RUN=0
 ONLY=""
 SKIP_CAPTURES=0
 CONFIG_REPO_TOKEN_REF=""
-# Days either side of the market date to accept a dated archive folder. 3 covers
-# a weekend plus the observed next-morning backup offset without pulling the
-# years of history that sit under the same prefix.
+# THE COHERENCE WINDOW. Days either side of the market date within which EVERY
+# date-resolved artifact must fall - FIX message folders, the engine config
+# snapshot, AsynchDB files, rotated logs, all of it.
+#
+# It began as a FIX-folder selector, to stop a recursive copy pulling years of
+# logs. It is now the single answer to "is this artifact from the day we are
+# replaying?", because the two questions turned out to be one: staging picked the
+# nearest config snapshot with no tolerance at all and staged one 62 days old, so
+# builds 81 and 82 put September order flow next to July routing rules.
+#
+# 3 covers a weekend plus the observed next-morning backup offset. Raising it
+# past a few days re-admits exactly the incoherence it exists to prevent, so
+# raise it to cover a genuine backup lag, never to make a run go green.
 ARCHIVE_WINDOW_DAYS=3
 
 C_CYAN='\033[0;36m'; C_GREEN='\033[0;32m'; C_YELLOW='\033[0;33m'
@@ -282,6 +292,76 @@ record() {   # record <component> <kind> <status> <detail-json>
   mv "$tmp" "$RESULTS_JSON"
 }
 
+# Did this component's configuration change between the snapshot date and the
+# market date? Answered from the config repo's history, which is the only record
+# of WHEN a config changed - the S3 snapshot job only records that it ran.
+#
+# Returns 0 when it could answer (verdict in CONFIG_CHANGE_RESULT: changed |
+# unchanged) and 1 when it could not - no token, no gitPath, or the clone failed.
+# "Could not answer" is deliberately not folded into either verdict: the whole
+# point is to stop assuming.
+CONFIG_CHANGE_RESULT=""
+CONFIG_CHANGE_COUNT=0
+CONFIG_CHANGE_NOTE=""
+config_changed_between() {
+  local cs="$1" snapshot_key="$2" offset="$3"
+  CONFIG_CHANGE_RESULT=""; CONFIG_CHANGE_COUNT=0; CONFIG_CHANGE_NOTE=""
+
+  local gp repo branch owner
+  gp="$(printf '%s' "$cs" | jq -r '.gitPath // empty')"
+  repo="$(printf '%s' "$cs" | jq -r '.gitRepo // empty')"
+  branch="$(printf '%s' "$cs" | jq -r '.gitBranch // "main"')"
+  owner="$(jq -r '.engineRepoOwner' "$PLAN_FILE")"
+  if [[ -z "$gp" || -z "$repo" ]]; then
+    CONFIG_CHANGE_NOTE="no gitPath/gitRepo declared for this component, so the config repo cannot be consulted"
+    return 1
+  fi
+  if ! resolve_github_token; then
+    CONFIG_CHANGE_NOTE="no usable config-repo token, so the config repo cannot be consulted"
+    return 1
+  fi
+
+  # The snapshot folder name carries its own date; derive the window ends from
+  # the offset rather than re-parsing the key, which differs per component.
+  local since
+  since="$(python3 -c "
+import datetime,sys
+m=datetime.date.fromisoformat('$MARKET_DATE')
+print((m+datetime.timedelta(days=int('$offset'))).isoformat())
+" 2>/dev/null)"
+  [[ -n "$since" ]] || { CONFIG_CHANGE_NOTE="could not derive the snapshot date from offset $offset"; return 1; }
+
+  local b64 work
+  b64="$(printf 'x-access-token:%s' "$GITHUB_TOKEN" | base64 | tr -d '\n')"
+  work="$(mktemp -d)"
+  # Commit graph only - no blobs, no working tree. This is a history question.
+  if ! ( cd "$work" || exit 1
+         GIT_TERMINAL_PROMPT=0 \
+         git -c credential.helper= -c "http.extraheader=Authorization: Basic $b64" \
+             clone --quiet --bare --filter=blob:none --branch "$branch" \
+             "https://github.com/$owner/$repo.git" hist >/dev/null 2>&1 || exit 1
+         cd hist || exit 1
+         git log --oneline --since="$since 00:00:00" --until="$MARKET_DATE 23:59:59" \
+             -- "${gp//\\//}" > "$work/between.log" 2>/dev/null || exit 1
+         exit 0 ); then
+    rm -rf "$work"
+    CONFIG_CHANGE_NOTE="the config repo could not be read to check for changes"
+    return 1
+  fi
+
+  CONFIG_CHANGE_COUNT="$(grep -c . "$work/between.log" 2>/dev/null || echo 0)"
+  if [[ "$CONFIG_CHANGE_COUNT" -gt 0 ]]; then
+    CONFIG_CHANGE_RESULT="changed"
+    CONFIG_CHANGE_NOTE="$CONFIG_CHANGE_COUNT commit(s) to $gp between $since and $MARKET_DATE"
+    sed 's/^/           /' "$work/between.log" >&2 || true
+  else
+    CONFIG_CHANGE_RESULT="unchanged"
+    CONFIG_CHANGE_NOTE="no commits to $gp between $since and $MARKET_DATE"
+  fi
+  rm -rf "$work"
+  return 0
+}
+
 stage_config() {
   local name="$1" cs="$2" dest="$CONFIG_ROOT/$1"
   local type; type="$(printf '%s' "$cs" | jq -r '.type')"
@@ -304,7 +384,61 @@ stage_config() {
       if [[ -n "$flag" ]]; then
         warn "$name: every snapshot is AFTER the market date; taking the earliest ($key). A snapshot dated after the session already contains it."
       fi
-      ok "$name: snapshot $key (offset ${offset}d from $MARKET_DATE)"
+      # A STALE SNAPSHOT IS NOT AUTOMATICALLY A WRONG CONFIG.
+      #
+      # An earlier version of this refused any snapshot outside the archive
+      # window. That was wrong, and Dev said why on 2026-09-17: "it is possible
+      # that the config that was pushed on git around 1 year ago is still being
+      # used." If a config has not changed in a year then a snapshot from July is
+      # byte-identical to the September config, and refusing it blocks a run for
+      # no reason.
+      #
+      # The backup's AGE is not the question. The question is whether the
+      # configuration CHANGED between the snapshot and the market date - and the
+      # config repo, not the timestamp, is what can answer that. So:
+      #
+      #   within the window            -> staged, nothing to check
+      #   outside it, git says
+      #     no commits in between      -> staged. The gap is a backup gap, not a
+      #                                   configuration difference
+      #     commits in between         -> FAILED. The snapshot predates a real
+      #                                   change, so it is the wrong config
+      #     git cannot answer          -> staged, but recorded as UNVERIFIED.
+      #                                   Never silently claimed either way
+      #
+      # Still true, and still the reason any of this exists: builds 81 and 82
+      # staged a 62-day-old snapshot and reported it as plain 'staged', with the
+      # gap recorded only as a number nobody reads.
+      local off_abs="${offset#-}"
+      local snap_verdict="within-window" snap_evidence=""
+      if [[ "$off_abs" -gt "$ARCHIVE_WINDOW_DAYS" ]]; then
+        warn "$name: snapshot $key is ${off_abs} day(s) from the market date $MARKET_DATE - outside the ${ARCHIVE_WINDOW_DAYS}-day window."
+        warn "$name: checking the config repo for changes in between, because a backup gap and a config change are not the same thing."
+        if config_changed_between "$cs" "$key" "$offset"; then
+          case "$CONFIG_CHANGE_RESULT" in
+            changed)
+              fail "$name: the config repo has $CONFIG_CHANGE_COUNT commit(s) to this path between the snapshot and $MARKET_DATE."
+              fail "$name: REFUSING to stage. This snapshot predates a real configuration change, so it is not what the session ran under."
+              record "$name" config failed \
+                "$(jq -n --arg k "$key" --arg o "$offset" --argjson w "$ARCHIVE_WINDOW_DAYS" \
+                      --arg m "$MARKET_DATE" --argjson n "$CONFIG_CHANGE_COUNT" \
+                      '{source:"s3-daily-snapshot", key:$k, dateOffsetDays:($o|tonumber),
+                        windowDays:$w, marketDate:$m, files:0,
+                        commitsBetweenSnapshotAndMarketDate:$n,
+                        reason:"snapshot is outside the window AND the config repo shows changes in between, so it is not the configuration in force on the market date"}')"
+              return 0 ;;
+            unchanged)
+              ok "$name: the config repo shows NO changes to this path between $key and $MARKET_DATE - the snapshot is stale but the configuration is not."
+              snap_verdict="stale-but-unchanged" ;;
+          esac
+        else
+          warn "$name: could not check the config repo (no token, clone failed, or no gitPath declared), so whether the config changed in between is UNKNOWN."
+          warn "$name: staging the snapshot and recording it as unverified. Do not read a green run as evidence the configuration matched."
+          snap_verdict="unverified"
+        fi
+        snap_evidence="$CONFIG_CHANGE_NOTE"
+      fi
+      ok "$name: snapshot $key (offset ${offset}d from $MARKET_DATE, $snap_verdict)"
       if [[ $DRY_RUN -eq 0 ]]; then
         mkdir -p "$dest"
         # Flat by construction: the snapshot itself is non-recursive, and
@@ -315,9 +449,20 @@ stage_config() {
       fi
       local count=0
       [[ $DRY_RUN -eq 0 ]] && count="$(find "$dest" -maxdepth 1 -type f | wc -l)"
+      # marketDateVerdict is the field to read, not dateOffsetDays. The offset
+      # alone is what let a 62-day-old snapshot pass as plain 'staged' in builds
+      # 81 and 82: a number with no judgement attached.
+      #
+      #   within-window        the snapshot is from the market date's own window
+      #   stale-but-unchanged  older, but the config repo shows no change since
+      #   unverified           older, and nothing could confirm it either way
       record "$name" config staged \
         "$(jq -n --arg k "$key" --arg o "$offset" --argjson c "$count" --arg d "$dest" \
-              '{source:"s3-daily-snapshot", key:$k, dateOffsetDays:($o|tonumber), files:$c, dest:$d}')"
+              --arg m "$MARKET_DATE" --argjson w "$ARCHIVE_WINDOW_DAYS" \
+              --arg v "$snap_verdict" --arg e "$snap_evidence" \
+              '{source:"s3-daily-snapshot", key:$k, dateOffsetDays:($o|tonumber),
+                files:$c, dest:$d, marketDate:$m, windowDays:$w,
+                marketDateVerdict:$v, marketDateEvidence:$e}')"
       cross_check_against_git "$name" "$cs" "$dest"
       ;;
 
@@ -366,6 +511,26 @@ stage_config() {
         # a different token type.
         local b64
         b64="$(printf 'x-access-token:%s' "$GITHUB_TOKEN" | base64 | tr -d '\n')"
+        # CHECK OUT THE REPO AS IT STOOD ON THE MARKET DATE, NOT AT TODAY'S HEAD.
+        #
+        # Dev, 2026-09-17: "it is possible that the config that was pushed on git
+        # around 1 year ago is still being used."
+        #
+        # Exactly - and that is the reason to ask git for a DATE rather than to
+        # judge a backup by its age. A config untouched for a year is identical
+        # on every date in that year, so a snapshot from July is the September
+        # config too. What actually invalidates a replay is a config that changed
+        # AFTER the market date, and cloning `main` at HEAD imports precisely
+        # that change with no way to notice.
+        #
+        # So: resolve the last commit at or before the market date and check that
+        # out. A year-old unchanged config resolves to its year-old commit and
+        # stages identically; a config edited last week resolves to the version
+        # that was live on the market date, not last week's.
+        #
+        # --depth 1 is GONE, because rev-list cannot walk history that was never
+        # fetched. --filter=blob:none keeps that cheap: full commit graph, file
+        # contents fetched only for the sparse path.
         (
           cd "$work" || exit 1
           # GIT_TERMINAL_PROMPT=0: on a 401 git otherwise falls back to asking for
@@ -374,9 +539,23 @@ stage_config() {
           # - a message that describes the fallback, not the rejection.
           GIT_TERMINAL_PROMPT=0 \
           git -c credential.helper= -c "http.extraheader=Authorization: Basic $b64" \
-              clone --quiet --depth 1 --branch "$branch" --filter=blob:none --sparse \
+              clone --quiet --branch "$branch" --filter=blob:none --sparse --no-checkout \
               "https://github.com/$owner/$repo.git" repo || exit 1
           cd repo || exit 1
+
+          # 23:59:59 so a commit made ON the market date counts as in force.
+          asof="$(git rev-list -1 --before="$MARKET_DATE 23:59:59" "origin/$branch" 2>/dev/null)"
+          if [[ -z "$asof" ]]; then
+            echo "no commit on origin/$branch at or before $MARKET_DATE - the branch may be younger than the market date" >&2
+            exit 3
+          fi
+          printf '%s\n' "$asof" > "$work/asof.sha"
+          git log -1 --format=%cI "$asof" > "$work/asof.date" 2>/dev/null || true
+          # Commits to THIS path after the market date, recorded as evidence: it
+          # is the difference between "unchanged for a year, so the snapshot is
+          # fine" and "edited since, so it is not".
+          git log --oneline "$asof..origin/$branch" -- "${gitpath//\\//}" \
+              > "$work/after.log" 2>/dev/null || true
           # DO NOT SILENCE THIS. It was ">/dev/null 2>&1 || true", and build 78
           # is the cost: the clone succeeded, sparse-checkout produced nothing,
           # and the only symptom was the directory test below reporting the path
@@ -397,6 +576,15 @@ stage_config() {
             echo "sparse-checkout set failed for '${gitpath//\\//}'" >&2
             exit 2
           fi
+          # Materialise the market-date commit. Blobs are fetched here, so this
+          # needs the credentials too.
+          if ! GIT_TERMINAL_PROMPT=0 \
+               git -c credential.helper= \
+                   -c "http.extraheader=Authorization: Basic $b64" \
+                   checkout --quiet "$asof" 2>&1; then
+            echo "checkout of $asof (as of $MARKET_DATE) failed" >&2
+            exit 4
+          fi
           exit 0
         ) || { fail "$name: clone of $repo@$branch failed - the path in the repo has NOT been checked."
                fail "$name: if stderr says \"could not read Username for 'https://github.com'\" the token was rejected, not missing: git fell back to prompting after a 401."
@@ -405,6 +593,28 @@ stage_config() {
                  "$(jq -n --arg r "$repo" --arg b "$branch" --arg p "$gitpath" \
                     '{reason:"git clone failed - token rejected or branch missing; repo path unverified", repo:$r, branch:$b, path:$p}')"
                return 0; }
+        # REPORT WHICH VERSION WE TOOK, AND WHETHER IT IS STILL CURRENT.
+        #
+        # This is the answer to "is a year-old config still the right one?" -
+        # stated per component from git history rather than assumed either way:
+        #
+        #   0 commits after the market date -> this path has not changed since,
+        #       so the version in force on the market date is also today's. A
+        #       snapshot of any age in between is the same bytes.
+        #   N commits after -> the config DID change after the session. Today's
+        #       HEAD would have been the wrong configuration to replay with, and
+        #       before this change that is exactly what was staged.
+        GIT_ASOF_SHA="$(cat "$work/asof.sha" 2>/dev/null || true)"
+        GIT_ASOF_DATE="$(cat "$work/asof.date" 2>/dev/null || true)"
+        GIT_AFTER_COUNT="$(grep -c . "$work/after.log" 2>/dev/null || echo 0)"
+        ok "$name: using ${GIT_ASOF_SHA:0:8} committed ${GIT_ASOF_DATE:-unknown} - the version in force on $MARKET_DATE"
+        if [[ "$GIT_AFTER_COUNT" -eq 0 ]]; then
+          ok "$name: unchanged since (0 commits to this path after $MARKET_DATE), so this is also the current config"
+        else
+          warn "$name: this path has $GIT_AFTER_COUNT commit(s) AFTER $MARKET_DATE. Staging the market-date version, not HEAD - HEAD would replay configuration the session never ran under."
+          sed 's/^/           /' "$work/after.log" >&2 || true
+        fi
+
         mkdir -p "$dest"
         local src="$work/repo/${gitpath//\\//}"
         # THE FILES MAY BE ONE LEVEL DOWN, IN config/. The repo convention puts
@@ -443,7 +653,12 @@ stage_config() {
       if [[ "$count" -gt 0 ]]; then
         record "$name" config staged \
           "$(jq -n --arg r "$repo" --arg b "$branch" --arg p "$gitpath" --argjson c "$count" --arg d "$dest" \
-                '{source:"git-serverconfigs", repo:$r, branch:$b, path:$p, files:$c, dest:$d}')"
+                --arg sha "${GIT_ASOF_SHA:-}" --arg cd "${GIT_ASOF_DATE:-}" \
+                --argjson after "${GIT_AFTER_COUNT:-0}" --arg m "$MARKET_DATE" \
+                '{source:"git-serverconfigs", repo:$r, branch:$b, path:$p, files:$c, dest:$d,
+                  marketDate:$m, commit:$sha, commitDate:$cd, commitsAfterMarketDate:$after,
+                  resolution:"the last commit at or before the market date, not branch HEAD",
+                  unchangedSinceMarketDate:($after == 0)}')"
       else
         record "$name" config failed \
           "$(jq -n --arg r "$repo" --arg b "$branch" --arg p "$gitpath" --arg d "$dest" \
@@ -536,8 +751,13 @@ stage_captures() {
       # failed with AccessDenied - and environment.json repeated it, because the
       # manifest is what it reads. A gap that reports itself as staged is worse
       # than a missing manifest: the Runner has no reason to look.
+      # RESET, because these are not local to the function and stage_captures is
+      # called once per component. A reason left over from the previous component
+      # would be recorded against this one.
       fix_rc=0
       fix_err=""
+      fix_reason=""
+      fix_prefix_count=0
       if [[ $DRY_RUN -eq 0 ]]; then
         mkdir -p "$dest/fix"
 
@@ -562,13 +782,34 @@ stage_captures() {
         # The manifest records which folders were taken, so the real convention
         # can be read off a run rather than guessed; tighten the window once it
         # is confirmed.
+        # LIST FIRST, AND KEEP THE ERROR. This used to pipe the listing straight
+        # into the picker with `2>/dev/null`, so a FAILED listing and a listing
+        # with no folder in the window produced the identical warning. Build 82
+        # is why that matters: this reported "no dated folder within 3 days" for
+        # the same prefix and market date that build 81 had taken six folders
+        # from, and the message could not tell us which of the two had happened.
+        fix_list=""
+        fix_list_rc=0
+        fix_list_err="$(aws s3api list-objects-v2 --bucket "$bucket" \
+                          --prefix "${prefix%/}/" --delimiter '/' \
+                          --query 'CommonPrefixes[].Prefix' --output text \
+                          2>&1 >/tmp/fix-list.$$)" || fix_list_rc=$?
+        fix_list="$(cat /tmp/fix-list.$$ 2>/dev/null || true)"; rm -f /tmp/fix-list.$$
+        if [[ $fix_list_rc -ne 0 ]]; then
+          warn "$name: listing $prefix/ FAILED (exit $fix_list_rc) - this is NOT 'no folder in the window'"
+          printf '           %s\n' "$fix_list_err" >&2
+        fi
+        # aws prints the literal "None" for an empty CommonPrefixes, which would
+        # otherwise be carried through as a candidate folder name.
+        [[ "$fix_list" == "None" ]] && fix_list=""
+        fix_prefix_count="$(printf '%s' "$fix_list" | tr '\t' '\n' | grep -c . || true)"
+        ok "$name: $fix_prefix_count dated folder(s) exist under $prefix/"
+
         fix_window=()
         while IFS= read -r line; do
           [[ -n "$line" ]] && fix_window+=("$line")
         done < <(
-          aws s3api list-objects-v2 --bucket "$bucket" \
-              --prefix "${prefix%/}/" --delimiter '/' \
-              --query 'CommonPrefixes[].Prefix' --output text 2>/dev/null \
+          printf '%s' "$fix_list" \
             | tr '\t' '\n' \
             | ARCHIVE_WINDOW_DAYS="$ARCHIVE_WINDOW_DAYS" MARKET_DATE="$MARKET_DATE" python3 -c '
 import os, re, sys, datetime
@@ -639,10 +880,18 @@ for raw in rows:
         )
 
         if [[ ${#fix_window[@]} -eq 0 ]]; then
-          warn "$name: no dated folder within ${ARCHIVE_WINDOW_DAYS} day(s) of $MARKET_DATE under $prefix/."
-          warn "$name: NOT falling back to the whole prefix - that is years of data. Widen --archive-window-days if the backup offset is larger than expected."
+          if [[ $fix_list_rc -ne 0 ]]; then
+            fix_reason="listing the archive prefix failed (exit $fix_list_rc) - window never evaluated"
+            warn "$name: no folders to choose from, because the LISTING failed. Fix that first."
+          elif [[ "$fix_prefix_count" -eq 0 ]]; then
+            fix_reason="the archive prefix contains no dated folders at all"
+            warn "$name: $prefix/ contains no dated folders at all - the prefix may be wrong."
+          else
+            fix_reason="no dated folder within ${ARCHIVE_WINDOW_DAYS} days of the market date (of $fix_prefix_count present)"
+            warn "$name: $fix_prefix_count folder(s) exist but none within ${ARCHIVE_WINDOW_DAYS} day(s) of $MARKET_DATE."
+            warn "$name: NOT falling back to the whole prefix - that is years of data. Widen --archive-window-days if the backup offset is larger than expected."
+          fi
           fix_rc=1
-          fix_reason="no dated folder within ${ARCHIVE_WINDOW_DAYS} days of the market date"
         else
           ok "$name: ${#fix_window[@]} dated folder(s) within ${ARCHIVE_WINDOW_DAYS} day(s) of $MARKET_DATE"
           for p in "${fix_window[@]}"; do
@@ -659,7 +908,13 @@ for raw in rows:
         # already succeeded and enumerated the prefixes - it is Glacier or
         # Intelligent-Tiering archive access. The old message blamed the prefix
         # or the role, which is where the next person would have looked.
-        if [[ $fix_rc -ne 0 ]]; then
+        # ONLY SPEAK IF THE COPY IS WHAT FAILED. `-z "$fix_reason"` is the guard,
+        # and build 82 is why it exists: the window-selection branch above set a
+        # precise reason ("no dated folder within 3 days"), then this block
+        # overwrote it with the generic "aws s3 cp exited 1" - so the log and the
+        # manifest disagreed about the same failure, and the manifest, which is
+        # the artifact anyone reads later, carried the less useful of the two.
+        if [[ $fix_rc -ne 0 && -z "$fix_reason" ]]; then
           if printf '%s' "$fix_err" | grep -q 'InvalidObjectState'; then
             warn "$name: the FIX objects are ARCHIVED (S3 Glacier / Intelligent-Tiering archive tier), not missing and not forbidden."
             warn "$name: they must be restored before they can be read - aws s3api restore-object - and a restore takes minutes to hours depending on tier."
@@ -695,7 +950,7 @@ for raw in rows:
   local fam
   for fam in $fams; do
     [[ "$fam" == "engineConfigs" ]] && continue   # that IS the config, staged above
-    local spec bucket pat fmt kind optional
+    local spec bucket pat fmt kind optional fam_abs
     spec="$(printf '%s' "$svc" | jq -c --arg f "$fam" '.logArchive.artifacts[$f]')"
     bucket="$(printf '%s' "$svc" | jq -r '.logArchive.bucket')"
     kind="$(printf '%s' "$spec" | jq -r '.kind')"
@@ -720,6 +975,27 @@ for raw in rows:
       fi
       continue
     fi
+    # Same coherence window as the config snapshot above, and for the same
+    # reason: an AsynchDB set or a rotated log from a different month is not the
+    # state the market date started from. Build 82 staged AsynchDB files 63 days
+    # old and reported them as staged.
+    fam_abs="${offset#-}"
+    if [[ "$fam_abs" -gt "$ARCHIVE_WINDOW_DAYS" ]]; then
+      if [[ "$optional" == "true" ]]; then
+        skip "$name/$fam: nearest entry is ${fam_abs}d from $MARKET_DATE (outside ${ARCHIVE_WINDOW_DAYS}d) - not staged (optional)"
+        record "$name" "$fam" skipped \
+          "$(jq -n --arg k "$key" --arg o "$offset" --argjson w "$ARCHIVE_WINDOW_DAYS" \
+                '{key:$k, dateOffsetDays:($o|tonumber), windowDays:$w, optional:true,
+                  reason:"nearest dated entry is outside the market-date window"}')"
+      else
+        fail "$name/$fam: nearest entry $key is ${fam_abs}d from the market date $MARKET_DATE - outside the ${ARCHIVE_WINDOW_DAYS}-day window. REFUSING to stage."
+        record "$name" "$fam" failed \
+          "$(jq -n --arg k "$key" --arg o "$offset" --argjson w "$ARCHIVE_WINDOW_DAYS" \
+                '{key:$k, dateOffsetDays:($o|tonumber), windowDays:$w, optional:false,
+                  reason:"nearest dated entry is outside the market-date window; refused rather than staged"}')"
+      fi
+      continue
+    fi
     ok "$name/$fam: $key (offset ${offset}d)"
     if [[ $DRY_RUN -eq 0 ]]; then
       mkdir -p "$dest/$fam"
@@ -737,27 +1013,68 @@ for raw in rows:
 
 # --------------------------- main ---------------------------
 
-step "Staging components"
+# ENGINE CONFIGS: this host's own components only. The engine reads its config
+# relative to its own working directory, so it must be on the machine that runs
+# the engine.
+step "Staging engine configs"
 mapfile -t COMPONENTS < <(jq -r '.groups[].services[].containerName' "$PLAN_FILE")
-[[ ${#COMPONENTS[@]} -gt 0 ]] || warn "this host runs no components; only the manifest will be written"
+[[ ${#COMPONENTS[@]} -gt 0 ]] || warn "this host runs no components; no engine configs to stage"
 
 for name in "${COMPONENTS[@]}"; do
   if [[ -n "$ONLY" && "$name" != "$ONLY" ]]; then continue; fi
   svc="$(jq -c --arg n "$name" '[.groups[].services[] | select(.containerName==$n)][0]' "$PLAN_FILE")"
   printf '\n  %b%s%b\n' "$C_CYAN" "$name" "$C_OFF"
   stage_config "$name" "$(printf '%s' "$svc" | jq -c '.configSource')"
-  if [[ $SKIP_CAPTURES -eq 1 ]]; then
-    skip "$name: captures (--skip-captures)"
-  else
-    stage_captures "$name" "$svc"
-  fi
 done
+
+# CAPTURES: every component in the flow, but ONLY on the host the plan nominates.
+#
+# Dev, 2026-09-17: the FIX messages, Quill logs and the rest are read by
+# FixToFixTestingApp, which runs on the Windows host. Staging a capture beside
+# the engine that produced it put half the corpus on a machine that will never
+# open it - build 82 did exactly that with the Linux engine's FIX archive.
+#
+# The plan carries a flat `captures` list, populated on the capture host and
+# EMPTY on the other. An empty list is a legitimate "nothing here"; a MISSING key
+# means the plan predates this split and the host would silently stage nothing,
+# so those two are reported differently.
+if [[ "$(jq -r 'has("captures")' "$PLAN_FILE")" != "true" ]]; then
+  die "this plan has no 'captures' key - it was generated before captures moved to one host. Regenerate it; staging captures from the old per-host layout would put them where the replay driver cannot read them."
+fi
+
+CAPTURE_COUNT="$(jq -r '.captures | length' "$PLAN_FILE")"
+if [[ $SKIP_CAPTURES -eq 1 ]]; then
+  step "Captures"
+  skip "captures (--skip-captures)"
+elif [[ "$CAPTURE_COUNT" -eq 0 ]]; then
+  step "Captures"
+  skip "$(jq -r '.capturesNote' "$PLAN_FILE")"
+else
+  step "Staging captures for the whole flow ($CAPTURE_COUNT component(s))"
+  ok "$(jq -r '.capturesNote' "$PLAN_FILE")"
+  mapfile -t CAPTURE_COMPONENTS < <(jq -r '.captures[].component' "$PLAN_FILE")
+  for name in "${CAPTURE_COMPONENTS[@]}"; do
+    if [[ -n "$ONLY" && "$name" != "$ONLY" ]]; then continue; fi
+    cap="$(jq -c --arg n "$name" '[.captures[] | select(.component==$n)][0]' "$PLAN_FILE")"
+    runs_on="$(printf '%s' "$cap" | jq -r '.runsOnRole')"
+    prod_host="$(printf '%s' "$cap" | jq -r '.prodHost')"
+    printf '\n  %b%s%b  %b(%s engine on %s)%b\n' \
+      "$C_CYAN" "$name" "$C_OFF" "$C_GREY" "$runs_on" "$prod_host" "$C_OFF"
+    # stage_captures reads .logArchive off the object it is handed, so the
+    # capture entry is passed in place of the service.
+    stage_captures "$name" "$cap"
+  done
+fi
 
 # The Quill capture is flow-level, not per-component: one book feeds the
 # market-data simulator for the whole slice.
 step "Market-data capture (Quill)"
 QUILL="$(jq -c '.quillCapture // empty' "$PLAN_FILE")"
-if [[ -z "$QUILL" ]]; then
+if [[ "$(jq -r '.stagesCaptures' "$PLAN_FILE")" != "true" ]]; then
+  # Not this host's job. Say that, rather than "no Quill capture declared" -
+  # which is what it used to say here and reads as a missing flow field.
+  skip "Quill is staged on the capture host, not this one"
+elif [[ -z "$QUILL" ]]; then
   warn "no Quill capture declared for this flow. The market-data simulator will have no book, so routing decisions constrained by order state exercise the no-market fallback path - a run that looks green while testing the wrong behaviour."
   record "-" quillCapture missing "$(jq -n '{reason:"not declared in the flow file"}')"
 else

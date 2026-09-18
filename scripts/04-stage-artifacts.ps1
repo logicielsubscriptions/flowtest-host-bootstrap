@@ -108,7 +108,7 @@ trap {
 
 # Printed first, every run. Without it a stale fetch is invisible and a retest
 # can silently re-run old code while looking like a fresh result.
-$script:ScriptVersion = '2026-09-15.2-dated-window'
+$script:ScriptVersion = '2026-09-17.1-captures-on-windows'
 
 function Write-Step { param([string] $Message) Write-Host "`n=== $Message ===" -ForegroundColor Cyan }
 function Write-Ok   { param([string] $Message) Write-Host "  [ok]   $Message" -ForegroundColor Green }
@@ -350,16 +350,62 @@ function Get-GitFolder {
         # alike, so this survives a rotation to a different token type.
         $basic = [Convert]::ToBase64String(
             [Text.Encoding]::ASCII.GetBytes("x-access-token:$script:GitHubToken"))
+
+        # THE HEADER GOES IN THE ENVIRONMENT, NOT ON THE COMMAND LINE.
+        #
+        # Build 82: the bash host cloned fine with `-c "http.extraheader=..."`
+        # and this host failed three times with `git exit 128`. The difference is
+        # PowerShell 5.1's native-argument handling - the value contains SPACES
+        # ("Authorization: Basic <b64>") and PowerShell re-splits it when handing
+        # it to a native executable, so git received a truncated -c value and a
+        # pair of stray arguments. The project's trap list already carries
+        # "command-line quoting is silently rewritten in two different places";
+        # this is a third.
+        #
+        # GIT_CONFIG_COUNT/KEY/VALUE (git >= 2.31) sets the same config with no
+        # argument parsing at all, and it applies to EVERY git process in this
+        # scope - which the clone and the sparse-checkout both need. It also keeps
+        # the token out of the process command line, where `ps`-equivalents can
+        # read it.
+        #
+        # Verify git is new enough rather than assuming: on an older git these
+        # variables are IGNORED, which would look exactly like a rejected token.
+        $gitVer = (& git --version) -replace '[^0-9.]', ''
+        $verParts = @($gitVer -split '\.' | Where-Object { $_ -ne '' })
+        $verOk = $verParts.Count -ge 2 -and
+                 ([int]$verParts[0] -gt 2 -or ([int]$verParts[0] -eq 2 -and [int]$verParts[1] -ge 31))
+        if (-not $verOk) {
+            Write-Warn "git $gitVer is older than 2.31, which ignores GIT_CONFIG_COUNT. The config-repo clone will not authenticate; upgrade git on this host."
+        }
+        $env:GIT_CONFIG_COUNT = '2'
+        $env:GIT_CONFIG_KEY_0 = 'credential.helper'
+        $env:GIT_CONFIG_VALUE_0 = ''
+        $env:GIT_CONFIG_KEY_1 = 'http.extraheader'
+        $env:GIT_CONFIG_VALUE_1 = "Authorization: Basic $basic"
         # GIT_TERMINAL_PROMPT=0: on a 401 git otherwise falls back to asking for a
         # username, and on a headless host that surfaces as "could not read
         # Username for 'https://github.com'" - a message about the fallback, not
         # about the rejection.
+        # CHECK OUT THE REPO AS IT STOOD ON THE MARKET DATE, NOT AT TODAY'S HEAD.
+        #
+        # Dev, 2026-09-17: "it is possible that the config that was pushed on git
+        # around 1 year ago is still being used."
+        #
+        # Which is the reason to ask git for a DATE instead of judging a backup
+        # by its age. A config untouched for a year is identical on every date in
+        # that year. What invalidates a replay is a config changed AFTER the
+        # market date - and cloning HEAD imports exactly that with no way to see
+        # it. --depth 1 is gone because rev-list cannot walk unfetched history;
+        # --filter=blob:none keeps it cheap.
         $env:GIT_TERMINAL_PROMPT = '0'
-        & git -c credential.helper= -c "http.extraheader=Authorization: Basic $basic" `
-              clone --quiet --depth 1 --branch $Branch --filter=blob:none --sparse `
-              "https://github.com/$Owner/$Repo.git" "$work\repo" 2>&1 | Out-Null
+        $cloneOut = & git clone --quiet --branch $Branch --filter=blob:none --sparse --no-checkout `
+              "https://github.com/$Owner/$Repo.git" "$work\repo" 2>&1
         if ($LASTEXITCODE -ne 0) {
             Write-Warn "clone of $Repo@$Branch failed (git exit $LASTEXITCODE). The path in the repo has NOT been checked - do not read this as a missing folder."
+            # PRINT WHAT GIT SAID. Build 82 reported only "git exit 128" three
+            # times, which is git's generic fatal and says nothing about whether
+            # the cause was auth, a bad ref or the URL.
+            if ($cloneOut) { $cloneOut | ForEach-Object { Write-Warn "  git: $_" } }
             return $null
         }
         Push-Location "$work\repo"
@@ -368,22 +414,60 @@ function Get-GitFolder {
         # absent from the repo - which is how build 79 blamed the config repo for
         # a path that exists on main.
         try {
+            # 23:59:59 so a commit made ON the market date counts as in force.
+            $asof = (& git rev-list -1 --before="$($plan.marketDate) 23:59:59" "origin/$Branch" 2>&1 |
+                     Select-Object -First 1)
+            if ($LASTEXITCODE -ne 0 -or -not $asof -or $asof -notmatch '^[0-9a-f]{7,40}$') {
+                Write-Warn "no commit on origin/$Branch at or before $($plan.marketDate) - the branch may be younger than the market date."
+                return $null
+            }
+            $script:GitAsOfSha = $asof
+            $script:GitAsOfDate = (& git log -1 --format=%cI $asof 2>$null | Select-Object -First 1)
+            # Commits to this path AFTER the market date. Zero means the config
+            # has not changed since, so this version is also the current one -
+            # which is the direct answer to "is a year-old config still right?".
+            $after = @(& git log --oneline "$asof..origin/$Branch" -- $Path.Replace('\', '/') 2>$null)
+            $script:GitAfterCount = $after.Count
+            $script:GitAfterLog = $after
             # The header goes on THIS call too. `git -c ...` configures one git
             # process, and --filter=blob:none defers blob download, so the fetch
             # happens here in a separate process. Build 81 failed exactly this
             # way on the Linux host after a clone that had succeeded.
-            $sparse = & git -c credential.helper= `
-                            -c "http.extraheader=Authorization: Basic $basic" `
-                            sparse-checkout set --no-cone $Path.Replace('\', '/') 2>&1
+            # Same GIT_CONFIG_* environment as the clone - it is still in scope,
+            # so this process authenticates too. --filter=blob:none defers the
+            # blob download to here, which is why it needs to.
+            $sparse = & git sparse-checkout set --no-cone $Path.Replace('\', '/') 2>&1
             if ($LASTEXITCODE -ne 0) {
                 Write-Warn "sparse-checkout failed for '$Path' (git exit $LASTEXITCODE): $sparse"
                 Write-Warn 'The repo path has NOT been checked - do not read the next warning as a missing folder.'
                 return $null
             }
+            # Materialise the market-date commit. Blobs are fetched here, so the
+            # GIT_CONFIG_* credentials still in scope are what make it possible.
+            $co = & git checkout --quiet $asof 2>&1
+            if ($LASTEXITCODE -ne 0) {
+                Write-Warn "checkout of $asof (as of $($plan.marketDate)) failed: $co"
+                return $null
+            }
+            Write-Ok "using $($asof.Substring(0,8)) committed $script:GitAsOfDate - the version in force on $($plan.marketDate)"
+            if ($script:GitAfterCount -eq 0) {
+                Write-Ok "unchanged since (0 commits to this path after $($plan.marketDate)), so this is also the current config"
+            }
+            else {
+                Write-Warn "this path has $($script:GitAfterCount) commit(s) AFTER $($plan.marketDate). Staging the market-date version, not HEAD - HEAD would replay configuration the session never ran under."
+                $script:GitAfterLog | ForEach-Object { Write-Warn "    $_" }
+            }
         }
         finally { Pop-Location }
     }
-    finally { $ErrorActionPreference = $previous }
+    finally {
+        $ErrorActionPreference = $previous
+        # Clear the token out of the environment as soon as git is done with it.
+        # It would otherwise be inherited by every later child process in this
+        # script, including the AWS CLI.
+        Remove-Item Env:GIT_CONFIG_COUNT, Env:GIT_CONFIG_KEY_0, Env:GIT_CONFIG_VALUE_0, `
+                    Env:GIT_CONFIG_KEY_1, Env:GIT_CONFIG_VALUE_1 -ErrorAction SilentlyContinue
+    }
 
     # The files may be one level down, in config\. The repo convention puts them
     # under <host>\<engine>\config while the plan's gitPath names <engine>. Try
@@ -403,6 +487,77 @@ function Get-GitFolder {
     return $null
 }
 
+# Did this component's configuration change between the snapshot date and the
+# market date? Answered from the config repo's history - the only record of WHEN
+# a config changed. The S3 snapshot job only records that it ran.
+#
+# Returns 'changed' | 'unchanged' | $null. $null means it COULD NOT ANSWER (no
+# token, no gitPath, clone failed) and is deliberately not folded into either
+# verdict - the point is to stop assuming.
+$script:ConfigChangeCount = 0
+$script:ConfigChangeNote = ''
+function Test-ConfigChangedBetween {
+    param($ConfigSource, [int] $Offset)
+    $script:ConfigChangeCount = 0
+    $script:ConfigChangeNote = ''
+
+    $gp = $ConfigSource.gitPath
+    $repo = $ConfigSource.gitRepo
+    $branch = if ($ConfigSource.gitBranch) { $ConfigSource.gitBranch } else { 'main' }
+    if (-not $gp -or -not $repo) {
+        $script:ConfigChangeNote = 'no gitPath/gitRepo declared for this component, so the config repo cannot be consulted'
+        return $null
+    }
+    if (-not (Resolve-GitHubToken)) {
+        $script:ConfigChangeNote = 'no usable config-repo token, so the config repo cannot be consulted'
+        return $null
+    }
+
+    $since = ([datetime]::ParseExact($plan.marketDate, 'yyyy-MM-dd', $null)).AddDays($Offset).ToString('yyyy-MM-dd')
+    $work = Join-Path $env:TEMP ("hist-" + [guid]::NewGuid().ToString('N').Substring(0, 8))
+    New-Item -ItemType Directory -Path $work -Force | Out-Null
+    $previous = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        $basic = [Convert]::ToBase64String(
+            [Text.Encoding]::ASCII.GetBytes("x-access-token:$script:GitHubToken"))
+        # Environment, not the command line - same PowerShell native-argument
+        # quoting problem that produced git exit 128 in build 82.
+        $env:GIT_CONFIG_COUNT = '2'
+        $env:GIT_CONFIG_KEY_0 = 'credential.helper'; $env:GIT_CONFIG_VALUE_0 = ''
+        $env:GIT_CONFIG_KEY_1 = 'http.extraheader'
+        $env:GIT_CONFIG_VALUE_1 = "Authorization: Basic $basic"
+        $env:GIT_TERMINAL_PROMPT = '0'
+        # Commit graph only: no blobs, no working tree. This is a history query.
+        & git clone --quiet --bare --filter=blob:none --branch $branch `
+              "https://github.com/$($plan.engineRepoOwner)/$repo.git" "$work\hist" 2>&1 | Out-Null
+        if ($LASTEXITCODE -ne 0) {
+            $script:ConfigChangeNote = 'the config repo could not be read to check for changes'
+            return $null
+        }
+        Push-Location "$work\hist"
+        try {
+            $between = @(& git log --oneline --since="$since 00:00:00" `
+                             --until="$($plan.marketDate) 23:59:59" -- $gp.Replace('\', '/') 2>$null)
+        }
+        finally { Pop-Location }
+        $script:ConfigChangeCount = $between.Count
+        if ($between.Count -gt 0) {
+            $between | ForEach-Object { Write-Warn "    $_" }
+            $script:ConfigChangeNote = "$($between.Count) commit(s) to $gp between $since and $($plan.marketDate)"
+            return 'changed'
+        }
+        $script:ConfigChangeNote = "no commits to $gp between $since and $($plan.marketDate)"
+        return 'unchanged'
+    }
+    finally {
+        $ErrorActionPreference = $previous
+        Remove-Item Env:GIT_CONFIG_COUNT, Env:GIT_CONFIG_KEY_0, Env:GIT_CONFIG_VALUE_0, `
+                    Env:GIT_CONFIG_KEY_1, Env:GIT_CONFIG_VALUE_1 -ErrorAction SilentlyContinue
+        Remove-Item -Recurse -Force $work -ErrorAction SilentlyContinue
+    }
+}
+
 function Stage-Config {
     param([string] $Name, $Service)
     $cs = $Service.configSource
@@ -419,7 +574,51 @@ function Stage-Config {
             if ($resolved.After) {
                 Write-Warn "${Name}: every snapshot is AFTER the market date; taking the earliest. A snapshot dated after the session already contains it."
             }
-            Write-Ok "${Name}: snapshot $($resolved.Key) (offset $($resolved.Offset)d from $($plan.marketDate))"
+            # A STALE SNAPSHOT IS NOT AUTOMATICALLY A WRONG CONFIG.
+            #
+            # An earlier version refused any snapshot outside the window. Dev,
+            # 2026-09-17: "it is possible that the config that was pushed on git
+            # around 1 year ago is still being used." If the config has not
+            # changed, a July snapshot IS the September config and refusing it
+            # blocks a run for nothing.
+            #
+            # The backup's age is not the question. Whether the configuration
+            # CHANGED in between is, and only the config repo can answer that.
+            # Verdicts: within-window / stale-but-unchanged / unverified, or a
+            # hard failure when the repo shows a real change in between.
+            #
+            # Still the reason this exists: builds 81 and 82 staged a 62-day-old
+            # snapshot as plain 'staged', the gap recorded only as a number.
+            $offAbs = [math]::Abs($resolved.Offset)
+            $snapVerdict = 'within-window'
+            $snapEvidence = ''
+            if ($offAbs -gt $ArchiveWindowDays) {
+                Write-Warn "${Name}: snapshot $($resolved.Key) is $offAbs day(s) from the market date $($plan.marketDate) - outside the $ArchiveWindowDays-day window."
+                Write-Warn "${Name}: checking the config repo for changes in between, because a backup gap and a config change are not the same thing."
+                $verdict = Test-ConfigChangedBetween -ConfigSource $cs -Offset $resolved.Offset
+                $snapEvidence = $script:ConfigChangeNote
+                if ($verdict -eq 'changed') {
+                    Write-Fail "${Name}: the config repo has $($script:ConfigChangeCount) commit(s) to this path between the snapshot and $($plan.marketDate)."
+                    Write-Fail "${Name}: REFUSING to stage. This snapshot predates a real configuration change, so it is not what the session ran under."
+                    Add-Result $Name 'config' 'failed' @{
+                        source = 's3-daily-snapshot'; key = $resolved.Key
+                        dateOffsetDays = $resolved.Offset; windowDays = $ArchiveWindowDays
+                        marketDate = $plan.marketDate; files = 0
+                        commitsBetweenSnapshotAndMarketDate = $script:ConfigChangeCount
+                        reason = 'snapshot is outside the window AND the config repo shows changes in between, so it is not the configuration in force on the market date' }
+                    return
+                }
+                elseif ($verdict -eq 'unchanged') {
+                    Write-Ok "${Name}: the config repo shows NO changes to this path between $($resolved.Key) and $($plan.marketDate) - the snapshot is stale but the configuration is not."
+                    $snapVerdict = 'stale-but-unchanged'
+                }
+                else {
+                    Write-Warn "${Name}: could not check the config repo, so whether the config changed in between is UNKNOWN."
+                    Write-Warn "${Name}: staging and recording it as unverified. Do not read a green run as evidence the configuration matched."
+                    $snapVerdict = 'unverified'
+                }
+            }
+            Write-Ok "${Name}: snapshot $($resolved.Key) (offset $($resolved.Offset)d from $($plan.marketDate), $snapVerdict)"
             $files = 0
             if (-not $DryRun) {
                 New-Item -ItemType Directory -Path $dest -Force | Out-Null
@@ -434,9 +633,14 @@ function Stage-Config {
                 }
                 $files = @(Get-ChildItem -LiteralPath $dest -File).Count
             }
+            # marketDateVerdict is the field to read, not dateOffsetDays. The
+            # offset alone is what let a 62-day-old snapshot pass as plain
+            # 'staged': a number with no judgement attached.
             Add-Result $Name 'config' 'staged' @{
                 source = 's3-daily-snapshot'; key = $resolved.Key
-                dateOffsetDays = $resolved.Offset; files = $files; dest = $dest }
+                dateOffsetDays = $resolved.Offset; files = $files; dest = $dest
+                marketDate = $plan.marketDate; windowDays = $ArchiveWindowDays
+                marketDateVerdict = $snapVerdict; marketDateEvidence = $snapEvidence }
             Test-AgainstGit -Name $Name -ConfigSource $cs -Dest $dest
         }
 
@@ -481,7 +685,12 @@ function Stage-Config {
             }
             Add-Result $Name 'config' 'staged' @{
                 source = 'git-serverconfigs'; repo = $cs.gitRepo; branch = $cs.gitBranch
-                path = $cs.gitPath; files = $files; dest = $dest }
+                path = $cs.gitPath; files = $files; dest = $dest
+                marketDate = $plan.marketDate
+                commit = $script:GitAsOfSha; commitDate = $script:GitAsOfDate
+                commitsAfterMarketDate = $script:GitAfterCount
+                unchangedSinceMarketDate = ($script:GitAfterCount -eq 0)
+                resolution = 'the last commit at or before the market date, not branch HEAD' }
         }
 
         default {
@@ -738,6 +947,28 @@ function Stage-Captures {
             }
             continue
         }
+        # Same coherence window as the config snapshot, for the same reason: an
+        # AsynchDB set or a rotated log from a different month is not the state
+        # the market date started from. Build 82 staged AsynchDB files 63 days
+        # old and called them staged.
+        $famAbs = [math]::Abs($resolved.Offset)
+        if ($famAbs -gt $ArchiveWindowDays) {
+            if ($spec.optional) {
+                Write-Skip "$Name/${family}: nearest entry is ${famAbs}d from $($plan.marketDate) (outside ${ArchiveWindowDays}d) - not staged (optional)"
+                Add-Result $Name $family 'skipped' @{
+                    key = $resolved.Key; dateOffsetDays = $resolved.Offset
+                    windowDays = $ArchiveWindowDays; optional = $true
+                    reason = 'nearest dated entry is outside the market-date window' }
+            }
+            else {
+                Write-Fail "$Name/${family}: nearest entry $($resolved.Key) is ${famAbs}d from the market date $($plan.marketDate) - outside the $ArchiveWindowDays-day window. REFUSING to stage."
+                Add-Result $Name $family 'failed' @{
+                    key = $resolved.Key; dateOffsetDays = $resolved.Offset
+                    windowDays = $ArchiveWindowDays; optional = $false
+                    reason = 'nearest dated entry is outside the market-date window; refused rather than staged' }
+            }
+            continue
+        }
         Write-Ok "$Name/${family}: $($resolved.Key) (offset $($resolved.Offset)d)"
         if (-not $DryRun) {
             $target = Join-Path $dest $family
@@ -756,23 +987,72 @@ function Stage-Captures {
 }
 
 # ---------------------------------------------------------------------------
-Write-Step 'Staging components'
+# ENGINE CONFIGS: this host's own components only. The engine resolves its config
+# relative to its own working directory, so it has to be on the machine running
+# the engine.
+Write-Step 'Staging engine configs'
 $components = @($plan.groups | ForEach-Object { $_.services } | ForEach-Object { $_.containerName })
-if ($components.Count -eq 0) { Write-Warn 'this host runs no components; only the manifest will be written' }
+if ($components.Count -eq 0) { Write-Warn 'this host runs no components; no engine configs to stage' }
 
 foreach ($name in $components) {
     if ($Only -and $name -ne $Only) { continue }
     $service = @($plan.groups | ForEach-Object { $_.services } | Where-Object { $_.containerName -eq $name })[0]
     Write-Host "`n  $name" -ForegroundColor Cyan
     Stage-Config -Name $name -Service $service
-    if ($SkipCaptures) { Write-Skip "${name}: captures (-SkipCaptures)" }
-    else { Stage-Captures -Name $name -Service $service }
+}
+
+# CAPTURES: every component in the flow, on the nominated capture host only.
+#
+# Dev, 2026-09-17: the FIX messages, Quill logs and the rest are read by
+# FixToFixTestingApp, which runs on THIS host. Staging each capture beside the
+# engine that produced it left half the corpus on the Linux host in build 82,
+# where the driver will never open it.
+#
+# An EMPTY captures list is a legitimate "not this host". A MISSING key means the
+# plan predates the split, and silently staging nothing would be the worst
+# outcome - so the two are distinguished.
+$planProps = @()
+if ($plan) {
+    $pp = $plan.PSObject.Properties
+    if ($pp) { $planProps = @($pp | ForEach-Object { $_.Name }) }
+}
+if ($planProps -notcontains 'captures') {
+    Write-Fail 'this plan has no "captures" key - it was generated before captures moved to one host.'
+    Write-Fail 'Regenerate it. Staging from the old per-host layout puts captures where the replay driver cannot read them.'
+    exit 1
+}
+
+$captures = @($plan.captures)
+if ($SkipCaptures) {
+    Write-Step 'Captures'
+    Write-Skip 'captures (-SkipCaptures)'
+}
+elseif ($captures.Count -eq 0) {
+    Write-Step 'Captures'
+    Write-Skip $plan.capturesNote
+}
+else {
+    Write-Step "Staging captures for the whole flow ($($captures.Count) component(s))"
+    Write-Ok $plan.capturesNote
+    foreach ($cap in $captures) {
+        if ($Only -and $cap.component -ne $Only) { continue }
+        Write-Host "`n  $($cap.component)" -ForegroundColor Cyan -NoNewline
+        Write-Host "  ($($cap.runsOnRole) engine on $($cap.prodHost))" -ForegroundColor DarkGray
+        # Stage-Captures reads .logArchive off whatever it is handed, so the
+        # capture entry stands in for the service object.
+        Stage-Captures -Name $cap.component -Service $cap
+    }
 }
 
 # The Quill capture is flow-level, not per-component: one book feeds the
 # market-data simulator for the whole slice.
 Write-Step 'Market-data capture (Quill)'
-if (-not $plan.quillCapture) {
+if (-not $plan.stagesCaptures) {
+    # Not this host's job. Previously this said "no Quill capture declared for
+    # this flow", which reads as a missing flow field rather than a host split.
+    Write-Skip 'Quill is staged on the capture host, not this one'
+}
+elseif (-not $plan.quillCapture) {
     Write-Warn 'no Quill capture declared for this flow. The market-data simulator will have no book, so routing decisions constrained by order state exercise the no-market fallback path - a run that looks green while testing the wrong behaviour.'
     Add-Result '-' 'quillCapture' 'missing' @{ reason = 'not declared in the flow file' }
 }
