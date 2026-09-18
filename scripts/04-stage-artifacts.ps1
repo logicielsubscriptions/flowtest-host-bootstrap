@@ -108,7 +108,7 @@ trap {
 
 # Printed first, every run. Without it a stale fetch is invisible and a retest
 # can silently re-run old code while looking like a fresh result.
-$script:ScriptVersion = '2026-09-18.3-iso-dates'
+$script:ScriptVersion = '2026-09-18.4-egress-retry'
 
 function Write-Step { param([string] $Message) Write-Host "`n=== $Message ===" -ForegroundColor Cyan }
 function Write-Ok   { param([string] $Message) Write-Host "  [ok]   $Message" -ForegroundColor Green }
@@ -293,6 +293,31 @@ if ($identity.ExitCode -ne 0) {
 if ($try -gt 1) { Write-Warn "identity resolved only on attempt $try - IMDS was briefly unavailable, which is the known l2bridge transition." }
 Write-Ok "identity $($identity.Output)"
 
+# EGRESS TO github.com, CHECKED ONCE, UP FRONT.
+#
+# Build 86 reported three separate component failures - one config clone and two
+# 'unverified' verdicts - all of which were one fact: no route to github.com at
+# that moment. One line here is worth three misleading ones later.
+#
+# Not fatal: the S3 work needs no GitHub access at all, and a flow whose configs
+# all come from the daily snapshot can stage perfectly well without it.
+$ghOk = $false
+foreach ($try in 1..4) {
+    $t = Test-NetConnection -ComputerName 'github.com' -Port 443 -InformationLevel Quiet -WarningAction SilentlyContinue
+    if ($t) { $ghOk = $true; break }
+    if ($try -lt 4) {
+        Write-Warn "github.com:443 not reachable (attempt $try of 4). The container network may still be settling; retrying in 15s."
+        Start-Sleep -Seconds 15
+    }
+}
+if ($ghOk) {
+    Write-Ok 'github.com:443 reachable - the config repo can be read'
+} else {
+    Write-Warn 'github.com:443 NOT reachable from this host. Anything that needs the config repo will fail;'
+    Write-Warn 'S3 artifacts are unaffected. Check the default route - creating the l2bridge vSwitches resets'
+    Write-Warn 'the underlying adapters, and staging starts seconds after bootstrap.'
+}
+
 # ---------------------------------------------------------------------------
 # GitHub token for the private config repo (configSource.gitRepo). Resolved by shape with the
 # instance profile, the same way UserData resolves the bootstrap token, so there
@@ -417,11 +442,13 @@ function Get-GitFolder {
         # it. --depth 1 is gone because rev-list cannot walk unfetched history;
         # --filter=blob:none keeps it cheap.
         $env:GIT_TERMINAL_PROMPT = '0'
-        $cloneOut = & git -c credential.helper= `
-              clone --quiet --branch $Branch --filter=blob:none --sparse --no-checkout `
-              "https://github.com/$Owner/$Repo.git" "$work\repo" 2>&1
-        if ($LASTEXITCODE -ne 0) {
-            Write-Warn "clone of $Repo@$Branch failed (git exit $LASTEXITCODE). The path in the repo has NOT been checked - do not read this as a missing folder."
+        $clone = Invoke-GitNet -GitArgs @(
+            '-c', 'credential.helper=',
+            'clone', '--quiet', '--branch', $Branch, '--filter=blob:none', '--sparse', '--no-checkout',
+            "https://github.com/$Owner/$Repo.git", "$work\repo")
+        $cloneOut = $clone.Output
+        if ($clone.ExitCode -ne 0) {
+            Write-Warn "clone of $Repo@$Branch failed after $($clone.Attempts) attempt(s) (git exit $($clone.ExitCode)). The path in the repo has NOT been checked - do not read this as a missing folder."
             # PRINT WHAT GIT SAID. Build 82 reported only "git exit 128" three
             # times, which is git's generic fatal and says nothing about whether
             # the cause was auth, a bad ref or the URL.
@@ -537,6 +564,57 @@ function Get-GitFolder {
 # verdict - the point is to stop assuming.
 $script:ConfigChangeCount = 0
 $script:ConfigChangeNote = ''
+# Run a git command that talks to the network, retrying ONLY on a connection
+# failure.
+#
+# Build 86:
+#   fatal: unable to access the config repo over https:
+#   Failed to connect to github.com:443 after 21049 ms: Could not connect to server
+#
+# Checked on the host minutes later: Test-NetConnection github.com -Port 443
+# succeeded, one clean default route via the management NIC. So egress WORKS on
+# that host - it was not available at the moment staging ran. Build 85's clone of
+# the same repo succeeded, which is what makes it intermittent rather than
+# broken.
+#
+# The likely cause is the same transition that took IMDS away in build 80:
+# Docker's l2bridge networks put a vSwitch on each prod NIC (vEthernet
+# (Ethernet 2) and vEthernet (Ethernet 4) are visible on the host), creating a
+# vSwitch resets the underlying adapter, and staging starts seconds after
+# bootstrap finishes.
+#
+# RETRY ONLY THE NETWORK CASE. A 401, a missing branch or a bad path will fail
+# identically on every attempt, and retrying those turns a clear two-second
+# failure into a slow one - which is how build 79 spent 27 minutes.
+$script:GIT_NET_PATTERNS = @(
+    'Could not connect to server', 'Failed to connect to',
+    'Could not resolve host', 'Operation timed out',
+    'Connection timed out', 'unable to access'
+)
+function Invoke-GitNet {
+    param(
+        [Parameter(Mandatory)][string[]] $GitArgs,
+        [int] $MaxTries = 4,
+        [int] $DelaySeconds = 15
+    )
+    for ($try = 1; $try -le $MaxTries; $try++) {
+        $out = & git @GitArgs 2>&1
+        $rc = $LASTEXITCODE
+        if ($rc -eq 0) {
+            if ($try -gt 1) { Write-Warn "git succeeded on attempt $try - egress was not ready at first" }
+            return [pscustomobject]@{ ExitCode = 0; Output = $out; Attempts = $try }
+        }
+        $text = ($out | Out-String)
+        $isNetwork = $false
+        foreach ($p in $script:GIT_NET_PATTERNS) { if ($text -match [regex]::Escape($p)) { $isNetwork = $true; break } }
+        if (-not $isNetwork -or $try -eq $MaxTries) {
+            return [pscustomobject]@{ ExitCode = $rc; Output = $out; Attempts = $try }
+        }
+        Write-Warn "git could not reach the remote (attempt $try of $MaxTries). Retrying in ${DelaySeconds}s - the container network may still be settling."
+        Start-Sleep -Seconds $DelaySeconds
+    }
+}
+
 function Test-ConfigChangedBetween {
     param($ConfigSource, [int] $Offset)
     $script:ConfigChangeCount = 0
@@ -574,11 +652,19 @@ function Test-ConfigChangedBetween {
         $env:GIT_CONFIG_VALUE_0 = "Authorization: Basic $basic"
         $env:GIT_TERMINAL_PROMPT = '0'
         # Commit graph only: no blobs, no working tree. This is a history query.
-        & git -c credential.helper= `
-              clone --quiet --bare --filter=blob:none --branch $branch `
-              "https://github.com/$($plan.engineRepoOwner)/$repo.git" "$work\hist" 2>&1 | Out-Null
-        if ($LASTEXITCODE -ne 0) {
-            $script:ConfigChangeNote = 'the config repo could not be read to check for changes'
+        # Same retry as Get-GitFolder: this clone hit the identical transient
+        # egress failure in build 86, and the result was an 'unverified' verdict
+        # on a config that could have been verified.
+        $hist = Invoke-GitNet -GitArgs @(
+            '-c', 'credential.helper=',
+            'clone', '--quiet', '--bare', '--filter=blob:none', '--branch', $branch,
+            "https://github.com/$($plan.engineRepoOwner)/$repo.git", "$work\hist")
+        if ($hist.ExitCode -ne 0) {
+            # Say WHY, rather than only that it could not be read. The
+            # distinction between "no egress" and "rejected" decides who fixes it.
+            $why = ($hist.Output | Out-String).Trim() -split "`n" | Select-Object -Last 1
+            $script:ConfigChangeNote = "the config repo could not be read to check for changes: $why"
+            Write-Warn "config-repo history clone failed after $($hist.Attempts) attempt(s): $why"
             return $null
         }
         Push-Location "$work\hist"
