@@ -108,7 +108,7 @@ trap {
 
 # Printed first, every run. Without it a stale fetch is invisible and a retest
 # can silently re-run old code while looking like a fresh result.
-$script:ScriptVersion = '2026-09-18.1-claim-bounds'
+$script:ScriptVersion = '2026-09-18.2-git-config-env'
 
 function Write-Step { param([string] $Message) Write-Host "`n=== $Message ===" -ForegroundColor Cyan }
 function Write-Ok   { param([string] $Message) Write-Host "  [ok]   $Message" -ForegroundColor Green }
@@ -377,11 +377,30 @@ function Get-GitFolder {
         if (-not $verOk) {
             Write-Warn "git $gitVer is older than 2.31, which ignores GIT_CONFIG_COUNT. The config-repo clone will not authenticate; upgrade git on this host."
         }
-        $env:GIT_CONFIG_COUNT = '2'
-        $env:GIT_CONFIG_KEY_0 = 'credential.helper'
-        $env:GIT_CONFIG_VALUE_0 = ''
-        $env:GIT_CONFIG_KEY_1 = 'http.extraheader'
-        $env:GIT_CONFIG_VALUE_1 = "Authorization: Basic $basic"
+        # ONE ENTRY, AND credential.helper STAYS ON THE COMMAND LINE.
+        #
+        # Build 84:
+        #   git: error: missing config value GIT_CONFIG_VALUE_0
+        #   git: fatal: unable to parse command-line config
+        #
+        # ASSIGNING '' TO $env:X IN POWERSHELL DELETES THE VARIABLE. It does not
+        # set it to an empty string. So `$env:GIT_CONFIG_VALUE_0 = ''` - meant to
+        # express `credential.helper=` with an empty value - removed VALUE_0
+        # entirely, git saw COUNT=2 with KEY_0 and no VALUE_0, and refused to
+        # parse ANY of the config. That killed the http.extraheader entry too,
+        # which was correct, so the symptom was a generic exit 128 with the
+        # header never applied.
+        #
+        # The split below is deliberate:
+        #   http.extraheader -> ENVIRONMENT. Its value contains spaces, and
+        #       PowerShell 5.1 re-splits native command arguments on spaces
+        #       (build 82's original exit 128).
+        #   credential.helper= -> COMMAND LINE. It has no spaces, so PowerShell
+        #       cannot mangle it, and an empty config value is expressible there
+        #       where the environment form cannot express it at all.
+        $env:GIT_CONFIG_COUNT = '1'
+        $env:GIT_CONFIG_KEY_0 = 'http.extraheader'
+        $env:GIT_CONFIG_VALUE_0 = "Authorization: Basic $basic"
         # GIT_TERMINAL_PROMPT=0: on a 401 git otherwise falls back to asking for a
         # username, and on a headless host that surfaces as "could not read
         # Username for 'https://github.com'" - a message about the fallback, not
@@ -398,7 +417,8 @@ function Get-GitFolder {
         # it. --depth 1 is gone because rev-list cannot walk unfetched history;
         # --filter=blob:none keeps it cheap.
         $env:GIT_TERMINAL_PROMPT = '0'
-        $cloneOut = & git clone --quiet --branch $Branch --filter=blob:none --sparse --no-checkout `
+        $cloneOut = & git -c credential.helper= `
+              clone --quiet --branch $Branch --filter=blob:none --sparse --no-checkout `
               "https://github.com/$Owner/$Repo.git" "$work\repo" 2>&1
         if ($LASTEXITCODE -ne 0) {
             Write-Warn "clone of $Repo@$Branch failed (git exit $LASTEXITCODE). The path in the repo has NOT been checked - do not read this as a missing folder."
@@ -465,8 +485,8 @@ function Get-GitFolder {
         # Clear the token out of the environment as soon as git is done with it.
         # It would otherwise be inherited by every later child process in this
         # script, including the AWS CLI.
-        Remove-Item Env:GIT_CONFIG_COUNT, Env:GIT_CONFIG_KEY_0, Env:GIT_CONFIG_VALUE_0, `
-                    Env:GIT_CONFIG_KEY_1, Env:GIT_CONFIG_VALUE_1 -ErrorAction SilentlyContinue
+        Remove-Item Env:GIT_CONFIG_COUNT, Env:GIT_CONFIG_KEY_0, Env:GIT_CONFIG_VALUE_0 `
+                    -ErrorAction SilentlyContinue
     }
 
     # The files may be one level down, in config\. The repo convention puts them
@@ -523,13 +543,18 @@ function Test-ConfigChangedBetween {
             [Text.Encoding]::ASCII.GetBytes("x-access-token:$script:GitHubToken"))
         # Environment, not the command line - same PowerShell native-argument
         # quoting problem that produced git exit 128 in build 82.
-        $env:GIT_CONFIG_COUNT = '2'
-        $env:GIT_CONFIG_KEY_0 = 'credential.helper'; $env:GIT_CONFIG_VALUE_0 = ''
-        $env:GIT_CONFIG_KEY_1 = 'http.extraheader'
-        $env:GIT_CONFIG_VALUE_1 = "Authorization: Basic $basic"
+        # One entry only - see the note in Get-GitFolder. Assigning '' to an
+        # $env: variable DELETES it, so a COUNT that promises an empty value git
+        # can never find makes git reject the whole config. credential.helper=
+        # goes on the command line, where an empty value is expressible and
+        # where PowerShell cannot re-split it (no spaces).
+        $env:GIT_CONFIG_COUNT = '1'
+        $env:GIT_CONFIG_KEY_0 = 'http.extraheader'
+        $env:GIT_CONFIG_VALUE_0 = "Authorization: Basic $basic"
         $env:GIT_TERMINAL_PROMPT = '0'
         # Commit graph only: no blobs, no working tree. This is a history query.
-        & git clone --quiet --bare --filter=blob:none --branch $branch `
+        & git -c credential.helper= `
+              clone --quiet --bare --filter=blob:none --branch $branch `
               "https://github.com/$($plan.engineRepoOwner)/$repo.git" "$work\hist" 2>&1 | Out-Null
         if ($LASTEXITCODE -ne 0) {
             $script:ConfigChangeNote = 'the config repo could not be read to check for changes'
@@ -552,8 +577,8 @@ function Test-ConfigChangedBetween {
     }
     finally {
         $ErrorActionPreference = $previous
-        Remove-Item Env:GIT_CONFIG_COUNT, Env:GIT_CONFIG_KEY_0, Env:GIT_CONFIG_VALUE_0, `
-                    Env:GIT_CONFIG_KEY_1, Env:GIT_CONFIG_VALUE_1 -ErrorAction SilentlyContinue
+        Remove-Item Env:GIT_CONFIG_COUNT, Env:GIT_CONFIG_KEY_0, Env:GIT_CONFIG_VALUE_0 `
+                    -ErrorAction SilentlyContinue
         Remove-Item -Recurse -Force $work -ErrorAction SilentlyContinue
     }
 }
