@@ -108,7 +108,7 @@ trap {
 
 # Printed first, every run. Without it a stale fetch is invisible and a retest
 # can silently re-run old code while looking like a fresh result.
-$script:ScriptVersion = '2026-09-18.5-egress-after-networks'
+$script:ScriptVersion = '2026-09-21.1-pathspec-and-evidence'
 
 function Write-Step { param([string] $Message) Write-Host "`n=== $Message ===" -ForegroundColor Cyan }
 function Write-Ok   { param([string] $Message) Write-Host "  [ok]   $Message" -ForegroundColor Green }
@@ -471,18 +471,44 @@ function Get-GitFolder {
             # the T form, which has no space to split on.
             #
             # 23:59:59 so a commit made ON the market date counts as in force.
-            $asof = (& git rev-list -1 "--before=$($plan.marketDate)T23:59:59" "origin/$Branch" 2>&1 |
-                     Select-Object -First 1)
-            if ($LASTEXITCODE -ne 0 -or -not $asof -or $asof -notmatch '^[0-9a-f]{7,40}$') {
-                Write-Warn "no commit on origin/$Branch at or before $($plan.marketDate) - the branch may be younger than the market date."
+            # CAPTURE FIRST, FILTER SECOND. This was
+            #     $asof = (& git rev-list ... 2>&1 | Select-Object -First 1)
+            # and `-First 1` stops the pipeline as soon as it has its object,
+            # which terminates git mid-write and leaves $LASTEXITCODE non-zero
+            # for a command that had already printed the right answer. The
+            # failure branch then fired on a successful query.
+            $revOut = @(& git rev-list -1 "--before=$($plan.marketDate)T23:59:59" "origin/$Branch" 2>&1)
+            $revRc  = $LASTEXITCODE
+            $asof   = @($revOut | Where-Object { "$_" -match '^[0-9a-f]{7,40}$' })[0]
+
+            # THREE DIFFERENT FACTS, THREE DIFFERENT MESSAGES. One message used
+            # to cover all of them, and it asserted a cause: "the branch may be
+            # younger than the market date". On build 91 that line appeared on
+            # the Windows host while the Linux host resolved the very same
+            # branch to a commit dated on the market date - so the message was
+            # not merely unhelpful, it was false, and it pointed the next
+            # reader at the repo instead of at this code.
+            if ($revRc -ne 0) {
+                Write-Warn "the as-of-market-date query failed (git exit $revRc). This says nothing about whether such a commit exists."
+                $revOut | ForEach-Object { Write-Warn "  git: $_" }
+                return $null
+            }
+            if (-not $asof) {
+                Write-Warn "git found no commit on origin/$Branch at or before $($plan.marketDate). The query ran and returned nothing, so the branch really may be younger than the market date."
                 return $null
             }
             $script:GitAsOfSha = $asof
-            $script:GitAsOfDate = (& git log -1 --format=%cI $asof 2>$null | Select-Object -First 1)
+            $dateOut = @(& git log -1 --format=%cI $asof 2>&1)
+            $script:GitAsOfDate = if ($LASTEXITCODE -eq 0) { @($dateOut)[0] } else { $null }
             # Commits to this path AFTER the market date. Zero means the config
             # has not changed since, so this version is also the current one -
             # which is the direct answer to "is a year-old config still right?".
-            $after = @(& git log --oneline "$asof..origin/$Branch" -- $Path.Replace('\', '/') 2>&1)
+            # NO LEADING SLASH. gitPath is stored with a leading backslash, so
+            # the naive replace yields "/NY4 Primary Servers/...", and git
+            # rejects an absolute pathspec: "fatal: Invalid path ... exit 128".
+            # Verified in a scratch repo on 2026-09-21, worktree and bare alike.
+            $pathspec = $Path.Replace('\', '/').TrimStart('/')
+            $after = @(& git log --oneline "$asof..origin/$Branch" -- $pathspec 2>&1)
             if ($LASTEXITCODE -ne 0) {
                 # EMPTY OUTPUT FROM A FAILED COMMAND IS NOT "no commits".
                 # Treating it as zero is how a broken query becomes evidence.
@@ -682,9 +708,13 @@ function Test-ConfigChangedBetween {
             # it converts an unknown into a positive assurance that the staged
             # config matched the market date. So the date loses its space, and a
             # non-zero exit now returns UNKNOWN instead of a verdict.
+            # Leading slash stripped - see the note in Get-GitFolder. This is
+            # the call that returned "git exit 128" on build 91 for both OMS
+            # engines, which is why both were recorded 'unverified'.
+            $betweenPath = $gp.Replace('\', '/').TrimStart('/')
             $between = @(& git log --oneline "--since=${since}T00:00:00" `
                              "--until=$($plan.marketDate)T23:59:59" `
-                             -- $gp.Replace('\', '/') 2>&1)
+                             -- $betweenPath 2>&1)
             $logRc = $LASTEXITCODE
         }
         finally { Pop-Location }

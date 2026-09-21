@@ -55,7 +55,7 @@ set -euo pipefail
 
 # Printed first, every run. A stale fetch is otherwise invisible - see the note
 # in 02-prereq-windows.ps1.
-SCRIPT_VERSION='2026-09-18.5-egress-after-networks'
+SCRIPT_VERSION='2026-09-21.1-pathspec-and-evidence'
 
 PLAN_FILE="/opt/flowtest/bootstrap/flow-plan-linux.json"
 DRY_RUN=0
@@ -341,11 +341,21 @@ print((m+datetime.timedelta(days=int('$offset'))).isoformat())
              clone --quiet --bare --filter=blob:none --branch "$branch" \
              "https://github.com/$owner/$repo.git" hist >/dev/null 2>&1 || exit 1
          cd hist || exit 1
+         # Leading slash stripped: git rejects an absolute pathspec with
+         # "fatal: ... is outside repository" (exit 128), and gitPath is stored
+         # with a leading backslash. This function has therefore never been able
+         # to answer 'unchanged' for a real path - it failed closed every time,
+         # which is why the failure hid for so long: 'unverified' is the correct
+         # output for a query that could not run, so nothing looked wrong.
+         gpq="${gp//\\//}"; gpq="${gpq#/}"
          git log --oneline --since="$since 00:00:00" --until="$MARKET_DATE 23:59:59" \
-             -- "${gp//\\//}" > "$work/between.log" 2>/dev/null || exit 1
+             -- "$gpq" > "$work/between.log" 2>"$work/between.err" || exit 1
          exit 0 ); then
-    rm -rf "$work"
     CONFIG_CHANGE_NOTE="the config repo could not be read to check for changes"
+    # Print what git said. Without this the note above is the whole story, and
+    # it cannot distinguish a rejected pathspec from a rejected token.
+    [[ -s "$work/between.err" ]] && sed 's/^/           git: /' "$work/between.err" >&2
+    rm -rf "$work"
     return 1
   fi
 
@@ -554,12 +564,43 @@ stage_config() {
             exit 3
           fi
           printf '%s\n' "$asof" > "$work/asof.sha"
-          git log -1 --format=%cI "$asof" > "$work/asof.date" 2>/dev/null || true
+          # Stderr kept rather than discarded: the consumer prints
+          # "${GIT_ASOF_DATE:-unknown}", so a failure here degrades honestly -
+          # but if it ever does fail, the reason should be in the log rather
+          # than inferred from a blank field.
+          git log -1 --format=%cI "$asof" > "$work/asof.date" 2> "$work/asof.date.err" || true
           # Commits to THIS path after the market date, recorded as evidence: it
           # is the difference between "unchanged for a year, so the snapshot is
           # fine" and "edited since, so it is not".
-          git log --oneline "$asof..origin/$branch" -- "${gitpath//\\//}" \
-              > "$work/after.log" 2>/dev/null || true
+          # NO LEADING SLASH ON A PATHSPEC, AND NEVER SILENCE THIS QUERY.
+          #
+          # This line read:
+          #   git log --oneline "$asof..origin/$branch" -- "${gitpath//\\//}" \
+          #       > "$work/after.log" 2>/dev/null || true
+          # and it produced the worst result this file has produced: a FALSE
+          # "unchanged". gitPath is stored with a leading backslash, so the
+          # substitution yields "/NY4 Primary Servers/...", and git rejects an
+          # absolute pathspec outright:
+          #   fatal: Invalid path '/NY4 Primary Servers': No such file or directory
+          #   exit 128
+          # (Reproduced on 2026-09-21 in a scratch repo, in both a worktree and a
+          # bare clone.) With stderr discarded and `|| true` swallowing the exit
+          # code, after.log was empty, wc -l said 0, and the manifest recorded
+          #   commitsAfterMarketDate: 0, unchangedSinceMarketDate: true
+          # for build 91's Linux component - an assurance that the staged config
+          # matched the market date, derived from a command that never ran.
+          #
+          # The Windows copy checks the exit code, so the same fault there
+          # surfaced honestly as 'unverified'. One bug, two hosts, and only the
+          # host that checked told the truth.
+          gp="${gitpath//\\//}"; gp="${gp#/}"
+          if git log --oneline "$asof..origin/$branch" -- "$gp" \
+                 > "$work/after.log" 2> "$work/after.err"; then
+            : > "$work/after.rc"
+          else
+            printf '%s' "$?" > "$work/after.rc"
+            : > "$work/after.log"
+          fi
           # DO NOT SILENCE THIS. It was ">/dev/null 2>&1 || true", and build 78
           # is the cost: the clone succeeded, sparse-checkout produced nothing,
           # and the only symptom was the directory test below reporting the path
@@ -625,8 +666,17 @@ stage_config() {
         # some wc implementations pad the count.
         GIT_AFTER_COUNT="$(wc -l < "$work/after.log" 2>/dev/null | tr -d ' ')"
         GIT_AFTER_COUNT="${GIT_AFTER_COUNT:-0}"
+        # A FAILED QUERY IS UNKNOWN, NOT ZERO. after.rc is empty on success and
+        # holds git's exit code on failure, so the two cases that both leave an
+        # empty after.log can no longer be confused - which is precisely how
+        # build 91 reported 'unchangedSinceMarketDate: true' off a fatal.
+        GIT_AFTER_RC="$(cat "$work/after.rc" 2>/dev/null || true)"
         ok "$name: using ${GIT_ASOF_SHA:0:8} committed ${GIT_ASOF_DATE:-unknown} - the version in force on $MARKET_DATE"
-        if [[ "$GIT_AFTER_COUNT" -eq 0 ]]; then
+        if [[ -n "$GIT_AFTER_RC" ]]; then
+          GIT_AFTER_COUNT=''
+          warn "$name: could not count commits after $MARKET_DATE (git exit $GIT_AFTER_RC). Recording it as UNKNOWN - an empty result from a failed query is not evidence of no change."
+          [[ -s "$work/after.err" ]] && sed 's/^/           git: /' "$work/after.err" >&2
+        elif [[ "$GIT_AFTER_COUNT" -eq 0 ]]; then
           ok "$name: unchanged since (0 commits to this path after $MARKET_DATE), so this is also the current config"
         else
           warn "$name: this path has $GIT_AFTER_COUNT commit(s) AFTER $MARKET_DATE. Staging the market-date version, not HEAD - HEAD would replay configuration the session never ran under."
@@ -672,11 +722,11 @@ stage_config() {
         record "$name" config staged \
           "$(jq -n --arg r "$repo" --arg b "$branch" --arg p "$gitpath" --argjson c "$count" --arg d "$dest" \
                 --arg sha "${GIT_ASOF_SHA:-}" --arg cd "${GIT_ASOF_DATE:-}" \
-                --argjson after "${GIT_AFTER_COUNT:-0}" --arg m "$MARKET_DATE" \
+                --argjson after "${GIT_AFTER_COUNT:-null}" --arg m "$MARKET_DATE" \
                 '{source:"git-serverconfigs", repo:$r, branch:$b, path:$p, files:$c, dest:$d,
                   marketDate:$m, commit:$sha, commitDate:$cd, commitsAfterMarketDate:$after,
                   resolution:"the last commit at or before the market date, not branch HEAD",
-                  unchangedSinceMarketDate:($after == 0)}')"
+                  unchangedSinceMarketDate:(if $after == null then null else $after == 0 end)}')"
       else
         record "$name" config failed \
           "$(jq -n --arg r "$repo" --arg b "$branch" --arg p "$gitpath" --arg d "$dest" \
