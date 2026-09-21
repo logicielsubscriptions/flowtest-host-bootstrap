@@ -78,7 +78,7 @@ Set-StrictMode -Version Latest
 # The same lesson as PIPELINE_VERSION in Jenkinsfile-generate-cfn, which was
 # itself once left un-bumped so a build reported a version that did not describe
 # the code it ran. Cheap marker, expensive absence.
-$script:ScriptVersion = '2026-09-18.4-egress-retry'
+$script:ScriptVersion = '2026-09-18.5-egress-after-networks'
 
 # ----------------------------- configuration -----------------------------
 
@@ -674,13 +674,23 @@ function Register-RoutePriorityTask {
         # rather than by setting Repetition on the boot trigger: a boot trigger's
         # repetition is not honoured consistently across Windows versions, and
         # this failing silently is exactly what it is meant to prevent.
-        $repeatTrigger = New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(5) `
-                            -RepetitionInterval (New-TimeSpan -Minutes 15)
+        # EVERY 3 MINUTES, NOT 15. The interval has to be shorter than the
+        # pipeline's readiness gate, or the repair arrives after the build has
+        # already given up - which is what happened on build 87.
+        #
+        # Registered early in this script, the 15-minute schedule put occurrences
+        # at roughly +5, +20, +35 minutes. Creating the container networks broke
+        # egress about 8 minutes in, so the next repair was due at +20 while the
+        # gate expired at +17. The task then fixed the routes a few minutes after
+        # the build failed, which is why a host inspected by hand afterwards
+        # looked perfectly healthy and the failure read as a transient.
+        $repeatTrigger = New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(3) `
+                            -RepetitionInterval (New-TimeSpan -Minutes 3)
 
         Register-ScheduledTask -TaskName $taskName -Action $action `
             -Trigger @($bootTrigger, $repeatTrigger) `
             -Principal $principal -Settings $settings -Force -ErrorAction Stop | Out-Null
-        Write-Ok "scheduled task '$taskName' registered (at startup +45s, then every 15 min, as SYSTEM)"
+        Write-Ok "scheduled task '$taskName' registered (at startup +45s, then every 3 min, as SYSTEM)"
         Write-Host "         runs: $stablePath -RoutesOnly"
     }
     catch {
@@ -1236,6 +1246,106 @@ function Initialize-DockerNetworks {
     }
 }
 
+function Assert-EgressAfterNetworks {
+    <#
+        RE-APPLY THE ROUTE FIX AFTER THE CONTAINER NETWORKS EXIST, THEN PROVE
+        EGRESS STILL WORKS.
+
+        Set-ProdNicRoutePriority runs early in main, before anything needs the
+        network - which is right, and was not enough. Creating an l2bridge
+        network binds the prod NIC to a Hyper-V virtual switch, and the NIC comes
+        back through DHCP with a fresh 0.0.0.0/0 route on a subnet that has no
+        path to the internet by design. The early pass cannot remove a route that
+        does not exist yet, and the boot task only fires at boot, so between
+        Initialize-DockerNetworks and the next reboot nothing re-applied it.
+
+        What that cost, in two builds:
+          build 86  the host registered with SSM before the networks were built,
+                    then 04-stage-artifacts could not reach github.com:443. Read
+                    at the time as a transient, and a retry was added for it.
+          build 87  same host, same script, different timing: the SSM Agent was
+                    restarted at 14:18:27 and never registered. The gate spent
+                    its full window on "PingStatus=not registered" and the build
+                    failed with no evidence on the Jenkins side at all. The
+                    instance's own system log showed the agent running fine.
+
+        One cause, two faces, and the retry added for the first one could never
+        have fixed the second - a host with no egress cannot be retried into
+        having some.
+
+        Not fatal on its own. A host that reaches nothing is useless, but saying
+        so here reaches nobody: this runs under UserData, whose output does not
+        appear in the EC2 system log, and the pipeline learns of the failure only
+        as a gate timeout. So this prints the evidence, fixes what it can, and
+        kicks the agent so registration is retried at once rather than after the
+        agent's own backoff.
+    #>
+    Write-Step 'Egress after the container networks exist'
+
+    Set-ProdNicRoutePriority
+
+    # Region for the SSM endpoint. IMDS is the right source and is also the first
+    # thing this transition breaks, so a failure to read it is reported rather
+    # than silently defaulted - "used the fallback" and "asked and was answered"
+    # must not look the same.
+    $region = $null
+    try {
+        $token = Invoke-RestMethod -Method Put -Uri 'http://169.254.169.254/latest/api/token' `
+            -Headers @{ 'X-aws-ec2-metadata-token-ttl-seconds' = '60' } -TimeoutSec 5
+        $region = Invoke-RestMethod -Uri 'http://169.254.169.254/latest/meta-data/placement/region' `
+            -Headers @{ 'X-aws-ec2-metadata-token' = $token } -TimeoutSec 5
+    } catch {
+        Write-Warn ("IMDS did not answer ({0}) - itself a symptom of this transition." -f $_.Exception.Message)
+    }
+    if ([string]::IsNullOrWhiteSpace($region)) {
+        $region = 'us-east-1'
+        Write-Warn "assuming region $region for the endpoint test"
+    } else {
+        Write-Ok "region from IMDS: $region"
+    }
+
+    # ssm is what the pipeline's gate waits on; github is what staging needs.
+    # Both are tested because a host that has one and not the other has a
+    # different problem from a host that has neither.
+    $targets = @(
+        @{ Host = "ssm.$region.amazonaws.com"; Why = 'the pipeline gate waits for this host to register' },
+        @{ Host = 'github.com';                Why = 'staging clones the configuration repo' }
+    )
+
+    $failed = @()
+    foreach ($target in $targets) {
+        $reachable = $false
+        foreach ($try in 1..6) {
+            $probe = Test-NetConnection -ComputerName $target.Host -Port 443 `
+                        -InformationLevel Quiet -WarningAction SilentlyContinue
+            if ($probe) { $reachable = $true; break }
+            if ($try -lt 6) {
+                Start-Sleep -Seconds 10
+                # Re-apply between attempts: DHCP can hand the route back at any
+                # point during the transition, so one pass is not a fix.
+                Set-ProdNicRoutePriority | Out-Null
+            }
+        }
+        if ($reachable) {
+            Write-Ok ("{0}:443 reachable" -f $target.Host)
+        } else {
+            $failed += $target
+            Write-Fail ("{0}:443 NOT reachable after 6 attempts over ~50s - {1}" -f $target.Host, $target.Why)
+        }
+    }
+
+    if ($failed.Count -eq 0) { return }
+
+    Write-Host '  default route(s) as this host sees them now:'
+    Get-NetRoute -DestinationPrefix '0.0.0.0/0' -ErrorAction SilentlyContinue |
+        Sort-Object RouteMetric |
+        ForEach-Object { Write-Host ("    ifIndex {0,-4} via {1,-15} metric {2}" -f $_.InterfaceIndex, $_.NextHop, $_.RouteMetric) }
+
+    # Restart the agent regardless: if egress came back late, this is what turns
+    # a registered-eventually host into a registered-now one.
+    Sync-ServiceEnvironment
+}
+
 function Get-BaseImages {
     Write-Step "Base image: $($Config.BaseImage)"
     $present = & docker images --format '{{.Repository}}:{{.Tag}}' 2>$null | Where-Object { $_ -eq $Config.BaseImage }
@@ -1460,6 +1570,10 @@ try {
     Initialize-Directories
     Get-BaseImages
     Initialize-DockerNetworks
+    # Immediately after the networks, because creating them is what breaks
+    # egress. Before Test-Prerequisites, so the verification below runs on a host
+    # whose routes have already been put back.
+    Assert-EgressAfterNetworks
     Test-Prerequisites
 
     # Print next steps using values from the plan, so this script carries no
