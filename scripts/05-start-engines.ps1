@@ -25,7 +25,7 @@
     clean result.
 
 .EXAMPLE
-    .\05-start-engines.ps1 -Plan C:\FlowTest\flow-plan-windows.json
+    .\05-start-engines.ps1 -Plan C:\FlowTest\bootstrap\flow-plan-windows.json
 
 .EXAMPLE
     .\05-start-engines.ps1 -Only <containerName>,<containerName> -DryRun
@@ -43,7 +43,7 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
-$script:ScriptVersion = '2026-09-22.2-deploy-visibility'
+$script:ScriptVersion = '2026-09-22.3-ecr-login'
 Write-Host "  script version $script:ScriptVersion" -ForegroundColor DarkGray
 
 function Write-Step { param([string] $m) Write-Host ''; Write-Host "==> $m" -ForegroundColor Cyan }
@@ -54,14 +54,30 @@ function Write-Fail { param([string] $m) Write-Host "  [FAIL] $m" -ForegroundCol
 
 # Native commands write to stderr for ordinary conditions, and under
 # ErrorActionPreference='Stop' PowerShell turns that into a terminating error.
-# Same helper and same reason as images/run-engine.ps1.
+# Same reason as images/run-engine.ps1.
+#
+# AN EXPLICIT ARRAY, NOT ValueFromRemainingArguments - AND NO PARAMETER THAT
+# COULD SWALLOW A PASSED-THROUGH FLAG.
+#
+# This was:
+#     param([string] $File, [Parameter(ValueFromRemainingArguments)][string[]] $Arguments)
+# called as
+#     Invoke-Native powershell -NoProfile -ExecutionPolicy Bypass -File $runEngine @args
+# and PowerShell bound the `-File` I meant for powershell.exe to this function's
+# own -File parameter. Everything after it shifted, and build 100 died with
+#     A positional parameter cannot be found that accepts argument '-ConfigDir'
+# which names an argument of a THIRD script and points nowhere near the cause.
+#
+# `docker inspect -f ...` was the same bug waiting: -f prefix-matches -File.
+# Passing the arguments as one array removes the whole class - nothing inside
+# an array is ever considered for parameter binding.
 function Invoke-Native {
-    param([Parameter(Mandatory)][string] $File,
-          [Parameter(ValueFromRemainingArguments = $true)][string[]] $Arguments)
+    param([Parameter(Mandatory)][string] $Exe,
+          [string[]] $NativeArgs = @())
     $prev = $ErrorActionPreference
     $ErrorActionPreference = 'Continue'
     try {
-        $out = & $File @Arguments 2>&1
+        $out = & $Exe @NativeArgs 2>&1
         [pscustomobject]@{ ExitCode = $LASTEXITCODE; Output = ($out | Out-String).Trim() }
     }
     finally { $ErrorActionPreference = $prev }
@@ -118,12 +134,40 @@ try {
 }
 if (-not $region) { Write-Fail 'could not determine the region from instance metadata'; exit 1 }
 
-$idn = Invoke-Native aws sts get-caller-identity --query Account --output text
+$idn = Invoke-Native aws @('sts','get-caller-identity','--query','Account','--output','text')
 if ($idn.ExitCode -ne 0 -or -not $idn.Output) {
     Write-Fail "could not read the account id: $($idn.Output)"; exit 1
 }
 $registry = "$($idn.Output).dkr.ecr.$region.amazonaws.com"
 Write-Ok $registry
+
+# THE DOCKER DAEMON NEEDS ITS OWN LOGIN. The instance role authorises the AWS
+# CLI, and the availability check below rides on that - but `docker pull` never
+# touches the CLI. Build 100 made the distinction concrete: the tag check
+# reported [ok] and the pull immediately failed with
+#   pull access denied ... no basic auth credentials
+# The check had told the truth (the image exists) and answered a question
+# nobody was asking. Logging in first puts both on the same credentials.
+#
+# Password through STDIN, never as an argument - a command line is readable in
+# the process table. Same form as images/build-images.ps1.
+if (-not $DryRun) {
+    $pwOut = Invoke-Native aws @('ecr','get-login-password','--region',$region)
+    if ($pwOut.ExitCode -ne 0) {
+        Write-Fail "aws ecr get-login-password failed: $($pwOut.Output)"; exit 1
+    }
+    $prevEap = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    $loginOut = ("$($pwOut.Output)" | & docker login --username AWS --password-stdin $registry 2>&1 | Out-String)
+    $loginRc = $LASTEXITCODE
+    $ErrorActionPreference = $prevEap
+    if ($loginRc -ne 0) {
+        Write-Fail "docker login to $registry failed: $($loginOut.Trim())"
+        Write-Fail 'The daemon cannot pull the engine images. The instance role may lack ecr:GetAuthorizationToken.'
+        exit 1
+    }
+    Write-Ok 'docker logged in to the registry'
+}
 
 # ---------------------------------------------------------------------------
 # Flatten groups into an ordered list, carrying each group's network identity.
@@ -164,8 +208,8 @@ Write-Step "Image availability ($($services.Count) component(s))"
 $missing = @()
 foreach ($s in $services) {
     $repo = "$EcrNamespace/$($s.Family)"
-    $q = Invoke-Native aws ecr describe-images --repository-name $repo `
-            --image-ids "imageTag=$($s.Tag)" --region $region
+    $q = Invoke-Native aws @('ecr','describe-images','--repository-name',$repo,
+                             '--image-ids',"imageTag=$($s.Tag)",'--region',$region)
     if ($q.ExitCode -eq 0) { Write-Ok "${repo}:$($s.Tag)" }
     else {
         $missing += "${repo}:$($s.Tag)  (for $($s.Service))"
@@ -206,17 +250,17 @@ foreach ($s in $services) {
     }
 
     $image = "$registry/$EcrNamespace/$($s.Family):$($s.Tag)"
-    $args  = @('-Name', $s.Name, '-Image', $image, '-ConfigDir', $configDir)
+    $engineArgs = @('-Name', $s.Name, '-Image', $image, '-ConfigDir', $configDir)
     if ($s.Shared -and -not $s.IsFirst) {
-        $args += @('-NamespaceContainer', $s.Owner)
+        $engineArgs += @('-NamespaceContainer', $s.Owner)
     } else {
-        if ($s.Network) { $args += @('-Network', $s.Network) }
-        if ($s.Ip)      { $args += @('-Ip', $s.Ip) }
+        if ($s.Network) { $engineArgs += @('-Network', $s.Network) }
+        if ($s.Ip)      { $engineArgs += @('-Ip', $s.Ip) }
     }
-    if ($Replace) { $args += '-Replace' }
-    if ($DryRun)  { $args += '-DryRun' }
+    if ($Replace) { $engineArgs += '-Replace' }
+    if ($DryRun)  { $engineArgs += '-DryRun' }
 
-    $run = Invoke-Native powershell -NoProfile -ExecutionPolicy Bypass -File $runEngine @args
+    $run = Invoke-Native powershell (@('-NoProfile','-ExecutionPolicy','Bypass','-File',$runEngine) + $engineArgs)
     $run.Output -split "`r?`n" | Where-Object { $_ } | ForEach-Object { Write-Host "    $_" }
 
     if ($DryRun) {
@@ -235,10 +279,10 @@ foreach ($s in $services) {
     # here is an engine that starts, is observed running, and dies shortly
     # afterwards - which is exactly the shape of the console-signal fault.
     Start-Sleep -Seconds $SettleSeconds
-    $state = (Invoke-Native docker inspect -f '{{.State.Status}}' $s.Name).Output
+    $state = (Invoke-Native docker @('inspect','-f','{{.State.Status}}',$s.Name)).Output
     if ($state -ne 'running') {
         Write-Fail "$($s.Name): container is '$state' $SettleSeconds s after start. Last output:"
-        (Invoke-Native docker logs --tail 30 $s.Name).Output -split "`r?`n" |
+        (Invoke-Native docker @('logs','--tail','30',$s.Name)).Output -split "`r?`n" |
             ForEach-Object { Write-Host "         $_" -ForegroundColor DarkGray }
         $results += [pscustomobject]@{ component = $s.Name; status = 'exited'
             detail = @{ reason = 'did not stay running'; state = "$state"; image = $image } }

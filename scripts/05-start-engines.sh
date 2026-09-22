@@ -30,13 +30,13 @@
 # carries no addresses, hostnames or product names and is safe to publish.
 #
 # Usage:
-#   ./05-start-engines.sh --plan /opt/flowtest/flow-plan-linux.json
+#   ./05-start-engines.sh --plan /opt/flowtest/bootstrap/flow-plan-linux.json
 #   ./05-start-engines.sh --only <containerName>[,<containerName>]
 #   ./05-start-engines.sh --dry-run                   # print, change nothing
 #
 set -uo pipefail
 
-SCRIPT_VERSION='2026-09-22.2-deploy-visibility'
+SCRIPT_VERSION='2026-09-22.3-ecr-login'
 
 PLAN=''
 ONLY=''
@@ -101,6 +101,28 @@ ACCOUNT="$(aws sts get-caller-identity --query Account --output text 2>/dev/null
 [[ -n "$ACCOUNT" && "$ACCOUNT" != "None" ]] || die 'could not read the account id - the instance profile may be missing'
 REGISTRY="${ACCOUNT}.dkr.ecr.${REGION}.amazonaws.com"
 ok "$REGISTRY"
+
+# THE DOCKER DAEMON NEEDS ITS OWN LOGIN. The instance role lets the AWS CLI talk
+# to ECR, and the availability check below uses exactly that - but `docker pull`
+# does not go through the CLI and has no credentials of its own. Build 100
+# proved the distinction the expensive way: every tag came back [ok] from
+# describe-images, and the very next command failed with
+#   pull access denied ... no basic auth credentials
+# So the check said the image EXISTS, which was true, and said nothing about
+# whether this host could fetch it. Logging in first makes the check and the
+# pull use the same credentials, so a pass means what a reader assumes it means.
+#
+# Password on STDIN, never as an argument: a command line is visible in the
+# process table to every user on the host.
+if [[ $DRY_RUN -eq 0 ]]; then
+  if aws ecr get-login-password --region "$REGION" \
+       | docker login --username AWS --password-stdin "$REGISTRY" >/dev/null 2>&1; then
+    ok "docker logged in to the registry"
+  else
+    die "docker login to $REGISTRY failed - the daemon cannot pull the engine images.
+         The instance role may lack ecr:GetAuthorizationToken."
+  fi
+fi
 
 # ---------------------------------------------------------------------------
 # Flatten the plan into one line per service, carrying the group's network
