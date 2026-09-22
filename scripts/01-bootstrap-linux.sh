@@ -45,7 +45,7 @@ set -euo pipefail
 # Printed first, every run. See the note in 02-prereq-windows.ps1: without a
 # version in the output, a stale fetch is invisible and a retest can silently
 # re-run old code.
-SCRIPT_VERSION='2026-09-21.1-pathspec-and-evidence'
+SCRIPT_VERSION='2026-09-22.1-phase0-start'
 echo "bootstrap script version $SCRIPT_VERSION"
 
 ROOT=""
@@ -99,7 +99,7 @@ prereq="$(find "$ROOT" -name 03-prereq-almalinux.sh -print -quit 2>/dev/null || 
 chmod +x "$prereq"
 echo "running $prereq"
 
-# COPY THE STAGING SCRIPT TO A STABLE PATH.
+# COPY THE HOST-SIDE SCRIPTS TO A STABLE PATH.
 #
 # The tarball extracts into a directory whose name carries the bootstrap commit
 # sha, so nothing may reference a path inside it: the next commit changes the
@@ -110,14 +110,18 @@ echo "running $prereq"
 # the copy lives at $ROOT and is the one thing that path can rely on. Not fatal
 # if absent - staging is a separate stage and an older bootstrap repo simply
 # will not have it, which the pipeline reports rather than crashing on.
-stager="$(find "$ROOT" -name 04-stage-artifacts.sh -print -quit 2>/dev/null || true)"
-if [[ -n "$stager" && "$stager" != "$ROOT/04-stage-artifacts.sh" ]]; then
-  cp -f "$stager" "$ROOT/04-stage-artifacts.sh"
-  chmod +x "$ROOT/04-stage-artifacts.sh"
-  echo "staged artifact script -> $ROOT/04-stage-artifacts.sh"
-elif [[ -z "$stager" ]]; then
-  echo 'note: 04-stage-artifacts.sh not in this tooling archive; the Stage artifacts step will report it missing'
-fi
+# A LIST, not one file: starting the engines is invoked by path too, and the
+# same silent-break argument applies to it.
+for wanted in 04-stage-artifacts.sh 05-start-engines.sh; do
+  found="$(find "$ROOT" -name "$wanted" -print -quit 2>/dev/null || true)"
+  if [[ -n "$found" && "$found" != "$ROOT/$wanted" ]]; then
+    cp -f "$found" "$ROOT/$wanted"
+    chmod +x "$ROOT/$wanted"
+    echo "$wanted -> $ROOT/$wanted"
+  elif [[ -z "$found" ]]; then
+    echo "note: $wanted not in this tooling archive; the stage that invokes it will report it missing"
+  fi
+done
 
 # Tee the child's output to its OWN log, for the same reason the Windows side
 # does: the caller's log does not capture it, and the exit code alone is not a

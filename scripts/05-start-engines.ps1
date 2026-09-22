@@ -1,0 +1,276 @@
+<#
+.SYNOPSIS
+    Start this host's engine containers from the flow plan.
+
+.DESCRIPTION
+    The Windows counterpart of scripts/05-start-engines.sh, and a thin driver
+    over images/run-engine.ps1 rather than a second implementation of it.
+    run-engine.ps1 already owns the create -> copy -> start sequence and the
+    reasons for it (configuration must sit beside the binary; the engine must
+    own its console). This script decides WHICH containers to start, in what
+    order, with which image and address - all of it read from
+    flow-plan-<role>.json.
+
+    WHY A DRIVER AND NOT A LOOP IN THE PIPELINE
+    The plan is the only place that knows the group structure, and groups are
+    where the network decisions live. Putting that logic in Groovy would put it
+    on the far side of an SSM call from the host it describes, and would make
+    the Windows and Linux paths diverge for no reason.
+
+    NOTHING STARTS IF AN IMAGE IS MISSING
+    Every required tag is checked in the registry before the first container is
+    created. A tag discovered missing half way through leaves some engines up
+    and some down, which presents as an engine crash rather than as a registry
+    gap - and the environment then has to be torn down and rebuilt to get a
+    clean result.
+
+.EXAMPLE
+    .\05-start-engines.ps1 -Plan C:\FlowTest\flow-plan-windows.json
+
+.EXAMPLE
+    .\05-start-engines.ps1 -Only <containerName>,<containerName> -DryRun
+#>
+[CmdletBinding()]
+param(
+    [string]   $Plan,
+    [string]   $Only,
+    [string]   $EcrNamespace   = 'flowtest',
+    [int]      $SettleSeconds  = 5,
+    [switch]   $Replace,
+    [switch]   $DryRun
+)
+
+Set-StrictMode -Version Latest
+$ErrorActionPreference = 'Stop'
+
+$script:ScriptVersion = '2026-09-22.1-phase0-start'
+Write-Host "  script version $script:ScriptVersion" -ForegroundColor DarkGray
+
+function Write-Step { param([string] $m) Write-Host ''; Write-Host "==> $m" -ForegroundColor Cyan }
+function Write-Ok   { param([string] $m) Write-Host "  [ok]   $m" -ForegroundColor Green }
+function Write-Warn { param([string] $m) Write-Host "  [warn] $m" -ForegroundColor Yellow }
+function Write-Skip { param([string] $m) Write-Host "  [skip] $m" -ForegroundColor DarkGray }
+function Write-Fail { param([string] $m) Write-Host "  [FAIL] $m" -ForegroundColor Red }
+
+# Native commands write to stderr for ordinary conditions, and under
+# ErrorActionPreference='Stop' PowerShell turns that into a terminating error.
+# Same helper and same reason as images/run-engine.ps1.
+function Invoke-Native {
+    param([Parameter(Mandatory)][string] $File,
+          [Parameter(ValueFromRemainingArguments = $true)][string[]] $Arguments)
+    $prev = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        $out = & $File @Arguments 2>&1
+        [pscustomobject]@{ ExitCode = $LASTEXITCODE; Output = ($out | Out-String).Trim() }
+    }
+    finally { $ErrorActionPreference = $prev }
+}
+
+trap {
+    $inv = $_.InvocationInfo
+    Write-Host ''
+    Write-Fail "line $($inv.ScriptLineNumber): $($inv.Line.Trim())"
+    Write-Fail $_.Exception.Message
+    exit 1
+}
+
+# ---------------------------------------------------------------------------
+if (-not $Plan) { $Plan = 'C:\FlowTest\flow-plan-windows.json' }
+if (-not (Test-Path $Plan)) { Write-Fail "flow plan not found at $Plan"; exit 1 }
+
+$planObj    = Get-Content -Raw $Plan | ConvertFrom-Json
+$role       = $planObj.hostRole
+$flow       = $planObj.flow
+$configRoot = $planObj.staged.configRoot
+$workRoot   = $planObj.workRoot
+Write-Ok "flow $flow, role $role"
+Write-Ok "config root $configRoot"
+
+$runEngine = Join-Path $PSScriptRoot 'run-engine.ps1'
+if (-not (Test-Path $runEngine)) {
+    # The bootstrap tarball puts the images/ scripts alongside scripts/. If the
+    # layout ever changes this must fail loudly rather than silently reimplement
+    # the start sequence, which is the one thing this file must not do.
+    $runEngine = Join-Path (Split-Path -Parent $PSScriptRoot) 'images\run-engine.ps1'
+}
+if (-not (Test-Path $runEngine)) { Write-Fail "run-engine.ps1 not found next to this script or in images/"; exit 1 }
+Write-Ok "using $runEngine"
+
+# ---------------------------------------------------------------------------
+Write-Step 'Registry'
+$region = $null
+try {
+    $token  = Invoke-RestMethod -Method Put -Uri 'http://169.254.169.254/latest/api/token' `
+                -Headers @{ 'X-aws-ec2-metadata-token-ttl-seconds' = '60' } -TimeoutSec 5
+    $region = Invoke-RestMethod -Uri 'http://169.254.169.254/latest/meta-data/placement/region' `
+                -Headers @{ 'X-aws-ec2-metadata-token' = $token } -TimeoutSec 5
+} catch {
+    Write-Warn "IMDS did not answer: $($_.Exception.Message)"
+}
+if (-not $region) { Write-Fail 'could not determine the region from instance metadata'; exit 1 }
+
+$idn = Invoke-Native aws sts get-caller-identity --query Account --output text
+if ($idn.ExitCode -ne 0 -or -not $idn.Output) {
+    Write-Fail "could not read the account id: $($idn.Output)"; exit 1
+}
+$registry = "$($idn.Output).dkr.ecr.$region.amazonaws.com"
+Write-Ok $registry
+
+# ---------------------------------------------------------------------------
+# Flatten groups into an ordered list, carrying each group's network identity.
+# The FIRST service in a shared-namespace group owns the namespace; the rest
+# join it by container name. The plan's namespaceContainer says the same thing
+# as of 2026-09-21 - before that it named a pause container nothing created.
+$services = @()
+foreach ($group in @($planObj.groups)) {
+    $svcList = @($group.services)
+    for ($i = 0; $i -lt $svcList.Count; $i++) {
+        $services += [pscustomobject]@{
+            Name      = $svcList[$i].containerName
+            Service   = $svcList[$i].serviceName
+            Family    = $svcList[$i].imageFamily
+            Tag       = $svcList[$i].tag
+            Network   = $group.dockerNetwork
+            Ip        = $group.ip
+            Shared    = [bool]$group.sharedNamespace
+            IsFirst   = ($i -eq 0)
+            Owner     = $svcList[0].containerName
+        }
+    }
+}
+if ($services.Count -eq 0) { Write-Fail 'the plan lists no services for this host'; exit 1 }
+
+if ($Only) {
+    # A LIST, not one name - Phase 0 starts the two FIX hubs deliberately, and
+    # naming them one run at a time would leave the host half started between
+    # runs. Split and trimmed here so the caller can pass either form.
+    $wanted = @($Only -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+    $services = @($services | Where-Object { $wanted -contains $_.Name })
+    if ($services.Count -eq 0) { Write-Fail "-Only '$Only' matched no component in this plan"; exit 1 }
+    Write-Ok "restricted to $($services.Count) of the plan's components by -Only"
+}
+
+# ---------------------------------------------------------------------------
+Write-Step "Image availability ($($services.Count) component(s))"
+$missing = @()
+foreach ($s in $services) {
+    $repo = "$EcrNamespace/$($s.Family)"
+    $q = Invoke-Native aws ecr describe-images --repository-name $repo `
+            --image-ids "imageTag=$($s.Tag)" --region $region
+    if ($q.ExitCode -eq 0) { Write-Ok "${repo}:$($s.Tag)" }
+    else {
+        $missing += "${repo}:$($s.Tag)  (for $($s.Service))"
+        Write-Fail "${repo}:$($s.Tag) NOT in the registry"
+    }
+}
+if ($missing.Count -gt 0) {
+    Write-Host ''
+    Write-Fail "$($missing.Count) image tag(s) missing. Nothing was started."
+    $missing | ForEach-Object { Write-Host "         $_" -ForegroundColor Red }
+    Write-Host '         Build and push them with images\build-images.ps1, then re-run.' -ForegroundColor Red
+    exit 1
+}
+
+# ---------------------------------------------------------------------------
+$results = @()
+$started = 0
+$failed  = 0
+
+foreach ($s in $services) {
+    Write-Step $s.Name
+    $configDir = Join-Path $configRoot $s.Name
+
+    if (-not (Test-Path $configDir)) {
+        Write-Fail "$($s.Name): no staged configuration at $configDir - not starting it"
+        $results += [pscustomobject]@{ component = $s.Name; status = 'refused'
+            detail = @{ reason = 'no staged configuration directory; staging must run first'; dir = $configDir } }
+        $failed++; continue
+    }
+    $files = @(Get-ChildItem -File -Path $configDir -ErrorAction SilentlyContinue)
+    if ($files.Count -eq 0) {
+        # An engine started without configuration does not fail - it runs on
+        # defaults and looks like a configuration bug somewhere else entirely.
+        Write-Fail "$($s.Name): staged configuration directory is EMPTY - not starting it"
+        $results += [pscustomobject]@{ component = $s.Name; status = 'refused'
+            detail = @{ reason = 'staged configuration directory is empty'; dir = $configDir } }
+        $failed++; continue
+    }
+
+    $image = "$registry/$EcrNamespace/$($s.Family):$($s.Tag)"
+    $args  = @('-Name', $s.Name, '-Image', $image, '-ConfigDir', $configDir)
+    if ($s.Shared -and -not $s.IsFirst) {
+        $args += @('-NamespaceContainer', $s.Owner)
+    } else {
+        if ($s.Network) { $args += @('-Network', $s.Network) }
+        if ($s.Ip)      { $args += @('-Ip', $s.Ip) }
+    }
+    if ($Replace) { $args += '-Replace' }
+    if ($DryRun)  { $args += '-DryRun' }
+
+    $run = Invoke-Native powershell -NoProfile -ExecutionPolicy Bypass -File $runEngine @args
+    $run.Output -split "`r?`n" | Where-Object { $_ } | ForEach-Object { Write-Host "    $_" }
+
+    if ($DryRun) {
+        $results += [pscustomobject]@{ component = $s.Name; status = 'dry-run'; detail = @{ image = $image } }
+        continue
+    }
+    if ($run.ExitCode -ne 0) {
+        Write-Fail "$($s.Name): run-engine.ps1 exited $($run.ExitCode)"
+        $results += [pscustomobject]@{ component = $s.Name; status = 'failed'
+            detail = @{ reason = "run-engine.ps1 exited $($run.ExitCode)"; image = $image } }
+        $failed++; continue
+    }
+
+    # run-engine.ps1 checks the container three seconds in. This checks again
+    # after the settle window, because the failure this project actually fears
+    # here is an engine that starts, is observed running, and dies shortly
+    # afterwards - which is exactly the shape of the console-signal fault.
+    Start-Sleep -Seconds $SettleSeconds
+    $state = (Invoke-Native docker inspect -f '{{.State.Status}}' $s.Name).Output
+    if ($state -ne 'running') {
+        Write-Fail "$($s.Name): container is '$state' $SettleSeconds s after start. Last output:"
+        (Invoke-Native docker logs --tail 30 $s.Name).Output -split "`r?`n" |
+            ForEach-Object { Write-Host "         $_" -ForegroundColor DarkGray }
+        $results += [pscustomobject]@{ component = $s.Name; status = 'exited'
+            detail = @{ reason = 'did not stay running'; state = "$state"; image = $image } }
+        $failed++; continue
+    }
+    Write-Ok "running ($SettleSeconds s after start)"
+    $results += [pscustomobject]@{ component = $s.Name; status = 'running'
+        detail = @{ image = $image; address = $s.Ip; network = $s.Network; configDir = $configDir
+                    note = 'running at this instant. Uptime is not stability - see the settle note in the report.' } }
+    $started++
+}
+
+# ---------------------------------------------------------------------------
+Write-Step 'Manifest'
+$manifest = Join-Path $workRoot "started-$role.json"
+if ($DryRun) {
+    Write-Skip "dry run - $manifest not written"
+} else {
+    $summary = @{}
+    foreach ($r in $results) {
+        if ($summary.ContainsKey($r.status)) { $summary[$r.status]++ } else { $summary[$r.status] = 1 }
+    }
+    $doc = [ordered]@{
+        schemaVersion = '1.0'
+        hostRole      = $role
+        flow          = $flow
+        startedBy     = $script:ScriptVersion
+        startedAt     = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
+        items         = $results
+        summary       = $summary
+    }
+    $dir = Split-Path -Parent $manifest
+    if (-not (Test-Path $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
+    $doc | ConvertTo-Json -Depth 8 | Set-Content -Path $manifest -Encoding UTF8
+    Write-Ok "wrote $manifest"
+}
+
+Write-Host ''
+Write-Host "  started: $started"
+Write-Host "  failed:  $failed"
+
+if ($failed -gt 0) { exit 1 }
+exit 0

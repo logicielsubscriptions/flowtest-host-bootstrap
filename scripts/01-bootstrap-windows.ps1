@@ -77,7 +77,7 @@ $ErrorActionPreference = 'Stop'
 
 # Printed first, every run. See the note in 02-prereq-windows.ps1: without this
 # a stale fetch is invisible, and a retest can silently re-run old code.
-$ScriptVersion = '2026-09-21.1-pathspec-and-evidence'
+$ScriptVersion = '2026-09-22.1-phase0-start'
 Write-Host "bootstrap script version $ScriptVersion"
 
 if (-not $ReadyMarker) { $ReadyMarker = Join-Path $Root 'READY' }
@@ -111,7 +111,7 @@ try {
     if (-not $prereq) { throw '02-prereq-windows.ps1 not found under the tooling archive' }
     Write-Host "running $($prereq.FullName)"
 
-    # COPY THE STAGING SCRIPT TO A STABLE PATH.
+    # COPY THE HOST-SIDE SCRIPTS TO A STABLE PATH.
     #
     # The tarball extracts into a directory whose name carries the bootstrap
     # commit sha, so nothing may reference a path inside it - the next commit
@@ -124,15 +124,21 @@ try {
     # not fatal: staging is a separate stage, and an older bootstrap repo simply
     # will not carry the script - which the pipeline reports rather than
     # crashing on.
-    $stager = Get-ChildItem -Path $Root -Recurse -Filter '04-stage-artifacts.ps1' -ErrorAction SilentlyContinue |
-              Select-Object -First 1
-    $stableStager = Join-Path $Root '04-stage-artifacts.ps1'
-    if ($stager -and $stager.FullName -ne $stableStager) {
-        Copy-Item -LiteralPath $stager.FullName -Destination $stableStager -Force
-        Write-Host "staged artifact script -> $stableStager"
-    }
-    elseif (-not $stager) {
-        Write-Host 'note: 04-stage-artifacts.ps1 not in this tooling archive; the Stage artifacts step will report it missing'
+    # A LIST, not one file. Staging was the only host-side script the pipeline
+    # invoked by path; starting the engines added two more, and run-engine.ps1
+    # has to land beside its driver because the driver looks for it next to
+    # itself rather than reimplementing the start sequence.
+    foreach ($wanted in @('04-stage-artifacts.ps1', '05-start-engines.ps1', 'run-engine.ps1')) {
+        $found = Get-ChildItem -Path $Root -Recurse -Filter $wanted -ErrorAction SilentlyContinue |
+                 Select-Object -First 1
+        $stable = Join-Path $Root $wanted
+        if ($found -and $found.FullName -ne $stable) {
+            Copy-Item -LiteralPath $found.FullName -Destination $stable -Force
+            Write-Host "$wanted -> $stable"
+        }
+        elseif (-not $found) {
+            Write-Host "note: $wanted not in this tooling archive; the stage that invokes it will report it missing"
+        }
     }
 
     # Tee the child's output to its OWN log. Start-Transcript records the calling
