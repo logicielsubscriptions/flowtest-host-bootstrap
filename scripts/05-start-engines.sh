@@ -36,7 +36,7 @@
 #
 set -uo pipefail
 
-SCRIPT_VERSION='2026-09-22.9-host-only-config-from-secrets'
+SCRIPT_VERSION='2026-09-22.10-ssl-off-declared-deviation'
 
 PLAN=''
 ONLY=''

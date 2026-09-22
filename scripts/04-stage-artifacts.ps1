@@ -108,7 +108,7 @@ trap {
 
 # Printed first, every run. Without it a stale fetch is invisible and a retest
 # can silently re-run old code while looking like a fresh result.
-$script:ScriptVersion = '2026-09-22.9-host-only-config-from-secrets'
+$script:ScriptVersion = '2026-09-22.10-ssl-off-declared-deviation'
 
 function Write-Step { param([string] $Message) Write-Host "`n=== $Message ===" -ForegroundColor Cyan }
 function Write-Ok   { param([string] $Message) Write-Host "  [ok]   $Message" -ForegroundColor Green }
@@ -389,6 +389,137 @@ function Get-MissingConfigReferences {
         }
     }
     return @($out | Sort-Object)
+}
+
+function Set-IniValues {
+    <#  Section-scoped INI edit that survives a Windows-authored file.
+
+        CRLF must be preserved, section and key matching is case-insensitive,
+        and a key already present is REPLACED IN PLACE rather than appended -
+        two copies of the same key leaves the engine reading whichever its
+        parser prefers. Returns the list of changes actually made; an empty
+        list means the file already said what the override wants, which is not
+        a deviation at all. Mirrors INI_SET in the .sh. #>
+    param([Parameter(Mandatory)][string] $Path,
+          [Parameter(Mandatory)][string] $Section,
+          [Parameter(Mandatory)][hashtable] $Set,
+          [bool] $CreateSectionIfAbsent = $true)
+
+    $raw = [System.IO.File]::ReadAllText($Path)
+    $crlf = $raw.Contains("`r`n")
+    $lines = [System.Collections.Generic.List[string]]@($raw -split "`n")
+    $want = @{}
+    foreach ($k in $Set.Keys) { $want[$k.ToLowerInvariant()] = @($k, [string]$Set[$k]) }
+
+    $changes = @(); $seen = @{}; $cur = $null
+    $out = [System.Collections.Generic.List[string]]::new()
+    $insertAt = -1
+    foreach ($line in $lines) {
+        $bare = $line.TrimEnd("`r")
+        $t = $bare.Trim()
+        if ($t.StartsWith('[') -and $t.EndsWith(']')) {
+            if ($cur -eq $Section.ToLowerInvariant() -and $insertAt -lt 0) { $insertAt = $out.Count }
+            $cur = $t.Substring(1, $t.Length - 2).Trim().ToLowerInvariant()
+        } elseif ($cur -eq $Section.ToLowerInvariant() -and $bare.Contains('=') -and
+                  -not ($t.StartsWith(';') -or $t.StartsWith('#'))) {
+            $key = $bare.Split('=', 2)[0].Trim()
+            $lk = $key.ToLowerInvariant()
+            if ($want.ContainsKey($lk)) {
+                $old = $bare.Split('=', 2)[1].Trim()
+                $new = $want[$lk][1]
+                $seen[$lk] = $true
+                if ($old -ne $new) {
+                    $changes += [pscustomobject]@{ key = $key; from = $old; to = $new }
+                    $out.Add("$key=$new" + $(if ($line.EndsWith("`r")) { "`r" } else { '' }))
+                    continue
+                }
+            }
+        }
+        $out.Add($line)
+    }
+    if ($cur -eq $Section.ToLowerInvariant() -and $insertAt -lt 0) { $insertAt = $out.Count }
+
+    $missing = @($want.Keys | Where-Object { -not $seen.ContainsKey($_) })
+    if ($missing.Count -gt 0) {
+        if ($insertAt -lt 0) {
+            if (-not $CreateSectionIfAbsent) {
+                return [pscustomobject]@{ error = "section [$Section] not present and createSectionIfAbsent is false" }
+            }
+            while ($out.Count -gt 0 -and -not $out[$out.Count - 1].Trim()) { $out.RemoveAt($out.Count - 1) }
+            $out.Add("[$Section]")
+            $insertAt = $out.Count
+        }
+        while ($insertAt -gt 0 -and -not $out[$insertAt - 1].Trim()) { $insertAt-- }
+        $add = @()
+        foreach ($lk in $missing) {
+            $k = $want[$lk][0]; $v = $want[$lk][1]
+            $changes += [pscustomobject]@{ key = $k; from = $null; to = $v }
+            $add += "$k=$v"
+        }
+        $out.InsertRange($insertAt, [string[]]$add)
+    }
+    while ($out.Count -gt 0 -and -not $out[$out.Count - 1].Trim()) { $out.RemoveAt($out.Count - 1) }
+    $out.Add('')
+    if ($changes.Count -gt 0) {
+        $text = ($out -join "`n")
+        if ($crlf) { $text = ($text -replace "`r`n", "`n") -replace "`n", "`r`n" }
+        [System.IO.File]::WriteAllText($Path, $text, (New-Object System.Text.UTF8Encoding $false))
+    }
+    return [pscustomobject]@{ changes = $changes }
+}
+
+function Invoke-ConfigOverrides {
+    <#  APPLY THE DECLARED DEVIATIONS FROM PRODUCTION CONFIGURATION.
+
+        Everything else here replays production configuration UNCHANGED, so an
+        override is the one thing that deliberately makes the staged tree
+        differ. Plan-driven, and every change is recorded with its before and
+        after value: a run that applied one is not configuration-faithful to
+        production and must not be described as such.
+
+        Applied to the STAGED tree, before the copy into the container, so the
+        read-back in run-engine.ps1 keeps comparing like with like. Mirrors
+        apply_config_overrides in the .sh. #>
+    param([Parameter(Mandatory)][string] $Dir, [Parameter(Mandatory)][string] $Component)
+    $svc = @($plan.groups.services | Where-Object { $_.containerName -eq $Component })[0]
+    $entries = @($svc.configOverrides)
+    $applied = @()
+    foreach ($e in $entries) {
+        if (-not $e) { continue }
+        if ($e.format -and $e.format -ne 'ini') {
+            Write-Warn "${Component}: override format '$($e.format)' is not implemented - NOT applied"
+            continue
+        }
+        $target = Join-Path $Dir $e.file
+        if (-not (Test-Path -LiteralPath $target)) {
+            # NOT created. A rule that invents a file the codebase does not
+            # read is worse than one that does nothing: it looks applied.
+            Write-Warn "${Component}: override targets $($e.file), which is not in the staged tree - NOT applied"
+            $applied += @{ file = $e.file; applied = $false; reason = 'file not present in the staged tree' }
+            continue
+        }
+        $set = @{}
+        foreach ($prop in $e.set.PSObject.Properties) { $set[$prop.Name] = [string]$prop.Value }
+        $res = Set-IniValues -Path $target -Section $e.section -Set $set `
+                 -CreateSectionIfAbsent ([bool]$e.createSectionIfAbsent)
+        if ($res.error) {
+            Write-Warn "${Component}: override of $($e.file) not applied: $($res.error)"
+            $applied += @{ file = $e.file; applied = $false; reason = $res.error }
+            continue
+        }
+        if (@($res.changes).Count -gt 0) {
+            Write-Warn "${Component}: DECLARED DEVIATION applied to $($e.file) [$($e.section)]:"
+            foreach ($c in $res.changes) {
+                $from = if ($null -eq $c.from) { '<absent>' } else { $c.from }
+                Write-Warn "         $($c.key): $from -> $($c.to)"
+            }
+        } else {
+            Write-Ok "${Component}: $($e.file) [$($e.section)] already matches the declared override"
+        }
+        $applied += @{ file = $e.file; section = $e.section; applied = $true
+                       changes = @($res.changes); reason = $e.reason; authority = $e.authority }
+    }
+    return @($applied)
 }
 
 function Get-HostOnlySecretName {
@@ -981,6 +1112,12 @@ function Stage-Config {
                 $files = @(Get-ChildItem -LiteralPath $dest -File -Recurse).Count
                 $subdirs = @(Get-ChildItem -LiteralPath $dest -Directory -Recurse).Count
             }
+            # DECLARED DEVIATIONS FIRST. An override can remove the very
+            # dependency the reference scan is about to complain about, so
+            # scanning first would report a gap that no longer matters.
+            $overrides = @()
+            if ($files -gt 0 -and -not $DryRun) { $overrides = @(Invoke-ConfigOverrides -Dir $dest -Component $Name) }
+
             $missingRefs = @()
             if ($files -gt 0 -and -not $DryRun) {
                 $missingRefs = @(Get-MissingConfigReferences -Dir $dest)
@@ -1007,6 +1144,9 @@ function Stage-Config {
                 source = 'git-serverconfigs'; repo = $cs.gitRepo; branch = $cs.gitBranch
                 path = $cs.gitPath; files = $files; subdirectories = $subdirs; dest = $dest
                 referencedButMissing = $missingRefs
+                configOverrides = $overrides
+                productionFaithful = (@($overrides | Where-Object {
+                    $_.applied -and @($_.changes).Count -gt 0 }).Count -eq 0)
                 marketDate = $plan.marketDate
                 commit = $script:GitAsOfSha; commitDate = $script:GitAsOfDate
                 commitsAfterMarketDate = $script:GitAfterCount

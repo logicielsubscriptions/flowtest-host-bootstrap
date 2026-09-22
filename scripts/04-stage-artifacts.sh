@@ -55,7 +55,7 @@ set -euo pipefail
 
 # Printed first, every run. A stale fetch is otherwise invisible - see the note
 # in 02-prereq-windows.ps1.
-SCRIPT_VERSION='2026-09-22.9-host-only-config-from-secrets'
+SCRIPT_VERSION='2026-09-22.10-ssl-off-declared-deviation'
 
 PLAN_FILE="/opt/flowtest/bootstrap/flow-plan-linux.json"
 DRY_RUN=0
@@ -356,6 +356,143 @@ config_references_missing() {   # config_references_missing <staged-dir>
 # THE VALUE NEVER REACHES THE LOG. Only the destination path and the secret
 # NAME are printed, and the file is written under umask 077 because some of
 # this material is private keys.
+# ---------------------------------------------------------------------------
+# APPLY THE DECLARED DEVIATIONS FROM PRODUCTION CONFIGURATION.
+#
+# Everything else here exists to replay production configuration UNCHANGED, so
+# an override is the one thing in this script that deliberately makes the
+# staged tree differ from production. It is therefore plan-driven - the rule,
+# the reason and who authorised it all live in hosts-map.json and travel in the
+# plan - and every change it makes is recorded per component in the manifest,
+# with the before and after values. A run that applied one is not
+# configuration-faithful to production and must not be described as such.
+#
+# APPLIED TO THE STAGED TREE, BEFORE the copy into the container. The read-back
+# in 05-start-engines compares the container against the staged tree, so
+# editing the staged tree keeps that guard meaningful; editing during the copy
+# would make the two differ by design and blind it.
+#
+# INI EDITING IS NOT sed. The file comes from a Windows-authored repository, so
+# it has CRLF line endings that must survive; section and key matching is
+# case-insensitive; a key already present must be REPLACED in place rather than
+# appended, or the engine reads whichever one its parser happens to prefer.
+# python3 is already a hard requirement of this script.
+INI_SET='
+import io, json, os, sys
+path, section, pairs_json, create_section = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4] == "1"
+pairs = json.loads(pairs_json)
+raw = open(path, "rb").read().decode("utf-8", "surrogateescape")
+crlf = "\r\n" in raw
+lines = raw.split("\n")
+want = {k.lower(): (k, v) for k, v in pairs.items()}
+changes, seen, cur, out, insert_at = [], set(), None, [], None
+for i, line in enumerate(lines):
+    bare = line.rstrip("\r")
+    stripped = bare.strip()
+    if stripped.startswith("[") and stripped.endswith("]"):
+        if cur == section.lower() and insert_at is None:
+            insert_at = len(out)
+        cur = stripped[1:-1].strip().lower()
+    elif cur == section.lower() and "=" in bare and not stripped.startswith((";", "#")):
+        key = bare.split("=", 1)[0].strip()
+        if key.lower() in want:
+            old = bare.split("=", 1)[1].strip()
+            new = want[key.lower()][1]
+            seen.add(key.lower())
+            if old != new:
+                changes.append({"key": key, "from": old, "to": new})
+                out.append(key + "=" + new + ("\r" if line.endswith("\r") else ""))
+                continue
+    out.append(line)
+if cur == section.lower() and insert_at is None:
+    insert_at = len(out)
+missing = [(k, v) for lk, (k, v) in want.items() if lk not in seen]
+if missing:
+    if insert_at is None:
+        if not create_section:
+            print(json.dumps({"error": "section [%s] not present and createSectionIfAbsent is false" % section}))
+            sys.exit(0)
+        while out and out[-1].strip() == "":
+            out.pop()
+        out.append("[" + section + "]")
+        insert_at = len(out)
+    add = []
+    for k, v in missing:
+        changes.append({"key": k, "from": None, "to": v})
+        add.append(k + "=" + v)
+    # Back up over the blank lines that separate sections, so a new key lands
+    # with the ones it belongs to rather than adrift at the section boundary.
+    while insert_at > 0 and out[insert_at - 1].strip() == "":
+        insert_at -= 1
+    out[insert_at:insert_at] = add
+while out and out[-1].strip() == "":
+    out.pop()
+out.append("")
+text = "\n".join(out)
+if crlf:
+    text = text.replace("\r\n", "\n").replace("\n", "\r\n")
+if changes:
+    with open(path, "wb") as fh:
+        fh.write(text.encode("utf-8", "surrogateescape"))
+print(json.dumps({"changes": changes}))
+'
+
+apply_config_overrides() {   # apply_config_overrides <staged-dir> <component>
+  local dir="$1" name="$2" ovr entry file fmt section pairs create res err
+  ovr="$(jq -c --arg n "$name" \
+    '[.groups[].services[] | select(.containerName==$n)][0].configOverrides // []' "$PLAN_FILE" 2>/dev/null)"
+  [[ -n "$ovr" && "$ovr" != "null" && "$ovr" != "[]" ]] || { printf '[]'; return 0; }
+  local applied='[]'
+  while IFS= read -r entry; do
+    [[ -n "$entry" ]] || continue
+    file="$(printf '%s' "$entry"    | jq -r '.file')"
+    fmt="$(printf '%s' "$entry"     | jq -r '.format // "ini"')"
+    section="$(printf '%s' "$entry" | jq -r '.section // ""')"
+    pairs="$(printf '%s' "$entry"   | jq -c '.set // {}')"
+    create="$(printf '%s' "$entry"  | jq -r 'if (.createSectionIfAbsent // false) then "1" else "0" end')"
+    if [[ "$fmt" != "ini" ]]; then
+      warn "$name: override format '$fmt' is not implemented - NOT applied"
+      continue
+    fi
+    if [[ ! -f "$dir/$file" ]]; then
+      # NOT created. A rule that invents a file the codebase does not read is
+      # worse than one that does nothing, because it looks applied.
+      warn "$name: override targets $file, which is not in the staged tree - NOT applied"
+      applied="$(printf '%s' "$applied" | jq -c --arg f "$file" \
+        '. + [{file:$f, applied:false, reason:"file not present in the staged tree"}]')"
+      continue
+    fi
+    res="$(python3 -c "$INI_SET" "$dir/$file" "$section" "$pairs" "$create" 2>&1)" || {
+      fail "$name: override of $file failed: $res"
+      applied="$(printf '%s' "$applied" | jq -c --arg f "$file" --arg r "$res" \
+        '. + [{file:$f, applied:false, reason:$r}]')"
+      continue
+    }
+    err="$(printf '%s' "$res" | jq -r '.error // empty' 2>/dev/null)"
+    if [[ -n "$err" ]]; then
+      warn "$name: override of $file not applied: $err"
+      applied="$(printf '%s' "$applied" | jq -c --arg f "$file" --arg r "$err" \
+        '. + [{file:$f, applied:false, reason:$r}]')"
+      continue
+    fi
+    local nchanges
+    nchanges="$(printf '%s' "$res" | jq '.changes | length')"
+    if [[ "$nchanges" -gt 0 ]]; then
+      warn "$name: DECLARED DEVIATION applied to $file [$section]:"
+      printf '%s' "$res" | jq -r '.changes[] | "         " + .key + ": " + (.from // "<absent>") + " -> " + .to' >&2
+    else
+      ok "$name: $file [$section] already matches the declared override"
+    fi
+    applied="$(printf '%s' "$applied" | jq -c \
+      --arg f "$file" --arg s "$section" \
+      --argjson ch "$(printf '%s' "$res" | jq -c '.changes')" \
+      --arg why "$(printf '%s' "$entry" | jq -r '.reason // ""')" \
+      --arg who "$(printf '%s' "$entry" | jq -r '.authority // ""')" \
+      '. + [{file:$f, section:$s, applied:true, changes:$ch, reason:$why, authority:$who}]')"
+  done < <(printf '%s' "$ovr" | jq -c '.[]')
+  printf '%s' "$applied"
+}
+
 hostonly_secret_name() {   # hostonly_secret_name <prefix> <serviceName> <relpath>
   local prefix="$1" svc="$2" rel="$3" slug
   slug="$(printf '%s' "$rel" | tr 'A-Z' 'a-z' | tr './' '--' | sed 's/--*/-/g; s/^-//; s/-$//')"
@@ -840,6 +977,16 @@ stage_config() {
         count="$(find "$dest" -type f 2>/dev/null | wc -l | tr -d ' ')"
         subdirs="$(find "$dest" -mindepth 1 -type d 2>/dev/null | wc -l | tr -d ' ')"
       fi
+      # DECLARED DEVIATIONS FIRST. An override can remove the very dependency
+      # the reference scan is about to complain about - turning SSL off makes
+      # the certificate paths in the config dead text - so applying it after
+      # the scan would report a gap that no longer matters and send someone to
+      # create a secret nothing reads.
+      local overrides='[]'
+      if [[ "$count" -gt 0 && $DRY_RUN -eq 0 ]]; then
+        overrides="$(apply_config_overrides "$dest" "$name")"
+      fi
+
       # WHAT DOES THE CONFIG ASK FOR THAT WE DID NOT STAGE?
       local missing_refs=''
       if [[ "$count" -gt 0 && $DRY_RUN -eq 0 ]]; then
@@ -874,9 +1021,11 @@ stage_config() {
                 --arg sha "${GIT_ASOF_SHA:-}" --arg cd "${GIT_ASOF_DATE:-}" \
                 --argjson after "${GIT_AFTER_COUNT:-null}" --arg m "$MARKET_DATE" \
                 --argjson sd "${subdirs:-0}" \
-                --arg mr "$missing_refs" \
+                --arg mr "$missing_refs" --argjson ov "${overrides:-[]}" \
                 '{source:"git-serverconfigs", repo:$r, branch:$b, path:$p, files:$c,
                   subdirectories:$sd, dest:$d,
+                  configOverrides:$ov,
+                  productionFaithful:(($ov | map(select(.applied and ((.changes // []) | length) > 0)) | length) == 0),
                   marketDate:$m, commit:$sha, commitDate:$cd, commitsAfterMarketDate:$after,
                   resolution:"the last commit at or before the market date, not branch HEAD",
                   referencedButMissing:($mr | split("\n") | map(select(length>0))),
