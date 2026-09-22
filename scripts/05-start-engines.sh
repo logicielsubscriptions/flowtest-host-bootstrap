@@ -36,7 +36,7 @@
 #
 set -uo pipefail
 
-SCRIPT_VERSION='2026-09-22.1-phase0-start'
+SCRIPT_VERSION='2026-09-22.2-deploy-visibility'
 
 PLAN=''
 ONLY=''
@@ -73,7 +73,11 @@ command -v jq >/dev/null     || die 'jq not found'
 command -v docker >/dev/null || die 'docker not found'
 command -v aws >/dev/null    || die 'aws not found'
 
-PLAN="${PLAN:-/opt/flowtest/flow-plan-linux.json}"
+# THE PLAN LIVES UNDER bootstrap/, NOT AT THE WORK ROOT. This defaulted to
+# /opt/flowtest/flow-plan-linux.json and build 98 failed on both hosts with
+# "flow plan not found" - one level off, in a path 04-stage-artifacts.sh has had
+# right all along. verify-all.sh now asserts the two agree.
+PLAN="${PLAN:-/opt/flowtest/bootstrap/flow-plan-linux.json}"
 [[ -f "$PLAN" ]] || die "flow plan not found at $PLAN"
 
 ROLE="$(jq -r '.hostRole' "$PLAN")"

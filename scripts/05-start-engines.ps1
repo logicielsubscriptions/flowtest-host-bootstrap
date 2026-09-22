@@ -43,7 +43,7 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
-$script:ScriptVersion = '2026-09-22.1-phase0-start'
+$script:ScriptVersion = '2026-09-22.2-deploy-visibility'
 Write-Host "  script version $script:ScriptVersion" -ForegroundColor DarkGray
 
 function Write-Step { param([string] $m) Write-Host ''; Write-Host "==> $m" -ForegroundColor Cyan }
@@ -76,7 +76,15 @@ trap {
 }
 
 # ---------------------------------------------------------------------------
-if (-not $Plan) { $Plan = 'C:\FlowTest\flow-plan-windows.json' }
+# THE PLAN LIVES UNDER bootstrap\, NOT AT THE WORK ROOT.
+#
+# This defaulted to C:\FlowTest\flow-plan-windows.json and build 98 failed on
+# both hosts with "flow plan not found" - one directory level off, in a path
+# 04-stage-artifacts.ps1 has had right since it was written. The two scripts
+# read the same file on the same host and each carried its own idea of where it
+# is; verify-all.sh now asserts they agree, because the next person to add a
+# host-side script will make the same guess.
+if (-not $Plan) { $Plan = 'C:\FlowTest\bootstrap\flow-plan-windows.json' }
 if (-not (Test-Path $Plan)) { Write-Fail "flow plan not found at $Plan"; exit 1 }
 
 $planObj    = Get-Content -Raw $Plan | ConvertFrom-Json
