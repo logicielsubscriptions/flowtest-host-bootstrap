@@ -36,7 +36,7 @@
 #
 set -uo pipefail
 
-SCRIPT_VERSION='2026-09-22.3-ecr-login'
+SCRIPT_VERSION='2026-09-22.4-linux-hub-args'
 
 PLAN=''
 ONLY=''
@@ -283,10 +283,15 @@ for line in "${SERVICES[@]}"; do
   sleep "$SETTLE_SECONDS"
   state="$(docker inspect -f '{{.State.Status}}' "$name" 2>/dev/null || echo unknown)"
   if [[ "$state" != "running" ]]; then
-    fail "$name: container is '$state' after ${SETTLE_SECONDS}s. Last output:"
+    # THE EXIT CODE, NOT JUST THE STATE. This family's production unit file
+    # carries SuccessExitStatus=11, so for this engine 11 is a NORMAL exit and
+    # 1 is a configuration error - a distinction "exited" erases entirely.
+    code="$(docker inspect -f '{{.State.ExitCode}}' "$name" 2>/dev/null || echo unknown)"
+    fail "$name: container is '$state' (exit $code) after ${SETTLE_SECONDS}s. Last output:"
     docker logs --tail 30 "$name" 2>&1 | sed 's/^/           /' >&2 || true
-    record "$name" 'exited' "$(jq -n --arg s "$state" --arg i "$image" \
-      '{reason:"did not stay running", state:$s, image:$i}')"
+    record "$name" 'exited' "$(jq -n --arg s "$state" --arg i "$image" --arg c "$code" \
+      '{reason:"did not stay running", state:$s, exitCode:$c, image:$i,
+        note:"this engine family treats exit 11 as a normal stop in production (SuccessExitStatus=11)"}')"
     failed=$((failed+1)); continue
   fi
   ok "running (${SETTLE_SECONDS}s after start)"

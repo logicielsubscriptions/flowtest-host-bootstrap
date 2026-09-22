@@ -43,7 +43,7 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
-$script:ScriptVersion = '2026-09-22.3-ecr-login'
+$script:ScriptVersion = '2026-09-22.4-linux-hub-args'
 Write-Host "  script version $script:ScriptVersion" -ForegroundColor DarkGray
 
 function Write-Step { param([string] $m) Write-Host ''; Write-Host "==> $m" -ForegroundColor Cyan }
@@ -281,11 +281,16 @@ foreach ($s in $services) {
     Start-Sleep -Seconds $SettleSeconds
     $state = (Invoke-Native docker @('inspect','-f','{{.State.Status}}',$s.Name)).Output
     if ($state -ne 'running') {
-        Write-Fail "$($s.Name): container is '$state' $SettleSeconds s after start. Last output:"
+        # THE EXIT CODE, NOT JUST THE STATE. The Linux hub's production unit file
+        # carries SuccessExitStatus=11, so an exit code can mean "stopped
+        # normally" for one family and "configuration error" for another -
+        # a distinction the word "exited" throws away.
+        $code = (Invoke-Native docker @('inspect','-f','{{.State.ExitCode}}',$s.Name)).Output
+        Write-Fail "$($s.Name): container is '$state' (exit $code) $SettleSeconds s after start. Last output:"
         (Invoke-Native docker @('logs','--tail','30',$s.Name)).Output -split "`r?`n" |
             ForEach-Object { Write-Host "         $_" -ForegroundColor DarkGray }
         $results += [pscustomobject]@{ component = $s.Name; status = 'exited'
-            detail = @{ reason = 'did not stay running'; state = "$state"; image = $image } }
+            detail = @{ reason = 'did not stay running'; state = "$state"; exitCode = "$code"; image = $image } }
         $failed++; continue
     }
     Write-Ok "running ($SettleSeconds s after start)"
