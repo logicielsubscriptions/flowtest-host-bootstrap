@@ -36,7 +36,7 @@
 #
 set -uo pipefail
 
-SCRIPT_VERSION='2026-09-22.6-redis-host-service'
+SCRIPT_VERSION='2026-09-22.7-redis-databases-and-config-readback'
 
 PLAN=''
 ONLY=''
@@ -169,25 +169,48 @@ fi
 # during start-up, so it has to exist before they do. A container can only
 # join a namespace that already exists, which is why the service that holds
 # the group's address is started here rather than by the loop below.
+#
+# THE PLAN CARRIES THE SERVICE'S OWN ARGUMENTS. Redis needs `--databases N`
+# because production raises it above the stock 16 and the engines SELECT an
+# index above that ceiling; build 107 died on "ERR DB index is out of range"
+# with a stock Redis. Encoded in the plan rather than here for the same reason
+# containerConfigTarget is: a start script that knows a service's arguments is
+# a second, invisible copy of the environment definition.
 mapfile -t HOSTSVC < <(jq -r '
   .groups[] | . as $g | (($g.hostServices // [])[])
   | [ .containerName, .image, .role,
-      ($g.dockerNetwork // ""), ($g.ip // "") ] | @tsv' "$PLAN")
+      ($g.dockerNetwork // ""), ($g.ip // ""),
+      ((.args // []) | join(" ")) ] | @tsv' "$PLAN")
 
 if [[ ${#HOSTSVC[@]} -gt 0 && $DRY_RUN -eq 0 ]]; then
   step "Host services (${#HOSTSVC[@]})"
-  while IFS=$'\t' read -r hname himage hrole hnet hip; do
+  while IFS=$'\t' read -r hname himage hrole hnet hip hargs; do
+    # Deliberate word splitting: the plan's args are individual flags and
+    # values, and each has to arrive as its own argv entry.
+    # shellcheck disable=SC2206
+    hargv=( $hargs )
     if docker ps --format '{{.Names}}' | grep -qx "$hname"; then
-      ok "$hname already running"
-      continue
+      # A SURVIVING CONTAINER IS NOT AUTOMATICALLY THE RIGHT ONE. Reusing a
+      # Redis started before the plan gained --databases is how build 107's
+      # fault would come back while the log said "already running".
+      running_cmd="$(docker inspect -f '{{range .Config.Cmd}}{{.}} {{end}}' "$hname" 2>/dev/null | xargs || true)"
+      if [[ "$running_cmd" == "$(printf '%s' "$hargs" | xargs || true)" ]]; then
+        ok "$hname already running with the plan's arguments"
+        continue
+      fi
+      warn "$hname is running with different arguments than the plan"
+      warn "       running: ${running_cmd:-<none>}"
+      warn "       plan:    ${hargs:-<none>}"
+      warn "       replacing it - a stale host service reproduces old faults silently"
     fi
     docker rm -f "$hname" >/dev/null 2>&1 || true
     # --restart unless-stopped: the engines depend on it for the life of the
     # environment, and a Redis that dies quietly would present as an engine
     # fault hours later.
     if hout="$(docker run -d --name "$hname" --restart unless-stopped \
-                 ${hnet:+--network "$hnet"} ${hip:+--ip "$hip"} "$himage" 2>&1)"; then
-      ok "$hrole $hname on ${hnet:-default}${hip:+ at $hip} ($himage)"
+                 ${hnet:+--network "$hnet"} ${hip:+--ip "$hip"} \
+                 "$himage" "${hargv[@]}" 2>&1)"; then
+      ok "$hrole $hname on ${hnet:-default}${hip:+ at $hip} ($himage)${hargs:+ [$hargs]}"
     else
       fail "$hrole $hname failed to start: $hout"
       fail "       The engines in this group reach it on loopback and will not work without it."
@@ -242,7 +265,13 @@ for line in "${SERVICES[@]}"; do
       '{reason:"no staged configuration directory; staging must run first", dir:$d}')"
     failed=$((failed+1)); continue
   fi
-  count="$(find "$config_dir" -maxdepth 1 -type f 2>/dev/null | wc -l | tr -d ' ')"
+  # RECURSIVE, because the tree is. Staging reported 15 files in 3
+  # subdirectories for one hub and this line reported 5, so the two
+  # halves of the same pipeline disagreed about what was staged while both
+  # printed a tick. The engine reads ./config/SSL/pem/cert.pem; a count that
+  # cannot see SSL/ cannot notice its absence.
+  count="$(find "$config_dir" -type f 2>/dev/null | wc -l | tr -d ' ')"
+  subdirs="$(find "$config_dir" -mindepth 1 -type d 2>/dev/null | wc -l | tr -d ' ')"
   if [[ "$count" -eq 0 ]]; then
     # An engine with no configuration does not fail; it runs on defaults and
     # looks like a configuration bug much later, somewhere else.
@@ -251,7 +280,7 @@ for line in "${SERVICES[@]}"; do
       '{reason:"staged configuration directory is empty", dir:$d}')"
     failed=$((failed+1)); continue
   fi
-  ok "$count config file(s) in $config_dir"
+  ok "$count config file(s) in $subdirs subdirectory(ies) under $config_dir"
 
   image="${REGISTRY}/${ECR_NAMESPACE}/${family}:${tag}"
 
@@ -317,6 +346,50 @@ for line in "${SERVICES[@]}"; do
   fi
   ok "$count file(s) copied to $target"
 
+  # READ IT BACK. "docker cp reported success" is not the same claim as "the
+  # files are where the engine looks", and the difference has cost this
+  # project two builds: once when the target was wrong and the copy created a
+  # stray directory, once when only the top level was staged and the SSL
+  # subtree was silently absent. `docker cp` OUT needs no shell in the image,
+  # so this works on engine images that have none.
+  #
+  # The comparison is deliberately against the staged tree rather than a fixed
+  # expectation: this catches a partial copy, a wrong target and a missing
+  # subtree, and stays correct as the configuration changes.
+  in_files=''; in_subdirs=''; readback='unavailable'
+  if tar_list="$(docker cp "${name}:${target}" - 2>/dev/null | tar -tf - 2>/dev/null)"; then
+    in_files="$(printf '%s\n' "$tar_list" | grep -cv '/$' || true)"
+    in_subdirs="$(printf '%s\n' "$tar_list" | grep -c '/$' || true)"
+    # The target directory itself appears in the stream as one entry.
+    in_subdirs=$(( in_subdirs > 0 ? in_subdirs - 1 : 0 ))
+    # The paths themselves, not just a count. An engine that says
+    # "./config/SSL/pem/cert.pem could not be opened" is answered by this list
+    # and by nothing else: it distinguishes "the copy dropped it" from "the
+    # configuration repository never held it" - and on a tree exported from
+    # Windows, from "the directory is there under a different case".
+    in_paths="$(printf '%s\n' "$tar_list" | grep -v '/$' | sed 's|^[^/]*/||' | sort | head -80)"
+    if [[ "$in_files" -eq "$count" ]]; then
+      readback='match'
+      ok "read back from the container: $in_files file(s), $in_subdirs subdirectory(ies) under $target"
+      printf '         %s\n' $(printf '%s\n' "$in_paths" | head -40) >&2
+    else
+      readback='mismatch'
+      fail "$name: the container holds $in_files file(s) under $target but $count were staged"
+      fail "       The engine would run on a partial configuration. Removing it."
+      docker rm -f "$name" >/dev/null 2>&1 || true
+      record "$name" 'failed' "$(jq -n --arg t "$target" \
+        --argjson staged "$count" --argjson found "$in_files" \
+        --arg p "$in_paths" \
+        '{stage:"verify-config", reason:"the configuration inside the container does not match what was staged",
+          target:$t, stagedFiles:$staged, filesInContainer:$found,
+          pathsInContainer:($p | split("\n") | map(select(length>0)))}')"
+      failed=$((failed+1)); continue
+    fi
+  else
+    # Not fatal - an image can refuse the read - but it must not read as proof.
+    warn "could not read $target back out of $name; this run cannot prove the engine sees the staged files"
+  fi
+
   if ! start_out="$(docker start "$name" 2>&1)"; then
     fail "$name: docker start failed"
     printf '         %s\n' "$start_out" >&2
@@ -337,13 +410,19 @@ for line in "${SERVICES[@]}"; do
     fail "$name: container is '$state' (exit $code) after ${SETTLE_SECONDS}s. Last output:"
     docker logs --tail 30 "$name" 2>&1 | sed 's/^/           /' >&2 || true
     record "$name" 'exited' "$(jq -n --arg s "$state" --arg i "$image" --arg c "$code" \
+      --arg rb "$readback" --arg p "${in_paths:-}" \
       '{reason:"did not stay running", state:$s, exitCode:$c, image:$i,
+        configReadback:$rb,
+        configInContainer:($p | split("\n") | map(select(length>0))),
         note:"this engine family treats exit 11 as a normal stop in production (SuccessExitStatus=11)"}')"
     failed=$((failed+1)); continue
   fi
   ok "running (${SETTLE_SECONDS}s after start)"
   record "$name" 'running' "$(jq -n --arg i "$image" --arg ip "$ip" --arg n "$net" --arg c "$config_dir" --arg tg "$target" \
+    --arg rb "$readback" --arg p "${in_paths:-}" \
     '{image:$i, address:$ip, network:$n, configDir:$c, containerConfigTarget:$tg,
+      configReadback:$rb,
+      configInContainer:($p | split("\n") | map(select(length>0))),
       note:"running at this instant. Uptime is not stability - see the settle note in the report."}')"
   started=$((started+1))
 done

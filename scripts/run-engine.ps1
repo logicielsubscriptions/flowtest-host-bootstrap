@@ -64,7 +64,7 @@ $ErrorActionPreference = 'Stop'
 # Printed on every run. See the note in scripts/02-prereq-windows.ps1: without a
 # version in the output a stale fetch is invisible, and a retest can silently
 # re-run old code while looking like a fresh result.
-$ScriptVersion = '2026-09-22.6-redis-host-service'
+$ScriptVersion = '2026-09-22.7-redis-databases-and-config-readback'
 Write-Host "  script version $ScriptVersion" -ForegroundColor DarkGray
 
 function Write-Step { param([string] $m) Write-Host ''; Write-Host "==> $m" -ForegroundColor Cyan }
@@ -149,6 +149,47 @@ if ($cp.ExitCode -ne 0) {
     throw "docker cp failed for $Name - the container has been removed so it cannot start unconfigured"
 }
 Write-Ok "$($configFiles.Count) file(s) copied next to the binary"
+
+# READ IT BACK, because "docker cp returned 0" and "the engine can see these
+# files" are different claims. On the Linux side the gap between them cost two
+# builds - once a wrong target that produced a stray directory, once a copy
+# that dropped a whole subtree - and in both the log said the configuration was
+# in place. `docker cp` OUT needs no shell inside the image, so this works even
+# on an engine image that has none. The Windows EngineHome is still UNCONFIRMED
+# (see CONTAINER_CONFIG_TARGET in the generator); this is the check that will
+# confirm or refute it.
+#
+# NOTE ON THE MECHANISM: `docker cp <container>:<path> <dir>` copies OUT into a
+# real directory. The tar-stream form ("- " as the destination) is not used
+# here because PowerShell would have to capture binary on a pipeline that this
+# script treats as text.
+$script:ConfigReadback = 'unavailable'
+$script:ConfigInContainer = @()
+$readDir = Join-Path $env:TEMP "$Name-config-readback"
+Remove-Item $readDir -Recurse -Force -ErrorAction SilentlyContinue
+$null = New-Item -ItemType Directory -Path $readDir -Force
+$read = Invoke-Docker cp "${Name}:${target}" $readDir
+if ($read.ExitCode -eq 0) {
+    $back = @(Get-ChildItem -Path $readDir -File -Recurse -ErrorAction SilentlyContinue)
+    $prefix = [regex]::Escape($readDir) + '\\?'
+    $script:ConfigInContainer = @($back | ForEach-Object { ($_.FullName -replace $prefix, '') -replace '\\', '/' } | Sort-Object)
+    if ($back.Count -eq $configFiles.Count) {
+        $script:ConfigReadback = 'match'
+        Write-Ok "read back from the container: $($back.Count) file(s) under $target"
+        $script:ConfigInContainer | Select-Object -First 40 | ForEach-Object { Write-Host "         $_" }
+    } else {
+        $script:ConfigReadback = 'mismatch'
+        $found = $back.Count
+        Remove-Item $readDir -Recurse -Force -ErrorAction SilentlyContinue
+        $null = Invoke-Docker rm -f $Name
+        throw ("$Name holds $found file(s) under $target but $($configFiles.Count) were staged. " +
+               'The container has been removed rather than run on a partial configuration.')
+    }
+}
+if ($script:ConfigReadback -eq 'unavailable') {
+    Write-Warn "could not read $target back out of $Name; this run cannot prove the engine sees the staged files"
+}
+Remove-Item $readDir -Recurse -Force -ErrorAction SilentlyContinue
 
 Write-Step "start $Name"
 $start = Invoke-Docker start $Name

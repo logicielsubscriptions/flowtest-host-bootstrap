@@ -78,7 +78,7 @@ Set-StrictMode -Version Latest
 # The same lesson as PIPELINE_VERSION in Jenkinsfile-generate-cfn, which was
 # itself once left un-bumped so a build reported a version that did not describe
 # the code it ran. Cheap marker, expensive absence.
-$script:ScriptVersion = '2026-09-22.6-redis-host-service'
+$script:ScriptVersion = '2026-09-22.7-redis-databases-and-config-readback'
 
 # ----------------------------- configuration -----------------------------
 
