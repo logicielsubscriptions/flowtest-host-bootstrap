@@ -108,7 +108,7 @@ trap {
 
 # Printed first, every run. Without it a stale fetch is invisible and a retest
 # can silently re-run old code while looking like a fresh result.
-$script:ScriptVersion = '2026-09-22.4-linux-hub-args'
+$script:ScriptVersion = '2026-09-22.6-redis-host-service'
 
 function Write-Step { param([string] $Message) Write-Host "`n=== $Message ===" -ForegroundColor Cyan }
 function Write-Ok   { param([string] $Message) Write-Host "  [ok]   $Message" -ForegroundColor Green }
@@ -800,7 +800,11 @@ function Stage-Config {
                 }
             }
             Write-Ok "${Name}: snapshot $($resolved.Key) (offset $($resolved.Offset)d from $($plan.marketDate), $snapVerdict)"
+            # Both initialised BEFORE the branch: under Set-StrictMode a
+            # variable that only exists on one path throws on the other, and
+            # the dry-run path never enters the copy below.
             $files = 0
+            $subdirs = 0
             if (-not $DryRun) {
                 New-Item -ItemType Directory -Path $dest -Force | Out-Null
                 # Flat by construction: the snapshot is non-recursive, and
@@ -858,15 +862,32 @@ function Stage-Config {
                     return
                 }
                 New-Item -ItemType Directory -Path $dest -Force | Out-Null
-                # Depth 1 only, matching the snapshot layout. Sub-folders are NOT
-                # flattened into the root: two same-named files in different
-                # folders would silently overwrite each other.
-                Get-ChildItem -LiteralPath $src -File | Copy-Item -Destination $dest -Force
-                $files = @(Get-ChildItem -LiteralPath $dest -File).Count
+                # COPY THE TREE, PRESERVING STRUCTURE.
+                #
+                # This took depth 1 only. The reasoning - do not FLATTEN
+                # sub-folders into the root, because two same-named files in
+                # different folders would overwrite each other - was right, but
+                # it was implemented as "do not copy them at all", which is a
+                # different thing.
+                #
+                # The Linux hub proved the cost on 2026-09-22: its acceptor.cfg
+                # references ./config/SSL/pem/cert.pem, that subtree was never
+                # staged, the manifest counted the root files and said "staged",
+                # and the engine failed with "file could not be opened" only
+                # after the config was finally delivered to the right directory.
+                #
+                # Copying the CONTENTS recursively keeps root files at the root
+                # and subtrees at their own depth, so relative paths inside the
+                # configs resolve exactly as they do in production.
+                Copy-Item -Path (Join-Path $src '*') -Destination $dest -Recurse -Force
+                # Counted over the TREE. A top-level count would under-report
+                # precisely the files whose absence caused that failure.
+                $files = @(Get-ChildItem -LiteralPath $dest -File -Recurse).Count
+                $subdirs = @(Get-ChildItem -LiteralPath $dest -Directory -Recurse).Count
             }
             Add-Result $Name 'config' 'staged' @{
                 source = 'git-serverconfigs'; repo = $cs.gitRepo; branch = $cs.gitBranch
-                path = $cs.gitPath; files = $files; dest = $dest
+                path = $cs.gitPath; files = $files; subdirectories = $subdirs; dest = $dest
                 marketDate = $plan.marketDate
                 commit = $script:GitAsOfSha; commitDate = $script:GitAsOfDate
                 commitsAfterMarketDate = $script:GitAfterCount

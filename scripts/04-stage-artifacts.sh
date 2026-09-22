@@ -55,7 +55,7 @@ set -euo pipefail
 
 # Printed first, every run. A stale fetch is otherwise invisible - see the note
 # in 02-prereq-windows.ps1.
-SCRIPT_VERSION='2026-09-22.4-linux-hub-args'
+SCRIPT_VERSION='2026-09-22.6-redis-host-service'
 
 PLAN_FILE="/opt/flowtest/bootstrap/flow-plan-linux.json"
 DRY_RUN=0
@@ -700,11 +700,27 @@ stage_config() {
           warn "$name: no files directly in $gitpath; using its config/ subfolder. If that is the repo convention, put it in the plan's gitPath instead of relying on this fallback."
         fi
         if [[ -n "$used" ]]; then
-          # -maxdepth 1: config at the directory root, matching the snapshot
-          # layout and .staged.layout. Nested folders are NOT flattened into the
-          # root, because two files of the same name in different subfolders
-          # would silently overwrite each other.
-          find "$used" -maxdepth 1 -type f -exec cp {} "$dest/" \;
+          # COPY THE TREE, PRESERVING STRUCTURE. This was
+          #     find "$used" -maxdepth 1 -type f -exec cp {} "$dest/" \;
+          # and the reasoning was sound as far as it went: do NOT flatten nested
+          # folders into the root, because two same-named files in different
+          # subfolders would silently overwrite each other. But not flattening
+          # them and not copying them at all are different things, and this did
+          # the second.
+          #
+          # What it cost, on 2026-09-22: the FIX hub's own acceptor.cfg says
+          #     ServerCertificateFile=./config/SSL/pem/cert.pem
+          # The SSL/ subtree was never staged, the manifest counted the 5 root
+          # files and reported "staged", and the engine died with
+          #     ./config/SSL/pem/cert.pem file could not be opened
+          # only once the config was finally delivered to the right place. A
+          # silently incomplete copy that reports success is precisely what this
+          # script exists to prevent.
+          #
+          # cp -R of the CONTENTS keeps root files at the root and subtrees at
+          # their own relative depth, so every relative path inside the configs
+          # resolves exactly as it does in production. Nothing is flattened.
+          cp -R "$used/." "$dest/"
         elif [[ -d "$src" ]]; then
           warn "$name: $gitpath exists in $repo@$branch but holds no files at its root or in config/"
         else
@@ -712,8 +728,16 @@ stage_config() {
         fi
         rm -rf "$work"
       fi
-      local count=0
-      [[ $DRY_RUN -eq 0 ]] && count="$(find "$dest" -maxdepth 1 -type f 2>/dev/null | wc -l)"
+      local count=0 subdirs=0
+      # COUNT THE TREE, NOT THE TOP LEVEL. The copy above preserves
+      # subdirectories, so a top-level count would under-report exactly the
+      # files whose absence caused the 2026-09-22 failure - and "5 files"
+      # reading the same before and after the fix would hide whether the fix
+      # had worked.
+      if [[ $DRY_RUN -eq 0 ]]; then
+        count="$(find "$dest" -type f 2>/dev/null | wc -l | tr -d ' ')"
+        subdirs="$(find "$dest" -mindepth 1 -type d 2>/dev/null | wc -l | tr -d ' ')"
+      fi
       # ZERO FILES IS NOT 'staged'. This recorded 'staged' unconditionally - the
       # third place in this script that claimed success without looking at the
       # result, and the source of build 78's "staged: 1" for a component whose
@@ -723,7 +747,9 @@ stage_config() {
           "$(jq -n --arg r "$repo" --arg b "$branch" --arg p "$gitpath" --argjson c "$count" --arg d "$dest" \
                 --arg sha "${GIT_ASOF_SHA:-}" --arg cd "${GIT_ASOF_DATE:-}" \
                 --argjson after "${GIT_AFTER_COUNT:-null}" --arg m "$MARKET_DATE" \
-                '{source:"git-serverconfigs", repo:$r, branch:$b, path:$p, files:$c, dest:$d,
+                --argjson sd "${subdirs:-0}" \
+                '{source:"git-serverconfigs", repo:$r, branch:$b, path:$p, files:$c,
+                  subdirectories:$sd, dest:$d,
                   marketDate:$m, commit:$sha, commitDate:$cd, commitsAfterMarketDate:$after,
                   resolution:"the last commit at or before the market date, not branch HEAD",
                   unchangedSinceMarketDate:(if $after == null then null else $after == 0 end)}')"

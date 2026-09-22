@@ -43,7 +43,7 @@ set -euo pipefail
 # Printed first, every run. See the note in 02-prereq-windows.ps1: without a
 # version in the output a stale fetch is invisible, and a retest can silently
 # re-run old code while looking like a fresh result.
-SCRIPT_VERSION='2026-09-22.4-linux-hub-args'
+SCRIPT_VERSION='2026-09-22.6-redis-host-service'
 
 # --------------------------- configuration ---------------------------
 # Host-level constants only. Flow specifics come from the plan file.

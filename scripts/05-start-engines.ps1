@@ -43,7 +43,7 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
-$script:ScriptVersion = '2026-09-22.4-linux-hub-args'
+$script:ScriptVersion = '2026-09-22.6-redis-host-service'
 Write-Host "  script version $script:ScriptVersion" -ForegroundColor DarkGray
 
 function Write-Step { param([string] $m) Write-Host ''; Write-Host "==> $m" -ForegroundColor Cyan }
@@ -188,6 +188,10 @@ foreach ($group in @($planObj.groups)) {
             Shared    = [bool]$group.sharedNamespace
             IsFirst   = ($i -eq 0)
             Owner     = $svcList[0].containerName
+            # Where the staged config goes INSIDE the container. From the plan,
+            # never guessed here: the Linux driver hardcoded the wrong path and
+            # the engine silently ran the config baked into its image.
+            Target    = $svcList[$i].containerConfigTarget
         }
     }
 }
@@ -249,8 +253,19 @@ foreach ($s in $services) {
         $failed++; continue
     }
 
+    if (-not $s.Target) {
+        Write-Fail "$($s.Name): the plan carries no containerConfigTarget for image family '$($s.Family)'."
+        Write-Fail "         Refusing to guess - a wrong target means the engine silently runs its baked-in config."
+        $results += [pscustomobject]@{ component = $s.Name; status = 'refused'
+            detail = @{ reason = 'no containerConfigTarget in the plan for this image family'; imageFamily = $s.Family } }
+        $failed++; continue
+    }
+
     $image = "$registry/$EcrNamespace/$($s.Family):$($s.Tag)"
-    $engineArgs = @('-Name', $s.Name, '-Image', $image, '-ConfigDir', $configDir)
+    # -EngineHome is run-engine.ps1's copy target. Passing the plan's value
+    # makes the two agree by construction rather than by coincidence.
+    $engineArgs = @('-Name', $s.Name, '-Image', $image, '-ConfigDir', $configDir,
+                    '-EngineHome', $s.Target)
     if ($s.Shared -and -not $s.IsFirst) {
         $engineArgs += @('-NamespaceContainer', $s.Owner)
     } else {
@@ -296,6 +311,7 @@ foreach ($s in $services) {
     Write-Ok "running ($SettleSeconds s after start)"
     $results += [pscustomobject]@{ component = $s.Name; status = 'running'
         detail = @{ image = $image; address = $s.Ip; network = $s.Network; configDir = $configDir
+                    containerConfigTarget = $s.Target
                     note = 'running at this instant. Uptime is not stability - see the settle note in the report.' } }
     $started++
 }

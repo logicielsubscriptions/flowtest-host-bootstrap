@@ -36,7 +36,7 @@
 #
 set -uo pipefail
 
-SCRIPT_VERSION='2026-09-22.4-linux-hub-args'
+SCRIPT_VERSION='2026-09-22.6-redis-host-service'
 
 PLAN=''
 ONLY=''
@@ -129,9 +129,11 @@ fi
 # identity with it. Jq does the joining so the shell never has to track which
 # group it is in.
 #
-# firstInGroup marks the service that OWNS the network namespace when a group
-# shares one. See the note at the start-up loop: the plan's namespaceContainer
-# names a concept, not a container that exists.
+# The namespace holder comes from the plan. On a linux host that is the group's
+# Redis container, started above; on Windows it is still the first engine. Any
+# service whose name is not the holder joins it. This comment used to say
+# namespaceContainer "names a concept, not a container that exists" - true when
+# it was written, false since Redis became the holder.
 mapfile -t SERVICES < <(jq -r '
   .groups[]
   | . as $g
@@ -144,7 +146,8 @@ mapfile -t SERVICES < <(jq -r '
       ($g.ip // ""),
       (if $g.sharedNamespace then "shared" else "own" end),
       (if .key == 0 then "first" else "joins" end),
-      ($g.services[0].containerName)
+      ($g.namespaceContainer // $g.services[0].containerName),
+      (.value.containerConfigTarget // "")
     ] | @tsv' "$PLAN")
 
 [[ ${#SERVICES[@]} -gt 0 ]] || die 'the plan lists no services for this host'
@@ -160,12 +163,46 @@ if [[ -n "$ONLY" ]]; then
 fi
 
 # ---------------------------------------------------------------------------
+# HOST SERVICES FIRST, AND THEY HOLD THE NAMESPACE.
+#
+# Production runs Redis on this host and the engines reach it on loopback
+# during start-up, so it has to exist before they do. A container can only
+# join a namespace that already exists, which is why the service that holds
+# the group's address is started here rather than by the loop below.
+mapfile -t HOSTSVC < <(jq -r '
+  .groups[] | . as $g | (($g.hostServices // [])[])
+  | [ .containerName, .image, .role,
+      ($g.dockerNetwork // ""), ($g.ip // "") ] | @tsv' "$PLAN")
+
+if [[ ${#HOSTSVC[@]} -gt 0 && $DRY_RUN -eq 0 ]]; then
+  step "Host services (${#HOSTSVC[@]})"
+  while IFS=$'\t' read -r hname himage hrole hnet hip; do
+    if docker ps --format '{{.Names}}' | grep -qx "$hname"; then
+      ok "$hname already running"
+      continue
+    fi
+    docker rm -f "$hname" >/dev/null 2>&1 || true
+    # --restart unless-stopped: the engines depend on it for the life of the
+    # environment, and a Redis that dies quietly would present as an engine
+    # fault hours later.
+    if hout="$(docker run -d --name "$hname" --restart unless-stopped \
+                 ${hnet:+--network "$hnet"} ${hip:+--ip "$hip"} "$himage" 2>&1)"; then
+      ok "$hrole $hname on ${hnet:-default}${hip:+ at $hip} ($himage)"
+    else
+      fail "$hrole $hname failed to start: $hout"
+      fail "       The engines in this group reach it on loopback and will not work without it."
+      exit 1
+    fi
+  done < <(printf '%s\n' "${HOSTSVC[@]}")
+fi
+
+# ---------------------------------------------------------------------------
 step "Image availability (${#SERVICES[@]} component(s))"
 # CHECKED FOR EVERY COMPONENT BEFORE ANY CONTAINER IS CREATED. A missing tag
 # found half way through leaves some engines up and some not, which reads like
 # an engine crash rather than a registry gap.
 MISSING=()
-while IFS=$'\t' read -r name svc family tag _net _ip _shared _pos _owner; do
+while IFS=$'\t' read -r name svc family tag _net _ip _shared _pos _owner _tgt; do
   repo="${ECR_NAMESPACE}/${family}"
   if aws ecr describe-images --repository-name "$repo" \
         --image-ids "imageTag=$tag" --region "$REGION" >/dev/null 2>&1; then
@@ -195,7 +232,7 @@ record() {  # name, status, detail-json
 started=0; failed=0
 
 for line in "${SERVICES[@]}"; do
-  IFS=$'\t' read -r name svc family tag net ip shared pos owner <<<"$line"
+  IFS=$'\t' read -r name svc family tag net ip shared pos owner target <<<"$line"
   step "$name"
 
   config_dir="${CONFIG_ROOT}/${name}"
@@ -223,7 +260,7 @@ for line in "${SERVICES[@]}"; do
   # container:<x>' takes that container's address with it and docker rejects
   # --ip alongside it.
   net_args=()
-  if [[ "$shared" == "shared" && "$pos" == "joins" ]]; then
+  if [[ "$shared" == "shared" && "$owner" != "$name" ]]; then
     net_args=(--network "container:${owner}")
     ok "sharing the network namespace of $owner"
   elif [[ -n "$net" ]]; then
@@ -236,7 +273,7 @@ for line in "${SERVICES[@]}"; do
 
   if [[ $DRY_RUN -eq 1 ]]; then
     echo "         docker create --name $name ${net_args[*]} $image"
-    echo "         docker cp $config_dir/. ${name}:/engine/"
+    echo "         docker cp $config_dir/. ${name}:${target}/"
     echo "         docker start $name"
     record "$name" 'dry-run' "$(jq -n --arg i "$image" '{image:$i}')"
     continue
@@ -259,16 +296,26 @@ for line in "${SERVICES[@]}"; do
     failed=$((failed+1)); continue
   fi
 
-  # The engine home is a property of the image, not of the host. It is the same
-  # for every family we build, and build-images.sh is what fixes it.
-  if ! cp_out="$(docker cp "${config_dir}/." "${name}:/engine/" 2>&1)"; then
+  # THE TARGET COMES FROM THE PLAN. It used to be the literal "/engine/" here -
+  # Windows' engine home, on a Linux image whose engine runs from /opt/engine.
+  # docker cp created a stray /engine directory, this script printed "copied
+  # next to the binary", and the engine ran the configuration baked into the
+  # image. Nothing failed; it simply tested the wrong configuration.
+  if [[ -z "$target" ]]; then
+    fail "$name: the plan carries no containerConfigTarget for image family '$family'."
+    fail "       Refusing to guess: a wrong target means the engine silently runs its baked-in config."
+    record "$name" 'refused' "$(jq -n --arg f "$family" \
+      '{reason:"no containerConfigTarget in the plan for this image family", imageFamily:$f}')"
+    failed=$((failed+1)); continue
+  fi
+  if ! cp_out="$(docker cp "${config_dir}/." "${name}:${target}/" 2>&1)"; then
     fail "$name: docker cp failed - removing the container so it cannot start unconfigured"
     printf '         %s\n' "$cp_out" >&2
     docker rm -f "$name" >/dev/null 2>&1 || true
     record "$name" 'failed' "$(jq -n --arg r "$cp_out" '{stage:"copy-config", reason:$r}')"
     failed=$((failed+1)); continue
   fi
-  ok "$count file(s) copied next to the binary"
+  ok "$count file(s) copied to $target"
 
   if ! start_out="$(docker start "$name" 2>&1)"; then
     fail "$name: docker start failed"
@@ -295,8 +342,8 @@ for line in "${SERVICES[@]}"; do
     failed=$((failed+1)); continue
   fi
   ok "running (${SETTLE_SECONDS}s after start)"
-  record "$name" 'running' "$(jq -n --arg i "$image" --arg ip "$ip" --arg n "$net" --arg c "$config_dir" \
-    '{image:$i, address:$ip, network:$n, configDir:$c,
+  record "$name" 'running' "$(jq -n --arg i "$image" --arg ip "$ip" --arg n "$net" --arg c "$config_dir" --arg tg "$target" \
+    '{image:$i, address:$ip, network:$n, configDir:$c, containerConfigTarget:$tg,
       note:"running at this instant. Uptime is not stability - see the settle note in the report."}')"
   started=$((started+1))
 done
