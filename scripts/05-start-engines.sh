@@ -36,7 +36,7 @@
 #
 set -uo pipefail
 
-SCRIPT_VERSION='2026-09-22.7-redis-databases-and-config-readback'
+SCRIPT_VERSION='2026-09-22.9-host-only-config-from-secrets'
 
 PLAN=''
 ONLY=''

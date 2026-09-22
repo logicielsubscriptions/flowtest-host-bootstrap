@@ -55,7 +55,7 @@ set -euo pipefail
 
 # Printed first, every run. A stale fetch is otherwise invisible - see the note
 # in 02-prereq-windows.ps1.
-SCRIPT_VERSION='2026-09-22.7-redis-databases-and-config-readback'
+SCRIPT_VERSION='2026-09-22.9-host-only-config-from-secrets'
 
 PLAN_FILE="/opt/flowtest/bootstrap/flow-plan-linux.json"
 DRY_RUN=0
@@ -290,6 +290,108 @@ record() {   # record <component> <kind> <status> <detail-json>
   jq --arg c "$1" --arg k "$2" --arg s "$3" --argjson d "$4" \
      '. + [{component:$c, kind:$k, status:$s, detail:$d}]' "$RESULTS_JSON" > "$tmp"
   mv "$tmp" "$RESULTS_JSON"
+}
+
+# ---------------------------------------------------------------------------
+# WHAT THE CONFIGURATION ASKS FOR THAT THE CONFIGURATION REPOSITORY DOES NOT
+# CARRY.
+#
+# Builds 107 and 108 both died on
+#     Runtime error: ./config/SSL/pem/cert.pem file could not be opened
+# roughly twenty minutes into a run, with a message that says nothing about
+# where cert.pem was supposed to come from. Every earlier step had reported
+# success, correctly: the files that exist were staged, copied and verified.
+# The gap was that a config file NAMED a path nobody had checked for.
+#
+# So: read the staged text configs, pull out anything that looks like a
+# relative path to a file, and say which of them are not in the staged tree.
+# The engine's working directory is its home and the staged tree lands in
+# <home>/config, so a leading "./config/" or "config/" is stripped before the
+# lookup - that is the form these engines use.
+#
+# THIS IS A WARNING, NOT A FAILURE, and deliberately so. A config legitimately
+# names files it will CREATE (logs, stores, sequence files), and refusing to
+# stage on those would block every run. The value is in naming the missing
+# path at the point where someone can act on it, twenty minutes earlier and
+# with the referring file attached.
+config_references_missing() {   # config_references_missing <staged-dir>
+  local dir="$1" f rel ref
+  [[ -d "$dir" ]] || return 0
+  while IFS= read -r f; do
+    # Text configs only. Reading a .pem or a binary store for "paths" produces
+    # noise, and noise in a warning is how warnings stop being read.
+    case "${f,,}" in
+      *.cfg|*.ini|*.json|*.xml|*.conf|*.properties) ;;
+      *) continue ;;
+    esac
+    # Candidate paths: at least one directory separator, a plausible file
+    # extension, and no whitespace. Anchoring on the extension keeps hostnames,
+    # URLs and FIX tags out.
+    grep -oE '[./A-Za-z0-9_-]+/[./A-Za-z0-9_-]+\.(pem|crt|key|cer|xml|cfg|ini|txt|dat|json|conf)' "$f" 2>/dev/null \
+    | while IFS= read -r ref; do
+        rel="${ref#./}"
+        rel="${rel#config/}"
+        [[ -n "$rel" ]] || continue
+        if [[ ! -e "$dir/$rel" ]]; then
+          printf '%s -> %s (not staged)\n' "$(basename "$f")" "$ref"
+        fi
+      done
+  done < <(find "$dir" -type f 2>/dev/null) | sort -u
+}
+
+# ---------------------------------------------------------------------------
+# FETCH THE FILES THAT EXIST ONLY ON THE PRODUCTION HOST.
+#
+# A flow-test account cannot read a production host, so material that is not in
+# the configuration repository - the SSL/pem tree, confirmed after build 108 -
+# has to be placed once in Secrets Manager by someone with production access.
+# This fetches it into the staged tree alongside the git-tracked files, using
+# the naming rule the plan carries.
+#
+# NOT AN ERROR WHEN A SECRET IS ABSENT. A config also names files it will
+# CREATE at run time, and those will never have a secret. What this must do is
+# say, precisely, which secret to create - so the gap is a five-minute task for
+# whoever has production access rather than a twenty-minute rediscovery.
+#
+# THE VALUE NEVER REACHES THE LOG. Only the destination path and the secret
+# NAME are printed, and the file is written under umask 077 because some of
+# this material is private keys.
+hostonly_secret_name() {   # hostonly_secret_name <prefix> <serviceName> <relpath>
+  local prefix="$1" svc="$2" rel="$3" slug
+  slug="$(printf '%s' "$rel" | tr 'A-Z' 'a-z' | tr './' '--' | sed 's/--*/-/g; s/^-//; s/-$//')"
+  printf '%s/%s/%s' "$prefix" "$(printf '%s' "$svc" | tr 'A-Z' 'a-z')" "$slug"
+}
+
+fetch_host_only_config() {   # fetch_host_only_config <staged-dir> <serviceName> <missing-refs>
+  local dir="$1" svc="$2" refs="$3"
+  local prefix max enabled n=0 ref rel secret tmp
+  enabled="$(jq -r '.staged.hostOnlyConfig.enabled // false' "$PLAN_FILE" 2>/dev/null)"
+  [[ "$enabled" == "true" ]] || return 0
+  prefix="$(jq -r '.staged.hostOnlyConfig.secretPrefix // ""' "$PLAN_FILE" 2>/dev/null)"
+  max="$(jq -r '.staged.hostOnlyConfig.maxLookupsPerComponent // 20' "$PLAN_FILE" 2>/dev/null)"
+  [[ -n "$prefix" ]] || return 0
+  while IFS= read -r ref; do
+    [[ -n "$ref" ]] || continue
+    n=$((n+1)); [[ "$n" -le "$max" ]] || { warn "       (stopping after $max lookups)"; break; }
+    # The line is "<referring file> -> <path> (not staged)"; take the path.
+    rel="${ref#* -> }"; rel="${rel% (not staged)}"
+    rel="${rel#./}"; rel="${rel#config/}"
+    secret="$(hostonly_secret_name "$prefix" "$svc" "$rel")"
+    tmp="$(mktemp)"
+    # --query/--output text keeps the value off the command line and out of any
+    # shell trace; the redirect keeps it out of the build log.
+    if ( umask 077; aws secretsmanager get-secret-value --secret-id "$secret" \
+           --query SecretString --output text > "$tmp" 2>/dev/null ) \
+       && [[ -s "$tmp" ]] && [[ "$(head -c 4 "$tmp")" != "None" ]]; then
+      ( umask 077; mkdir -p "$(dirname "$dir/$rel")" && mv "$tmp" "$dir/$rel" )
+      chmod 600 "$dir/$rel" 2>/dev/null || true
+      ok "$svc: $rel supplied from Secrets Manager ($secret)"
+    else
+      rm -f "$tmp"
+      warn "$svc: $rel is neither in the config repository nor in Secrets Manager."
+      warn "         Create it with:  aws secretsmanager create-secret --name $secret --secret-string file://<the file from the production host>"
+    fi
+  done <<< "$refs"
 }
 
 # Did this component's configuration change between the snapshot date and the
@@ -738,6 +840,30 @@ stage_config() {
         count="$(find "$dest" -type f 2>/dev/null | wc -l | tr -d ' ')"
         subdirs="$(find "$dest" -mindepth 1 -type d 2>/dev/null | wc -l | tr -d ' ')"
       fi
+      # WHAT DOES THE CONFIG ASK FOR THAT WE DID NOT STAGE?
+      local missing_refs=''
+      if [[ "$count" -gt 0 && $DRY_RUN -eq 0 ]]; then
+        missing_refs="$(config_references_missing "$dest")"
+        if [[ -n "$missing_refs" ]]; then
+          warn "$name: the staged configuration NAMES file(s) that are not in the staged tree:"
+          while IFS= read -r m; do [[ -n "$m" ]] && warn "         $m"; done <<< "$missing_refs"
+          # Some of these live only on the production host. Try Secrets Manager
+          # before declaring the gap, then re-derive the list so the manifest
+          # records what is STILL missing rather than what was missing before
+          # we went and fetched half of it.
+          fetch_host_only_config "$dest" "$name" "$missing_refs"
+          missing_refs="$(config_references_missing "$dest")"
+          count="$(find "$dest" -type f 2>/dev/null | wc -l | tr -d ' ')"
+          subdirs="$(find "$dest" -mindepth 1 -type d 2>/dev/null | wc -l | tr -d ' ')"
+          if [[ -n "$missing_refs" ]]; then
+            warn "       Still missing after the Secrets Manager lookup. The engine will fail at"
+            warn "       start-up on the first one it needs, unless that leg of the flow is a cut"
+            warn "       edge whose configuration is stood in for."
+          else
+            ok "$name: every file the configuration names is now present"
+          fi
+        fi
+      fi
       # ZERO FILES IS NOT 'staged'. This recorded 'staged' unconditionally - the
       # third place in this script that claimed success without looking at the
       # result, and the source of build 78's "staged: 1" for a component whose
@@ -748,10 +874,12 @@ stage_config() {
                 --arg sha "${GIT_ASOF_SHA:-}" --arg cd "${GIT_ASOF_DATE:-}" \
                 --argjson after "${GIT_AFTER_COUNT:-null}" --arg m "$MARKET_DATE" \
                 --argjson sd "${subdirs:-0}" \
+                --arg mr "$missing_refs" \
                 '{source:"git-serverconfigs", repo:$r, branch:$b, path:$p, files:$c,
                   subdirectories:$sd, dest:$d,
                   marketDate:$m, commit:$sha, commitDate:$cd, commitsAfterMarketDate:$after,
                   resolution:"the last commit at or before the market date, not branch HEAD",
+                  referencedButMissing:($mr | split("\n") | map(select(length>0))),
                   unchangedSinceMarketDate:(if $after == null then null else $after == 0 end)}')"
       else
         record "$name" config failed \

@@ -108,7 +108,7 @@ trap {
 
 # Printed first, every run. Without it a stale fetch is invisible and a retest
 # can silently re-run old code while looking like a fresh result.
-$script:ScriptVersion = '2026-09-22.7-redis-databases-and-config-readback'
+$script:ScriptVersion = '2026-09-22.9-host-only-config-from-secrets'
 
 function Write-Step { param([string] $Message) Write-Host "`n=== $Message ===" -ForegroundColor Cyan }
 function Write-Ok   { param([string] $Message) Write-Host "  [ok]   $Message" -ForegroundColor Green }
@@ -347,6 +347,102 @@ function Add-Result {
     param([string] $Component, [string] $Kind, [string] $Status, [hashtable] $Detail)
     $script:Results.Add([pscustomobject]@{
         component = $Component; kind = $Kind; status = $Status; detail = $Detail })
+}
+
+function Get-MissingConfigReferences {
+    <#  WHAT THE CONFIGURATION ASKS FOR THAT THE CONFIGURATION REPOSITORY DOES
+        NOT CARRY.
+
+        Builds 107 and 108 both died roughly twenty minutes into a run on
+            Runtime error: ./config/SSL/pem/cert.pem file could not be opened
+        with a message that says nothing about where cert.pem should have come
+        from. Every earlier step had reported success, correctly: the files
+        that exist were staged, copied and verified. The gap was that a config
+        file NAMED a path nobody had checked for.
+
+        The engine's working directory is its home and the staged tree lands in
+        <home>\config, so a leading './config/' or 'config/' is stripped before
+        the lookup - that is the form these engines use.
+
+        A WARNING, NOT A FAILURE, deliberately: a config legitimately names
+        files it will CREATE (logs, stores, sequence files). The value is in
+        naming the missing path where someone can act on it, with the referring
+        file attached. Mirrors config_references_missing in the .sh. #>
+    param([Parameter(Mandatory)][string] $Dir)
+    if (-not (Test-Path -LiteralPath $Dir)) { return @() }
+    $textExt = @('.cfg', '.ini', '.json', '.xml', '.conf', '.properties')
+    $pattern = '[./A-Za-z0-9_-]+/[./A-Za-z0-9_-]+\.(pem|crt|key|cer|xml|cfg|ini|txt|dat|json|conf)'
+    $out = New-Object System.Collections.Generic.List[string]
+    foreach ($f in @(Get-ChildItem -LiteralPath $Dir -File -Recurse -ErrorAction SilentlyContinue)) {
+        if ($textExt -notcontains $f.Extension.ToLowerInvariant()) { continue }
+        $text = Get-Content -LiteralPath $f.FullName -Raw -ErrorAction SilentlyContinue
+        if (-not $text) { continue }
+        foreach ($m in [regex]::Matches($text, $pattern)) {
+            $ref = $m.Value
+            $rel = $ref -replace '^\./', '' -replace '^config/', ''
+            if (-not $rel) { continue }
+            $full = Join-Path $Dir ($rel -replace '/', '\')
+            if (-not (Test-Path -LiteralPath $full)) {
+                $line = "$($f.Name) -> $ref (not staged)"
+                if (-not $out.Contains($line)) { $out.Add($line) }
+            }
+        }
+    }
+    return @($out | Sort-Object)
+}
+
+function Get-HostOnlySecretName {
+    param([string] $Prefix, [string] $Component, [string] $RelPath)
+    $slug = ($RelPath.ToLowerInvariant() -replace '[./]', '-') -replace '-{2,}', '-'
+    return "$Prefix/$($Component.ToLowerInvariant())/$($slug.Trim('-'))"
+}
+
+function Invoke-HostOnlyConfigFetch {
+    <#  FETCH THE FILES THAT EXIST ONLY ON THE PRODUCTION HOST.
+
+        A flow-test account cannot read a production host, so material that is
+        not in the configuration repository - the SSL/pem tree, confirmed after
+        build 108 - has to be placed once in Secrets Manager by someone who has
+        production access. This fetches it into the staged tree alongside the
+        git-tracked files, using the naming rule the plan carries.
+
+        NOT AN ERROR WHEN A SECRET IS ABSENT: a config also names files it will
+        CREATE at run time. What this must do is say precisely which secret to
+        create. THE VALUE NEVER REACHES THE LOG - only the path and the secret
+        NAME are printed. Mirrors fetch_host_only_config in the .sh. #>
+    param([Parameter(Mandatory)][string] $Dir,
+          [Parameter(Mandatory)][string] $Component,
+          [string[]] $MissingRefs = @())
+    # $plan is the script-scope plan object read at start-up, the same way
+    # Get-ConfigAsOfMarketDate reads $plan.marketDate.
+    $hoc = $plan.staged.hostOnlyConfig
+    if (-not $hoc -or -not $hoc.enabled -or -not $hoc.secretPrefix) { return }
+    $max = if ($hoc.maxLookupsPerComponent) { [int]$hoc.maxLookupsPerComponent } else { 20 }
+    $n = 0
+    foreach ($line in $MissingRefs) {
+        $n++
+        if ($n -gt $max) { Write-Warn "       (stopping after $max lookups)"; break }
+        $rel = ($line -replace '^.*? -> ', '') -replace ' \(not staged\)$', ''
+        $rel = $rel -replace '^\./', '' -replace '^config/', ''
+        if (-not $rel) { continue }
+        $secret = Get-HostOnlySecretName -Prefix $hoc.secretPrefix -Component $Component -RelPath $rel
+        $value = $null
+        try {
+            $value = (& aws secretsmanager get-secret-value --secret-id $secret `
+                        --query SecretString --output text 2>$null | Out-String)
+        } catch { $value = $null }
+        if ($LASTEXITCODE -eq 0 -and $value -and $value.Trim() -and $value.Trim() -ne 'None') {
+            $full = Join-Path $Dir ($rel -replace '/', '\')
+            $null = New-Item -ItemType Directory -Force -Path (Split-Path -Parent $full)
+            # No BOM: these are PEM and config files read by native code.
+            [System.IO.File]::WriteAllText($full, $value.TrimEnd("`r", "`n") + "`n",
+                (New-Object System.Text.UTF8Encoding $false))
+            Write-Ok "${Component}: $rel supplied from Secrets Manager ($secret)"
+        } else {
+            Write-Warn "${Component}: $rel is neither in the config repository nor in Secrets Manager."
+            Write-Warn "         Create it with:  aws secretsmanager create-secret --name $secret --secret-string file://<the file from the production host>"
+        }
+    }
 }
 
 function Get-GitFolder {
@@ -885,9 +981,32 @@ function Stage-Config {
                 $files = @(Get-ChildItem -LiteralPath $dest -File -Recurse).Count
                 $subdirs = @(Get-ChildItem -LiteralPath $dest -Directory -Recurse).Count
             }
+            $missingRefs = @()
+            if ($files -gt 0 -and -not $DryRun) {
+                $missingRefs = @(Get-MissingConfigReferences -Dir $dest)
+                if ($missingRefs.Count -gt 0) {
+                    Write-Warn "${Name}: the staged configuration NAMES file(s) that are not in the staged tree:"
+                    $missingRefs | ForEach-Object { Write-Warn "         $_" }
+                    # Some of these live only on the production host. Try
+                    # Secrets Manager, then re-derive so the manifest records
+                    # what is STILL missing, not what was missing before.
+                    Invoke-HostOnlyConfigFetch -Dir $dest -Component $Name -MissingRefs $missingRefs
+                    $missingRefs = @(Get-MissingConfigReferences -Dir $dest)
+                    $files = @(Get-ChildItem -LiteralPath $dest -File -Recurse).Count
+                    $subdirs = @(Get-ChildItem -LiteralPath $dest -Directory -Recurse).Count
+                    if ($missingRefs.Count -gt 0) {
+                        Write-Warn '       Still missing after the Secrets Manager lookup. The engine will fail at'
+                        Write-Warn '       start-up on the first one it needs, unless that leg of the flow is a cut'
+                        Write-Warn '       edge whose configuration is stood in for.'
+                    } else {
+                        Write-Ok "${Name}: every file the configuration names is now present"
+                    }
+                }
+            }
             Add-Result $Name 'config' 'staged' @{
                 source = 'git-serverconfigs'; repo = $cs.gitRepo; branch = $cs.gitBranch
                 path = $cs.gitPath; files = $files; subdirectories = $subdirs; dest = $dest
+                referencedButMissing = $missingRefs
                 marketDate = $plan.marketDate
                 commit = $script:GitAsOfSha; commitDate = $script:GitAsOfDate
                 commitsAfterMarketDate = $script:GitAfterCount
