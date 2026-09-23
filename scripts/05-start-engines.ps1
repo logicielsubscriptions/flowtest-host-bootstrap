@@ -55,7 +55,7 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
-$script:ScriptVersion = '2026-09-23.1-all-engines-late-check'
+$script:ScriptVersion = '2026-09-23.3-backup-size-check'
 Write-Host "  script version $script:ScriptVersion" -ForegroundColor DarkGray
 
 function Write-Step { param([string] $m) Write-Host ''; Write-Host "==> $m" -ForegroundColor Cyan }
@@ -204,6 +204,12 @@ foreach ($group in @($planObj.groups)) {
             # never guessed here: the Linux driver hardcoded the wrong path and
             # the engine silently ran the config baked into its image.
             Target    = $svcList[$i].containerConfigTarget
+            # Whether this engine needs a restored database, and which one.
+            # [bool] on a possibly-absent property: under StrictMode a bare
+            # $x.missing THROWS, and this whole object exists to be read with
+            # dotted access in the loops below.
+            NeedsDb   = [bool]$svcList[$i].needsDatabase
+            DbName    = "$($svcList[$i].dbName)"
         }
     }
 }

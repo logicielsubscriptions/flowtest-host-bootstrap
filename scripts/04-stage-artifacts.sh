@@ -55,7 +55,7 @@ set -euo pipefail
 
 # Printed first, every run. A stale fetch is otherwise invisible - see the note
 # in 02-prereq-windows.ps1.
-SCRIPT_VERSION='2026-09-23.1-all-engines-late-check'
+SCRIPT_VERSION='2026-09-23.3-backup-size-check'
 
 PLAN_FILE="/opt/flowtest/bootstrap/flow-plan-linux.json"
 DRY_RUN=0
@@ -1167,6 +1167,42 @@ cross_check_against_git() {
 # manifest can distinguish "the backup for the market date is not there" from
 # "nothing is there at all" - a distinction that matters a great deal while the
 # production backup jobs are known to have stopped in July.
+# A BACKUP THAT IS THE WRONG SIZE RESTORES PERFECTLY.
+#
+# The archive for one database on 2026-09-08 is 216 MB where every neighbouring
+# day is about 2.9 GB. A truncated or failed backup like that restores without
+# complaint and hands the engines a SHORT BOOK - orders that should exist do
+# not, and the replay diverges in a way that reads as a routing fault rather
+# than as missing data. Nothing downstream can tell the difference.
+#
+# The baseline is the MEDIAN of the other dated backups under the same prefix,
+# not a fixed number: a genuinely small database has a small median and does
+# not trip, while one bad file among many good ones stands out. Compared before
+# the download, so a bad backup does not cost a multi-gigabyte transfer.
+#
+# Echoes only the verdict line; the caller decides what to do with it.
+bak_size_verdict() {   # bak_size_verdict <bucket> <prefix> <chosen-key>  -> "<verdict> <size> <median> <n>"
+  local bucket="$1" prefix="$2" key="$3"
+  local listing
+  listing="$(aws s3api list-objects-v2 --bucket "$bucket" --prefix "${prefix%/}/" \
+              --query 'Contents[].[Key,Size]' --output text 2>/dev/null || true)"
+  [[ -n "$listing" && "$listing" != "None" ]] || { printf 'unknown 0 0 0\n'; return 0; }
+  local chosen median n
+  chosen="$(printf '%s\n' "$listing" | awk -F'\t' -v k="$key" '$1==k {print $2; exit}')"
+  [[ -n "$chosen" ]] || { printf 'unknown 0 0 0\n'; return 0; }
+  # Median of every OTHER .bak under the prefix.
+  read -r median n < <(printf '%s\n' "$listing" \
+    | awk -F'\t' -v k="$key" '$1 != k && $1 ~ /\.bak$/ {print $2}' \
+    | sort -n | awk '{a[NR]=$1} END {if (NR==0) {print 0, 0} else {print (NR%2 ? a[(NR+1)/2] : int((a[NR/2]+a[NR/2+1])/2)), NR}}')
+  if [[ "${n:-0}" -lt 3 || "${median:-0}" -eq 0 ]]; then
+    printf 'insufficient-sample %s %s %s\n' "$chosen" "${median:-0}" "${n:-0}"
+  elif (( chosen * 2 < median )); then
+    printf 'suspect %s %s %s\n' "$chosen" "$median" "$n"
+  else
+    printf 'ok %s %s %s\n' "$chosen" "$median" "$n"
+  fi
+}
+
 stage_db_backups() {
   local db; db="$(jq -c '.database // empty' "$PLAN_FILE")"
   [[ -n "$db" && "$db" != "null" ]] || return 0
@@ -1178,15 +1214,22 @@ stage_db_backups() {
 
   local db_root; db_root="$(jq -r '.staged.dbRoot // empty' "$PLAN_FILE")"
   [[ -n "$db_root" ]] || { warn 'the plan carries no staged.dbRoot; cannot stage database backups'; return 0; }
-  # The bucket is not on the database block - it is the log archive, the same
-  # one every other artifact comes from, so it is read off any service that
-  # declares one rather than duplicated into the plan.
+  # THE BUCKET COMES OFF THE DATABASE BLOCK. Build 113 read it off "any
+  # service that declares one", which found nothing: the database runs on the
+  # Linux host, whose only service is a FIX hub configured from git with no log
+  # archive at all. The probe never fired and the run could not say whether a
+  # backup exists - the one question it was added to answer. The service
+  # fallback is kept for plans generated before the database block carried a
+  # bucket.
   local bucket
-  bucket="$(jq -r '[.groups[].services[].logArchive.bucket // empty] | first // ""' "$PLAN_FILE")"
+  bucket="$(jq -r '.database.bucket // empty' "$PLAN_FILE")"
+  [[ -n "$bucket" ]] || bucket="$(jq -r '[.groups[].services[].logArchive.bucket // empty] | first // ""' "$PLAN_FILE")"
   if [[ -z "$bucket" ]]; then
-    warn 'no log-archive bucket is declared by any service, so the database backups cannot be fetched'
+    warn 'no log-archive bucket on the database block or on any service, so the database backups cannot be fetched'
+    warn 'This is a PLAN gap, not evidence that the backups are missing - nothing was looked for.'
     return 0
   fi
+  ok "archive bucket $bucket"
 
   step "Staging database backups"
   mkdir -p "$db_root"
@@ -1240,6 +1283,27 @@ stage_db_backups() {
       warn "$dbname: using $rkey (${roff} day(s) from the market date)"
     fi
 
+    # SIZE SANITY, BEFORE THE DOWNLOAD.
+    local verdict vsize vmed vn
+    read -r verdict vsize vmed vn < <(bak_size_verdict "$bucket" "$prefix" "$key")
+    case "$verdict" in
+      suspect)
+        fail "$dbname: $key is $(( vsize / 1024 / 1024 )) MB against a median of $(( vmed / 1024 / 1024 )) MB across $vn other backups."
+        fail "       REFUSING. A truncated backup restores without complaint and gives the engines a"
+        fail "       SHORT BOOK - the replay then diverges in a way that reads as a routing fault."
+        record "$dbname" dbBackup failed \
+          "$(jq -n --arg s "$svc" --arg k "$key" --argjson b "$vsize" --argjson m "$vmed" --argjson n "$vn" \
+                '{service:$s, key:$k, bytes:$b, medianBytes:$m, comparedAgainst:$n, optional:false,
+                  reason:"the backup is less than half the median size of the others under this prefix, so it is very likely truncated"}')"
+        continue ;;
+      insufficient-sample)
+        warn "$dbname: too few other backups under this prefix to judge the size ($vn)" ;;
+      unknown)
+        warn "$dbname: could not read object sizes, so the backup's size is unchecked" ;;
+      ok)
+        ok "$dbname: size is in line with the other $vn backups here" ;;
+    esac
+
     local size dl_err
     if ! dl_err="$(aws s3 cp "s3://${bucket}/${key}" "$dest" --only-show-errors 2>&1)"; then
       fail "$dbname: download failed: $dl_err"
@@ -1253,7 +1317,9 @@ stage_db_backups() {
     record "$dbname" dbBackup staged \
       "$(jq -n --arg s "$svc" --arg k "$key" --arg d "$dest" --argjson b "$size" \
             --arg h "$how" --arg o "$offset" --arg m "$MARKET_DATE" \
+            --argjson med "${vmed:-0}" --arg sv "${verdict:-unknown}" \
             '{service:$s, key:$k, dest:$d, bytes:$b, resolution:$h,
+              sizeCheck:$sv, medianBytesOfOthers:$med,
               dateOffsetDays:($o|tonumber), marketDate:$m}')"
   done < <(printf '%s' "$db" | jq -c '.databases[]?')
 }
