@@ -55,7 +55,7 @@ set -euo pipefail
 
 # Printed first, every run. A stale fetch is otherwise invisible - see the note
 # in 02-prereq-windows.ps1.
-SCRIPT_VERSION='2026-09-22.11-containment-readback'
+SCRIPT_VERSION='2026-09-23.1-all-engines-late-check'
 
 PLAN_FILE="/opt/flowtest/bootstrap/flow-plan-linux.json"
 DRY_RUN=0
@@ -75,6 +75,10 @@ CONFIG_REPO_TOKEN_REF=""
 # 3 covers a weekend plus the observed next-morning backup offset. Raising it
 # past a few days re-admits exactly the incoherence it exists to prevent, so
 # raise it to cover a genuine backup lag, never to make a run go green.
+# Set only while stage_config is re-entered for a component whose daily
+# snapshot was refused as the wrong vintage. Non-empty means the configuration
+# about to be staged is the config repository's answer, not the deployed one.
+SNAPSHOT_FALLBACK_REASON=''
 ARCHIVE_WINDOW_DAYS=3
 
 C_CYAN='\033[0;36m'; C_GREEN='\033[0;32m'; C_YELLOW='\033[0;33m'
@@ -682,14 +686,42 @@ stage_config() {
           case "$CONFIG_CHANGE_RESULT" in
             changed)
               fail "$name: the config repo has $CONFIG_CHANGE_COUNT commit(s) to this path between the snapshot and $MARKET_DATE."
-              fail "$name: REFUSING to stage. This snapshot predates a real configuration change, so it is not what the session ran under."
-              record "$name" config failed \
+              fail "$name: REFUSING the snapshot. It predates a real configuration change, so it is not what the session ran under."
+              # THE SNAPSHOT IS REFUSED. THAT IS NOT THE SAME AS HAVING NOTHING.
+              #
+              # Until 2026-09-23 this returned here, the component got no
+              # configuration at all, and the start step then correctly refused
+              # to start an engine with an empty config directory - so one
+              # stale backup took a whole engine out of every run, with no date
+              # on when the backup job might be fixed.
+              #
+              # The config repository can answer the same question the snapshot
+              # was supposed to: what was in force on the market date. It is
+              # resolved to the last commit at or before that date, exactly as
+              # both FIX hubs already are. That is a genuine DOWNGRADE - the
+              # repository says what was committed, the snapshot said what was
+              # deployed, and they are not identical claims - so it is recorded
+              # as one, with the refusal that caused it attached, and
+              # claim-bounds names it.
+              record "$name" configSnapshot refused \
                 "$(jq -n --arg k "$key" --arg o "$offset" --argjson w "$ARCHIVE_WINDOW_DAYS" \
                       --arg m "$MARKET_DATE" --argjson n "$CONFIG_CHANGE_COUNT" \
                       '{source:"s3-daily-snapshot", key:$k, dateOffsetDays:($o|tonumber),
                         windowDays:$w, marketDate:$m, files:0,
                         commitsBetweenSnapshotAndMarketDate:$n,
                         reason:"snapshot is outside the window AND the config repo shows changes in between, so it is not the configuration in force on the market date"}')"
+              local fb_path; fb_path="$(printf '%s' "$cs" | jq -r '.gitPath // ""')"
+              if [[ -z "$fb_path" ]]; then
+                fail "$name: and no gitPath is declared, so there is no second source to fall back to."
+                record "$name" config failed \
+                  "$(jq -n '{reason:"the snapshot was refused as the wrong vintage and no gitPath is declared to fall back to", files:0}')"
+                return 0
+              fi
+              warn "$name: falling back to the config repository at the market-date commit."
+              warn "       This states what was COMMITTED on $MARKET_DATE, not what was DEPLOYED."
+              SNAPSHOT_FALLBACK_REASON="snapshot ${key} refused: ${CONFIG_CHANGE_COUNT} commit(s) to this path between it and ${MARKET_DATE}"
+              stage_config "$name" "$(printf '%s' "$cs" | jq -c '.type = "git-serverconfigs"')"
+              SNAPSHOT_FALLBACK_REASON=''
               return 0 ;;
             unchanged)
               ok "$name: the config repo shows NO changes to this path between $key and $MARKET_DATE - the snapshot is stale but the configuration is not."
@@ -1039,7 +1071,10 @@ stage_config() {
                 --argjson after "${GIT_AFTER_COUNT:-null}" --arg m "$MARKET_DATE" \
                 --argjson sd "${subdirs:-0}" \
                 --arg mr "$missing_refs" --argjson ov "${overrides:-[]}" \
-                '{source:"git-serverconfigs", repo:$r, branch:$b, path:$p, files:$c,
+                --arg fb "${SNAPSHOT_FALLBACK_REASON:-}" \
+                '{source:(if $fb == "" then "git-serverconfigs" else "git-serverconfigs-fallback" end),
+                  fallbackFromSnapshot:(if $fb == "" then null else $fb end),
+                  repo:$r, branch:$b, path:$p, files:$c,
                   subdirectories:$sd, dest:$d,
                   configOverrides:$ov,
                   productionFaithful:(($ov | map(select(.applied and ((.changes // []) | length) > 0)) | length) == 0),
@@ -1110,6 +1145,117 @@ cross_check_against_git() {
     ok "$name: snapshot matches git file-for-file"
     record "$name" crosscheck ok "$(jq -n '{missing:[]}')"
   fi
+}
+
+# ---------------------------------------------------------------------------
+# DATABASE BACKUPS.
+#
+# The plan has declared these since the generator was written - container,
+# address, one database per engine, and a backup file derived from the market
+# date - and until 2026-09-23 NOTHING READ IT. No step staged a .bak, started
+# SQL Server or restored anything, while two engines carried needsDatabase:true
+# and would have started against an empty instance. An order execution server
+# with no database does not obviously fail; that is precisely why this has to
+# be an artifact with a recorded outcome like every other.
+#
+# Only the host the database runs on stages them. SQL Server runs on LINUX
+# here because Microsoft no longer publishes Windows SQL Server images, so on
+# this flow the backups land on the Linux host and the Windows engines reach
+# the instance across the container network.
+#
+# The derived filename is tried first and discovery is the fallback, so the
+# manifest can distinguish "the backup for the market date is not there" from
+# "nothing is there at all" - a distinction that matters a great deal while the
+# production backup jobs are known to have stopped in July.
+stage_db_backups() {
+  local db; db="$(jq -c '.database // empty' "$PLAN_FILE")"
+  [[ -n "$db" && "$db" != "null" ]] || return 0
+  local db_platform; db_platform="$(printf '%s' "$db" | jq -r '.platform // ""')"
+  if [[ "$db_platform" != "$ROLE" ]]; then
+    skip "the database runs on the $db_platform host, not this one - nothing to stage here"
+    return 0
+  fi
+
+  local db_root; db_root="$(jq -r '.staged.dbRoot // empty' "$PLAN_FILE")"
+  [[ -n "$db_root" ]] || { warn 'the plan carries no staged.dbRoot; cannot stage database backups'; return 0; }
+  # The bucket is not on the database block - it is the log archive, the same
+  # one every other artifact comes from, so it is read off any service that
+  # declares one rather than duplicated into the plan.
+  local bucket
+  bucket="$(jq -r '[.groups[].services[].logArchive.bucket // empty] | first // ""' "$PLAN_FILE")"
+  if [[ -z "$bucket" ]]; then
+    warn 'no log-archive bucket is declared by any service, so the database backups cannot be fetched'
+    return 0
+  fi
+
+  step "Staging database backups"
+  mkdir -p "$db_root"
+
+  local entry
+  while IFS= read -r entry; do
+    [[ -n "$entry" ]] || continue
+    local svc dbname prefix wanted dest
+    svc="$(printf '%s' "$entry"    | jq -r '.service')"
+    dbname="$(printf '%s' "$entry" | jq -r '.dbName')"
+    prefix="$(printf '%s' "$entry" | jq -r '.s3DbBackup')"
+    wanted="$(printf '%s' "$entry" | jq -r '.dbBackupFile // ""')"
+    dest="${db_root}/${dbname}.bak"
+    printf '\n  %b%s%b\n' "$C_CYAN" "$dbname" "$C_OFF"
+
+    # 1. The exact file the market date implies.
+    local key='' offset=0 how=''
+    if [[ -n "$wanted" ]] \
+       && aws s3api head-object --bucket "$bucket" --key "${prefix%/}/${wanted}" >/dev/null 2>&1; then
+      key="${prefix%/}/${wanted}"; how='exact'
+      ok "$dbname: $wanted is present for the market date"
+    else
+      # 2. Nearest dated backup, reported with its distance. NOT staged if it
+      #    is outside the window - a database from another month is a different
+      #    book, and restoring one produces a run that looks fine and is not.
+      [[ -n "$wanted" ]] && warn "$dbname: $wanted is NOT in s3://$bucket/${prefix%/}/ - looking for the nearest dated backup"
+      local resolved rkey roff rflag
+      resolved="$(resolve_dated "$bucket" "$prefix" '%Y%m%d' '{date}.bak')"
+      IFS=$'\t' read -r rkey roff rflag <<<"$resolved"
+      if [[ "$rkey" == "NONE" ]]; then
+        fail "$dbname: NOTHING dated found under s3://$bucket/${prefix%/}/"
+        record "$dbname" dbBackup missing \
+          "$(jq -n --arg s "$svc" --arg p "$prefix" --arg w "$wanted" \
+                '{service:$s, prefix:$p, wantedFile:$w, optional:false,
+                  reason:"no dated backup found at all under this prefix"}')"
+        continue
+      fi
+      local roff_abs="${roff#-}"
+      if [[ "$roff_abs" -gt "$ARCHIVE_WINDOW_DAYS" ]]; then
+        fail "$dbname: nearest backup $rkey is ${roff_abs} day(s) from $MARKET_DATE, outside the ${ARCHIVE_WINDOW_DAYS}-day window. REFUSING."
+        fail "       Restoring it would give the engines a different day's book while everything else replays $MARKET_DATE."
+        record "$dbname" dbBackup failed \
+          "$(jq -n --arg s "$svc" --arg k "$rkey" --arg o "$roff" --argjson w "$ARCHIVE_WINDOW_DAYS" \
+                --arg m "$MARKET_DATE" --arg wf "$wanted" \
+                '{service:$s, nearestKey:$k, dateOffsetDays:($o|tonumber), windowDays:$w,
+                  marketDate:$m, wantedFile:$wf, optional:false,
+                  reason:"the nearest database backup is outside the market-date window"}')"
+        continue
+      fi
+      key="$rkey"; offset="$roff"; how='discovered'
+      warn "$dbname: using $rkey (${roff} day(s) from the market date)"
+    fi
+
+    local size dl_err
+    if ! dl_err="$(aws s3 cp "s3://${bucket}/${key}" "$dest" --only-show-errors 2>&1)"; then
+      fail "$dbname: download failed: $dl_err"
+      record "$dbname" dbBackup failed \
+        "$(jq -n --arg s "$svc" --arg k "$key" --arg r "$dl_err" \
+              '{service:$s, key:$k, optional:false, reason:$r}')"
+      continue
+    fi
+    size="$(stat -c %s "$dest" 2>/dev/null || echo 0)"
+    ok "$dbname: staged $(( size / 1024 / 1024 )) MB to $dest"
+    record "$dbname" dbBackup staged \
+      "$(jq -n --arg s "$svc" --arg k "$key" --arg d "$dest" --argjson b "$size" \
+            --arg h "$how" --arg o "$offset" --arg m "$MARKET_DATE" \
+            '{service:$s, key:$k, dest:$d, bytes:$b, resolution:$h,
+              dateOffsetDays:($o|tonumber), marketDate:$m}')"
+  done < <(printf '%s' "$db" | jq -c '.databases[]?')
 }
 
 stage_captures() {
@@ -1457,6 +1603,10 @@ else
     stage_captures "$name" "$cap"
   done
 fi
+
+# The database backups are flow-level too, and land only on the host the
+# database container runs on.
+stage_db_backups
 
 # The Quill capture is flow-level, not per-component: one book feeds the
 # market-data simulator for the whole slice.

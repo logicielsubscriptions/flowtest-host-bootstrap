@@ -4,10 +4,10 @@
 #
 # WHY THIS EXISTS
 #   Everything before this step builds a host that is ready to run engines and
-#   then stops. The images are in the registry, the configuration is staged next
-#   to nothing, and the plan knows every container name, network and address -
-#   but no code has ever started one from the pipeline. That gap is the whole
-#   distance between "Phase 0 is unblocked" and "Phase 0 has run".
+#   then stops: the images are in the registry, the configuration is staged, and
+#   the plan knows every container name, network and address. This is the step
+#   that starts them. It first ran successfully on build 110, which is the
+#   difference between "Phase 0 is unblocked" and "Phase 0 has run".
 #
 # THE SEQUENCE IS CREATE -> COPY -> START, NOT RUN
 #   The engines read configuration from their own working directory and take no
@@ -22,6 +22,12 @@
 #   * Start a component whose configuration directory is empty. An engine that
 #     starts with no configuration does not fail - it runs with defaults and
 #     looks misconfigured three layers later.
+#   * Leave a container running whose staged configuration did not reach it. The
+#     files are read back OUT of the container and compared against what was
+#     staged; a component missing any of them is removed, not started.
+#   * Call a five-second reading a result. Every component that starts is
+#     re-checked late, past the window in which this engine family is known to
+#     self-terminate.
 #   * Start anything at all if a required image tag is missing from the registry.
 #     Checked for every component up front, because discovering it half way
 #     through leaves a partially started environment that reads like a crash.
@@ -36,7 +42,7 @@
 #
 set -uo pipefail
 
-SCRIPT_VERSION='2026-09-22.11-containment-readback'
+SCRIPT_VERSION='2026-09-23.1-all-engines-late-check'
 
 PLAN=''
 ONLY=''
@@ -44,6 +50,14 @@ DRY_RUN=0
 REPLACE=0
 ECR_NAMESPACE='flowtest'
 SETTLE_SECONDS=5
+# THE SECOND LOOK, AND THE ONE THAT MATTERS.
+#
+# The order execution server dies about 45 SECONDS after launch if it does not
+# own its console - its log shows a SIGINT it never received from a human. A
+# five-second check cannot see that, so every run so far could have reported an
+# engine 'running' that was already doomed. 90s clears the known failure with
+# margin; the wait is shared across all components rather than paid per engine.
+LATE_CHECK_SECONDS=90
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -51,6 +65,7 @@ while [[ $# -gt 0 ]]; do
     --only)           ONLY="${2:-}"; shift 2 ;;
     --ecr-namespace)  ECR_NAMESPACE="${2:-}"; shift 2 ;;
     --settle-seconds) SETTLE_SECONDS="${2:-}"; shift 2 ;;
+    --late-check-seconds) LATE_CHECK_SECONDS="${2:-}"; shift 2 ;;
     --replace)        REPLACE=1; shift ;;
     --dry-run)        DRY_RUN=1; shift ;;
     -h|--help)        sed -n '2,40p' "$0"; exit 0 ;;
@@ -84,8 +99,19 @@ ROLE="$(jq -r '.hostRole' "$PLAN")"
 FLOW="$(jq -r '.flow' "$PLAN")"
 CONFIG_ROOT="$(jq -r '.staged.configRoot' "$PLAN")"
 WORK_ROOT="$(jq -r '.workRoot' "$PLAN")"
+RESTORE_MANIFEST="${RESTORE_MANIFEST:-${WORK_ROOT}/restored-databases.json}"
 ok "flow $FLOW, role $ROLE"
 ok "config root $CONFIG_ROOT"
+# Written by 06-restore-databases.sh on the host the database runs on, and
+# copied to the OTHER host by the pipeline - the engines that need a database
+# are on a different machine from the database here, so the evidence has to
+# travel. No manifest is NOT the same as "restored nothing", and an engine that
+# needs a database is refused either way.
+if [[ -f "$RESTORE_MANIFEST" ]]; then
+  ok "database restore manifest $RESTORE_MANIFEST"
+else
+  warn "no database restore manifest at $RESTORE_MANIFEST - any engine that needs one will be refused"
+fi
 
 # ---------------------------------------------------------------------------
 step 'Registry'
@@ -147,7 +173,9 @@ mapfile -t SERVICES < <(jq -r '
       (if $g.sharedNamespace then "shared" else "own" end),
       (if .key == 0 then "first" else "joins" end),
       ($g.namespaceContainer // $g.services[0].containerName),
-      (.value.containerConfigTarget // "")
+      (.value.containerConfigTarget // ""),
+      (if .value.needsDatabase then "needsdb" else "nodb" end),
+      (.value.dbName // "")
     ] | @tsv' "$PLAN")
 
 [[ ${#SERVICES[@]} -gt 0 ]] || die 'the plan lists no services for this host'
@@ -253,10 +281,38 @@ record() {  # name, status, detail-json
 }
 
 started=0; failed=0
+STARTED_NAMES=()
+FIRST_START_EPOCH=''
 
 for line in "${SERVICES[@]}"; do
-  IFS=$'\t' read -r name svc family tag net ip shared pos owner target <<<"$line"
+  IFS=$'\t' read -r name svc family tag net ip shared pos owner target needsdb dbname <<<"$line"
   step "$name"
+
+  # A DATABASE THIS ENGINE NEEDS AND DOES NOT HAVE.
+  #
+  # Checked FIRST, before configuration, because it is the more dangerous gap:
+  # an engine with no config fails visibly, and an order execution server with
+  # no database can sit there looking healthy while answering nothing. The
+  # restore manifest is the only evidence that accepts - not the presence of a
+  # container, not a reachable port.
+  if [[ "$needsdb" == "needsdb" ]]; then
+    db_state='no manifest'
+    if [[ -f "$RESTORE_MANIFEST" ]]; then
+      db_state="$(jq -r --arg d "$dbname" \
+        '[.items[]? | select(.database == $d)] | (first // {}) | .status // "not in the manifest"' \
+        "$RESTORE_MANIFEST" 2>/dev/null || echo 'unreadable manifest')"
+    fi
+    if [[ "$db_state" != "restored" ]]; then
+      fail "$name: needs the database '$dbname', which is '${db_state}'."
+      fail "       NOT starting it. This engine does not fail loudly without its database -"
+      fail "       it can run and answer nothing, which reads downstream as a routing fault."
+      fail "       See $RESTORE_MANIFEST, and the dbBackup entries in the staging manifest."
+      record "$name" 'refused' "$(jq -n --arg d "$dbname" --arg st "$db_state" --arg m "$RESTORE_MANIFEST" \
+        '{reason:"the database this engine needs was not restored", dbName:$d, databaseStatus:$st, restoreManifest:$m}')"
+      failed=$((failed+1)); continue
+    fi
+    ok "database $dbname is restored"
+  fi
 
   config_dir="${CONFIG_ROOT}/${name}"
   if [[ ! -d "$config_dir" ]]; then
@@ -436,15 +492,66 @@ for line in "${SERVICES[@]}"; do
         note:"this engine family treats exit 11 as a normal stop in production (SuccessExitStatus=11)"}')"
     failed=$((failed+1)); continue
   fi
-  ok "running (${SETTLE_SECONDS}s after start)"
+  ok "running (${SETTLE_SECONDS}s after start) - NOT yet a claim; see the late re-check below"
+  STARTED_NAMES+=("$name")
+  [[ -n "$FIRST_START_EPOCH" ]] || FIRST_START_EPOCH="$(date +%s)"
   record "$name" 'running' "$(jq -n --arg i "$image" --arg ip "$ip" --arg n "$net" --arg c "$config_dir" --arg tg "$target" \
     --arg rb "$readback" --arg p "${in_paths:-}" \
     '{image:$i, address:$ip, network:$n, configDir:$c, containerConfigTarget:$tg,
       configReadback:$rb,
       configInContainer:($p | split("\n") | map(select(length>0))),
-      note:"running at this instant. Uptime is not stability - see the settle note in the report."}')"
+      note:"running at this instant. Superseded by the late re-check if one ran."}')"
   started=$((started+1))
 done
+
+# ---------------------------------------------------------------------------
+# LATE RE-CHECK.
+#
+# Everything above establishes that a container STARTED. This establishes that
+# it is still there once the window in which this engine family is known to
+# kill itself has passed. The two are different claims and the manifest now
+# says which one it is making: a component that survives is re-recorded as
+# 'running' with secondsObserved, and one that did not is re-recorded as
+# 'exited-late' with its logs - the single most likely real failure mode for
+# the order execution server, and the one a five-second check would have
+# reported as success.
+if [[ ${#STARTED_NAMES[@]} -gt 0 && $DRY_RUN -eq 0 ]]; then
+  elapsed=$(( $(date +%s) - FIRST_START_EPOCH ))
+  remaining=$(( LATE_CHECK_SECONDS - elapsed ))
+  step "Late re-check (${LATE_CHECK_SECONDS}s after the first engine started)"
+  if [[ "$remaining" -gt 0 ]]; then
+    echo "         waiting ${remaining}s"
+    sleep "$remaining"
+  fi
+  for name in "${STARTED_NAMES[@]}"; do
+    age=$(( $(date +%s) - FIRST_START_EPOCH ))
+    state="$(docker inspect -f '{{.State.Status}}' "$name" 2>/dev/null || echo unknown)"
+    if [[ "$state" == "running" ]]; then
+      ok "$name still running after ${age}s"
+      # Replace the earlier optimistic record rather than adding a second one,
+      # so the manifest has exactly one verdict per component.
+      for i in "${!RESULTS[@]}"; do
+        [[ "$(printf '%s' "${RESULTS[$i]}" | jq -r '.component // ""')" == "$name" ]] || continue
+        RESULTS[$i]="$(printf '%s' "${RESULTS[$i]}" | jq -c --argjson a "$age" \
+          '.detail.secondsObserved = $a
+           | .detail.note = "still running at the late re-check, past the window in which this engine family self-terminates without a console"')"
+      done
+    else
+      code="$(docker inspect -f '{{.State.ExitCode}}' "$name" 2>/dev/null || echo unknown)"
+      fail "$name: was running at ${SETTLE_SECONDS}s and is '$state' (exit $code) at ${age}s. Last output:"
+      docker logs --tail 30 "$name" 2>&1 | sed 's/^/           /' >&2 || true
+      for i in "${!RESULTS[@]}"; do
+        [[ "$(printf '%s' "${RESULTS[$i]}" | jq -r '.component // ""')" == "$name" ]] || continue
+        RESULTS[$i]="$(printf '%s' "${RESULTS[$i]}" | jq -c --arg s "$state" --arg c "$code" --argjson a "$age" \
+          '.status = "exited-late"
+           | .detail.state = $s | .detail.exitCode = $c | .detail.secondsObserved = $a
+           | .detail.reason = "started, then stopped before the late re-check - the shape the order execution server takes when it does not own its console"
+           | .detail.note = "the earlier \"running\" reading was taken at '"$SETTLE_SECONDS"'s and did not survive"')"
+      done
+      started=$((started-1)); failed=$((failed+1))
+    fi
+  done
+fi
 
 # ---------------------------------------------------------------------------
 step 'Manifest'

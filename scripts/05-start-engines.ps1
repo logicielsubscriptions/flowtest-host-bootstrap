@@ -36,6 +36,18 @@ param(
     [string]   $Only,
     [string]   $EcrNamespace   = 'flowtest',
     [int]      $SettleSeconds  = 5,
+    # THE SECOND LOOK, AND THE ONE THAT MATTERS. The order execution server -
+    # which runs on THIS host - dies about 45 seconds after launch if it does
+    # not own its console. A five-second check cannot see that. 90 clears it
+    # with margin, and the wait is shared across all components on the host
+    # rather than paid per engine.
+    [int]      $LateCheckSeconds = 90,
+    # Written by 06-restore-databases.sh on the host the database runs on, and
+    # copied here by the pipeline: on this flow the engines that need a
+    # database are NOT on the same machine as the database, so the evidence has
+    # to travel. Absent is not the same as "restored nothing", and an engine
+    # that needs a database is refused either way.
+    [string]   $RestoreManifest = 'C:\FlowTest\restored-databases.json',
     [switch]   $Replace,
     [switch]   $DryRun
 )
@@ -43,7 +55,7 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
-$script:ScriptVersion = '2026-09-22.11-containment-readback'
+$script:ScriptVersion = '2026-09-23.1-all-engines-late-check'
 Write-Host "  script version $script:ScriptVersion" -ForegroundColor DarkGray
 
 function Write-Step { param([string] $m) Write-Host ''; Write-Host "==> $m" -ForegroundColor Cyan }
@@ -211,6 +223,37 @@ if ($Only) {
 Write-Step "Image availability ($($services.Count) component(s))"
 $missing = @()
 foreach ($s in $services) {
+    # A DATABASE THIS ENGINE NEEDS AND DOES NOT HAVE.
+    #
+    # Checked FIRST, before configuration, because it is the more dangerous
+    # gap: an engine with no config fails visibly, and an order execution
+    # server with no database can sit there looking healthy while answering
+    # nothing - which reads downstream as a routing fault, three layers from
+    # the cause. The restore manifest is the only evidence accepted; a
+    # reachable port is not.
+    if ($s.NeedsDb) {
+        $dbState = 'no manifest'
+        if (Test-Path -LiteralPath $RestoreManifest) {
+            try {
+                $rm = Get-Content -LiteralPath $RestoreManifest -Raw | ConvertFrom-Json
+                $row = @($rm.items | Where-Object { $_.database -eq $s.DbName }) | Select-Object -First 1
+                $dbState = if ($row) { $row.status } else { 'not in the manifest' }
+            } catch { $dbState = 'unreadable manifest' }
+        }
+        if ($dbState -ne 'restored') {
+            Write-Fail "$($s.Name): needs the database '$($s.DbName)', which is '$dbState'."
+            Write-Fail '       NOT starting it. This engine does not fail loudly without its database -'
+            Write-Fail '       it can run and answer nothing, which reads downstream as a routing fault.'
+            Write-Fail "       See $RestoreManifest, and the dbBackup entries in the staging manifest."
+            $results += [pscustomobject]@{ component = $s.Name; status = 'refused'
+                detail = @{ reason = 'the database this engine needs was not restored'
+                            dbName = $s.DbName; databaseStatus = "$dbState"
+                            restoreManifest = $RestoreManifest } }
+            $failed++; continue
+        }
+        Write-Ok "database $($s.DbName) is restored"
+    }
+
     $repo = "$EcrNamespace/$($s.Family)"
     $q = Invoke-Native aws @('ecr','describe-images','--repository-name',$repo,
                              '--image-ids',"imageTag=$($s.Tag)",'--region',$region)
@@ -230,6 +273,8 @@ if ($missing.Count -gt 0) {
 
 # ---------------------------------------------------------------------------
 $results = @()
+$startedNames = @()
+$script:FirstStart = $null
 $started = 0
 $failed  = 0
 
@@ -308,12 +353,59 @@ foreach ($s in $services) {
             detail = @{ reason = 'did not stay running'; state = "$state"; exitCode = "$code"; image = $image } }
         $failed++; continue
     }
-    Write-Ok "running ($SettleSeconds s after start)"
+    Write-Ok "running ($SettleSeconds s after start) - NOT yet a claim; see the late re-check below"
     $results += [pscustomobject]@{ component = $s.Name; status = 'running'
         detail = @{ image = $image; address = $s.Ip; network = $s.Network; configDir = $configDir
                     containerConfigTarget = $s.Target
-                    note = 'running at this instant. Uptime is not stability - see the settle note in the report.' } }
+                    note = 'running at this instant. Superseded by the late re-check if one ran.' } }
+    $startedNames += $s.Name
+    if (-not $script:FirstStart) { $script:FirstStart = Get-Date }
     $started++
+}
+
+# ---------------------------------------------------------------------------
+# LATE RE-CHECK.
+#
+# Everything above establishes that a container STARTED. This establishes that
+# it is still there once the window in which the order execution server is
+# known to kill itself - about 45 seconds, when it does not own its console -
+# has passed. Those are different claims, and this host runs the very engine
+# family the constraint was discovered on, so a five-second verdict here would
+# be the most expensive false green this project could produce.
+if ($startedNames.Count -gt 0 -and -not $DryRun) {
+    $elapsed = [int]((Get-Date) - $script:FirstStart).TotalSeconds
+    $remaining = $LateCheckSeconds - $elapsed
+    Write-Step "Late re-check ($LateCheckSeconds s after the first engine started)"
+    if ($remaining -gt 0) {
+        Write-Host "         waiting $remaining s"
+        Start-Sleep -Seconds $remaining
+    }
+    foreach ($n in $startedNames) {
+        $age = [int]((Get-Date) - $script:FirstStart).TotalSeconds
+        $state = (Invoke-Native docker @('inspect','-f','{{.State.Status}}',$n)).Output
+        $row = $results | Where-Object { $_.component -eq $n } | Select-Object -First 1
+        if ($state -eq 'running') {
+            Write-Ok "$n still running after $age s"
+            if ($row) {
+                $row.detail.secondsObserved = $age
+                $row.detail.note = 'still running at the late re-check, past the window in which this engine family self-terminates without a console'
+            }
+        } else {
+            $code = (Invoke-Native docker @('inspect','-f','{{.State.ExitCode}}',$n)).Output
+            Write-Fail "${n}: was running at $SettleSeconds s and is '$state' (exit $code) at $age s. Last output:"
+            (Invoke-Native docker @('logs','--tail','30',$n)).Output -split "`r?`n" |
+                ForEach-Object { Write-Host "         $_" -ForegroundColor DarkGray }
+            if ($row) {
+                $row.status = 'exited-late'
+                $row.detail.state = "$state"
+                $row.detail.exitCode = "$code"
+                $row.detail.secondsObserved = $age
+                $row.detail.reason = 'started, then stopped before the late re-check - the shape the order execution server takes when it does not own its console'
+                $row.detail.note = "the earlier 'running' reading was taken at $SettleSeconds s and did not survive"
+            }
+            $started--; $failed++
+        }
+    }
 }
 
 # ---------------------------------------------------------------------------

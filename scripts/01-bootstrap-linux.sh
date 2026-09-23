@@ -45,7 +45,7 @@ set -euo pipefail
 # Printed first, every run. See the note in 02-prereq-windows.ps1: without a
 # version in the output, a stale fetch is invisible and a retest can silently
 # re-run old code.
-SCRIPT_VERSION='2026-09-22.11-containment-readback'
+SCRIPT_VERSION='2026-09-23.1-all-engines-late-check'
 echo "bootstrap script version $SCRIPT_VERSION"
 
 ROOT=""
@@ -112,7 +112,7 @@ echo "running $prereq"
 # will not have it, which the pipeline reports rather than crashing on.
 # A LIST, not one file: starting the engines is invoked by path too, and the
 # same silent-break argument applies to it.
-for wanted in 04-stage-artifacts.sh 05-start-engines.sh; do
+for wanted in 04-stage-artifacts.sh 05-start-engines.sh 06-restore-databases.sh; do
   found="$(find "$ROOT" -name "$wanted" -print -quit 2>/dev/null || true)"
   if [[ -n "$found" && "$found" != "$ROOT/$wanted" ]]; then
     cp -f "$found" "$ROOT/$wanted"
