@@ -42,7 +42,7 @@
 #
 set -uo pipefail
 
-SCRIPT_VERSION='2026-09-23.3-backup-size-check'
+SCRIPT_VERSION='2026-09-23.4-ssm-poll-blank-status'
 
 PLAN=''
 ONLY=''
