@@ -37,7 +37,7 @@
 #
 set -uo pipefail
 
-SCRIPT_VERSION='2026-09-23.9-capture-engine-logs'
+SCRIPT_VERSION='2026-09-23.10-declared-bypasses'
 
 PLAN=''
 SA_SECRET=''

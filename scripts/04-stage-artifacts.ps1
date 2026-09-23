@@ -108,7 +108,7 @@ trap {
 
 # Printed first, every run. Without it a stale fetch is invisible and a retest
 # can silently re-run old code while looking like a fresh result.
-$script:ScriptVersion = '2026-09-23.9-capture-engine-logs'
+$script:ScriptVersion = '2026-09-23.10-declared-bypasses'
 
 function Write-Step { param([string] $Message) Write-Host "`n=== $Message ===" -ForegroundColor Cyan }
 function Write-Ok   { param([string] $Message) Write-Host "  [ok]   $Message" -ForegroundColor Green }
@@ -486,6 +486,10 @@ function Invoke-ConfigOverrides {
     $applied = @()
     foreach ($e in $entries) {
         if (-not $e) { continue }
+        # Carry the dependency id through to the manifest. claim-bounds prints
+        # "this run does not talk to X", which is what a reader can act on; an
+        # INI key name on its own tells them nothing.
+        $dep = if ($e.bypassedDependency) { [string]$e.bypassedDependency } else { '' }
         if ($e.format -and $e.format -ne 'ini') {
             Write-Warn "${Component}: override format '$($e.format)' is not implemented - NOT applied"
             continue
@@ -494,8 +498,18 @@ function Invoke-ConfigOverrides {
         if (-not (Test-Path -LiteralPath $target)) {
             # NOT created. A rule that invents a file the codebase does not
             # read is worse than one that does nothing: it looks applied.
-            Write-Warn "${Component}: override targets $($e.file), which is not in the staged tree - NOT applied"
-            $applied += @{ file = $e.file; applied = $false; reason = 'file not present in the staged tree' }
+            if ($dep) {
+                # An unapplied BYPASS is not a footnote: the engine will try to
+                # reach the real dependency, which this flow file says it cannot.
+                Write-Fail "${Component}: the declared bypass of '$dep' targets $($e.file), which is NOT in"
+                Write-Fail "      the staged tree. The bypass did not happen. The engine will try to reach"
+                Write-Fail "      the real dependency and this flow file says it cannot."
+            } else {
+                Write-Warn "${Component}: override targets $($e.file), which is not in the staged tree - NOT applied"
+            }
+            $r = @{ file = $e.file; applied = $false; reason = 'file not present in the staged tree' }
+            if ($dep) { $r.bypassedDependency = $dep }
+            $applied += $r
             continue
         }
         $set = @{}
@@ -504,7 +518,9 @@ function Invoke-ConfigOverrides {
                  -CreateSectionIfAbsent ([bool]$e.createSectionIfAbsent)
         if ($res.error) {
             Write-Warn "${Component}: override of $($e.file) not applied: $($res.error)"
-            $applied += @{ file = $e.file; applied = $false; reason = $res.error }
+            $r = @{ file = $e.file; applied = $false; reason = $res.error }
+            if ($dep) { $r.bypassedDependency = $dep }
+            $applied += $r
             continue
         }
         if (@($res.changes).Count -gt 0) {
@@ -516,8 +532,10 @@ function Invoke-ConfigOverrides {
         } else {
             Write-Ok "${Component}: $($e.file) [$($e.section)] already matches the declared override"
         }
-        $applied += @{ file = $e.file; section = $e.section; applied = $true
-                       changes = @($res.changes); reason = $e.reason; authority = $e.authority }
+        $r = @{ file = $e.file; section = $e.section; applied = $true
+                changes = @($res.changes); reason = $e.reason; authority = $e.authority }
+        if ($dep) { $r.bypassedDependency = $dep }
+        $applied += $r
     }
     return @($applied)
 }

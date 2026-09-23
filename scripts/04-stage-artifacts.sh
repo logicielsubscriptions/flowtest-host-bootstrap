@@ -55,7 +55,7 @@ set -euo pipefail
 
 # Printed first, every run. A stale fetch is otherwise invisible - see the note
 # in 02-prereq-windows.ps1.
-SCRIPT_VERSION='2026-09-23.9-capture-engine-logs'
+SCRIPT_VERSION='2026-09-23.10-declared-bypasses'
 
 PLAN_FILE="/opt/flowtest/bootstrap/flow-plan-linux.json"
 DRY_RUN=0
@@ -452,7 +452,7 @@ print(json.dumps({"changes": changes}))
 # JSON. Nothing about the failure pointed at the capture. So the JSON is
 # written to a path the caller supplies, and stdout stays what it looks like.
 apply_config_overrides() {   # apply_config_overrides <staged-dir> <component> <out-json-path>
-  local dir="$1" name="$2" outfile="$3" ovr entry file fmt section pairs create res err
+  local dir="$1" name="$2" outfile="$3" ovr entry file fmt section pairs create res err dep
   ovr="$(jq -c --arg n "$name" \
     '[.groups[].services[] | select(.containerName==$n)][0].configOverrides // []' "$PLAN_FILE" 2>/dev/null)"
   printf '[]' > "$outfile"
@@ -465,6 +465,10 @@ apply_config_overrides() {   # apply_config_overrides <staged-dir> <component> <
     section="$(printf '%s' "$entry" | jq -r '.section // ""')"
     pairs="$(printf '%s' "$entry"   | jq -c '.set // {}')"
     create="$(printf '%s' "$entry"  | jq -r 'if (.createSectionIfAbsent // false) then "1" else "0" end')"
+    # Carry the dependency id through to the manifest. claim-bounds prints
+    # "this run does not talk to X", which is what a reader can act on; an
+    # INI key name on its own tells them nothing.
+    dep="$(printf '%s' "$entry"     | jq -r '.bypassedDependency // ""')"
     if [[ "$fmt" != "ini" ]]; then
       warn "$name: override format '$fmt' is not implemented - NOT applied"
       continue
@@ -472,22 +476,31 @@ apply_config_overrides() {   # apply_config_overrides <staged-dir> <component> <
     if [[ ! -f "$dir/$file" ]]; then
       # NOT created. A rule that invents a file the codebase does not read is
       # worse than one that does nothing, because it looks applied.
-      warn "$name: override targets $file, which is not in the staged tree - NOT applied"
-      applied="$(printf '%s' "$applied" | jq -c --arg f "$file" \
-        '. + [{file:$f, applied:false, reason:"file not present in the staged tree"}]')"
+      if [[ -n "$dep" ]]; then
+        fail "$name: the declared bypass of '$dep' targets $file, which is NOT in the"
+        fail "      staged tree. The bypass did not happen. The engine will try to reach"
+        fail "      the real dependency and this flow file says it cannot."
+      else
+        warn "$name: override targets $file, which is not in the staged tree - NOT applied"
+      fi
+      applied="$(printf '%s' "$applied" | jq -c --arg f "$file" --arg d "$dep" \
+        '. + [{file:$f, applied:false, reason:"file not present in the staged tree"}
+              + (if $d == "" then {} else {bypassedDependency:$d} end)]')"
       continue
     fi
     res="$(python3 -c "$INI_SET" "$dir/$file" "$section" "$pairs" "$create" 2>&1)" || {
       fail "$name: override of $file failed: $res"
-      applied="$(printf '%s' "$applied" | jq -c --arg f "$file" --arg r "$res" \
-        '. + [{file:$f, applied:false, reason:$r}]')"
+      applied="$(printf '%s' "$applied" | jq -c --arg f "$file" --arg r "$res" --arg d "$dep" \
+        '. + [{file:$f, applied:false, reason:$r}
+              + (if $d == "" then {} else {bypassedDependency:$d} end)]')"
       continue
     }
     err="$(printf '%s' "$res" | jq -r '.error // empty' 2>/dev/null)"
     if [[ -n "$err" ]]; then
       warn "$name: override of $file not applied: $err"
-      applied="$(printf '%s' "$applied" | jq -c --arg f "$file" --arg r "$err" \
-        '. + [{file:$f, applied:false, reason:$r}]')"
+      applied="$(printf '%s' "$applied" | jq -c --arg f "$file" --arg r "$err" --arg d "$dep" \
+        '. + [{file:$f, applied:false, reason:$r}
+              + (if $d == "" then {} else {bypassedDependency:$d} end)]')"
       continue
     fi
     local nchanges
@@ -503,7 +516,9 @@ apply_config_overrides() {   # apply_config_overrides <staged-dir> <component> <
       --argjson ch "$(printf '%s' "$res" | jq -c '.changes')" \
       --arg why "$(printf '%s' "$entry" | jq -r '.reason // ""')" \
       --arg who "$(printf '%s' "$entry" | jq -r '.authority // ""')" \
-      '. + [{file:$f, section:$s, applied:true, changes:$ch, reason:$why, authority:$who}]')"
+      --arg d "$dep" \
+      '. + [{file:$f, section:$s, applied:true, changes:$ch, reason:$why, authority:$who}
+            + (if $d == "" then {} else {bypassedDependency:$d} end)]')"
   done < <(printf '%s' "$ovr" | jq -c '.[]')
   printf '%s' "$applied" > "$outfile"
 }
