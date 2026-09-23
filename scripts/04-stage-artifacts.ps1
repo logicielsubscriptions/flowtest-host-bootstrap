@@ -108,7 +108,7 @@ trap {
 
 # Printed first, every run. Without it a stale fetch is invisible and a retest
 # can silently re-run old code while looking like a fresh result.
-$script:ScriptVersion = '2026-09-23.5-restore-parse-and-refusal-placement'
+$script:ScriptVersion = '2026-09-23.8-ps-brace-check'
 
 function Write-Step { param([string] $Message) Write-Host "`n=== $Message ===" -ForegroundColor Cyan }
 function Write-Ok   { param([string] $Message) Write-Host "  [ok]   $Message" -ForegroundColor Green }
@@ -966,6 +966,11 @@ function Test-ConfigChangedBetween {
     }
 }
 
+# Set only while Stage-Config is re-entered for a component whose daily
+# snapshot was refused as the wrong vintage. Non-empty means the configuration
+# about to be staged is the config repository's answer, not the deployed one.
+$script:SnapshotFallbackReason = ''
+
 function Stage-Config {
     param([string] $Name, $Service)
     $cs = $Service.configSource
@@ -1007,13 +1012,42 @@ function Stage-Config {
                 $snapEvidence = $script:ConfigChangeNote
                 if ($verdict -eq 'changed') {
                     Write-Fail "${Name}: the config repo has $($script:ConfigChangeCount) commit(s) to this path between the snapshot and $($plan.marketDate)."
-                    Write-Fail "${Name}: REFUSING to stage. This snapshot predates a real configuration change, so it is not what the session ran under."
-                    Add-Result $Name 'config' 'failed' @{
+                    Write-Fail "${Name}: REFUSING the snapshot. It predates a real configuration change, so it is not what the session ran under."
+                    # THE SNAPSHOT IS REFUSED. THAT IS NOT THE SAME AS HAVING
+                    # NOTHING. Mirrors the .sh, which gained this on
+                    # 2026-09-23 while this file did not - so on build 119 the
+                    # Linux host would have fallen back and the Windows host,
+                    # where this component actually lives, returned 'no staged
+                    # configuration directory' and the engine was refused. Two
+                    # implementations of one behaviour, and only one of them
+                    # had it.
+                    #
+                    # The config repository answers the same question the
+                    # snapshot was meant to: what was in force on the market
+                    # date. It is a DOWNGRADE - committed, not deployed - so it
+                    # is recorded as one and claim-bounds names it.
+                    Add-Result $Name 'configSnapshot' 'refused' @{
                         source = 's3-daily-snapshot'; key = $resolved.Key
                         dateOffsetDays = $resolved.Offset; windowDays = $ArchiveWindowDays
                         marketDate = $plan.marketDate; files = 0
                         commitsBetweenSnapshotAndMarketDate = $script:ConfigChangeCount
                         reason = 'snapshot is outside the window AND the config repo shows changes in between, so it is not the configuration in force on the market date' }
+                    if (-not $cs.gitPath) {
+                        Write-Fail "${Name}: and no gitPath is declared, so there is no second source to fall back to."
+                        Add-Result $Name 'config' 'failed' @{ files = 0
+                            reason = 'the snapshot was refused as the wrong vintage and no gitPath is declared to fall back to' }
+                        return
+                    }
+                    Write-Warn "${Name}: falling back to the config repository at the market-date commit."
+                    Write-Warn '       This states what was COMMITTED on the market date, not what was DEPLOYED.'
+                    $script:SnapshotFallbackReason =
+                        "snapshot $($resolved.Key) refused: $($script:ConfigChangeCount) commit(s) to this path between it and $($plan.marketDate)"
+                    $fallback = $cs.PSObject.Copy()
+                    $fallback.type = 'git-serverconfigs'
+                    $svcCopy = $Service.PSObject.Copy()
+                    $svcCopy.configSource = $fallback
+                    Stage-Config -Name $Name -Service $svcCopy
+                    $script:SnapshotFallbackReason = ''
                     return
                 }
                 elseif ($verdict -eq 'unchanged') {
@@ -1141,7 +1175,9 @@ function Stage-Config {
                 }
             }
             Add-Result $Name 'config' 'staged' @{
-                source = 'git-serverconfigs'; repo = $cs.gitRepo; branch = $cs.gitBranch
+                source = $(if ($script:SnapshotFallbackReason) { 'git-serverconfigs-fallback' } else { 'git-serverconfigs' })
+                fallbackFromSnapshot = $(if ($script:SnapshotFallbackReason) { $script:SnapshotFallbackReason } else { $null })
+                repo = $cs.gitRepo; branch = $cs.gitBranch
                 path = $cs.gitPath; files = $files; subdirectories = $subdirs; dest = $dest
                 referencedButMissing = $missingRefs
                 configOverrides = $overrides

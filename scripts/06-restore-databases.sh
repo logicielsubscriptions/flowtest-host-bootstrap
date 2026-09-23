@@ -37,7 +37,7 @@
 #
 set -uo pipefail
 
-SCRIPT_VERSION='2026-09-23.5-restore-parse-and-refusal-placement'
+SCRIPT_VERSION='2026-09-23.8-ps-brace-check'
 
 PLAN=''
 SA_SECRET=''

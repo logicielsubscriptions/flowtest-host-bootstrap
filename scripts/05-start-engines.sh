@@ -42,7 +42,7 @@
 #
 set -uo pipefail
 
-SCRIPT_VERSION='2026-09-23.5-restore-parse-and-refusal-placement'
+SCRIPT_VERSION='2026-09-23.8-ps-brace-check'
 
 PLAN=''
 ONLY=''
@@ -175,7 +175,8 @@ mapfile -t SERVICES < <(jq -r '
       ($g.namespaceContainer // $g.services[0].containerName),
       (.value.containerConfigTarget // ""),
       (if .value.needsDatabase then "needsdb" else "nodb" end),
-      (.value.dbName // "")
+      (.value.dbName // ""),
+      ((.value.requiredEmptyDirs // []) | join(" "))
     ] | @tsv' "$PLAN")
 
 [[ ${#SERVICES[@]} -gt 0 ]] || die 'the plan lists no services for this host'
@@ -285,7 +286,7 @@ STARTED_NAMES=()
 FIRST_START_EPOCH=''
 
 for line in "${SERVICES[@]}"; do
-  IFS=$'\t' read -r name svc family tag net ip shared pos owner target needsdb dbname <<<"$line"
+  IFS=$'\t' read -r name svc family tag net ip shared pos owner target needsdb dbname reqdirs <<<"$line"
   step "$name"
 
   # A DATABASE THIS ENGINE NEEDS AND DOES NOT HAVE.
@@ -402,6 +403,34 @@ for line in "${SERVICES[@]}"; do
   fi
   ok "$count file(s) copied to $target"
 
+  # DIRECTORIES THE ENGINE NEEDS AND WILL NOT CREATE.
+  #
+  # The order execution server aborts inside g3log if its log directory is
+  # absent - build 119's RISK engine died 20s in with SIGABRT and a
+  # SinkWrapper stack dump, which reads as an engine crash and was a missing
+  # folder. Dev confirmed the OMS needs an EMPTY logs folder present first.
+  #
+  # `docker cp` of an empty local directory is the only way in: the container
+  # is created and not started, so there is no process to exec into. Created
+  # empty and never populated - anything in it would be another run's history.
+  if [[ -n "$reqdirs" ]]; then
+    for d in $reqdirs; do
+      emptydir="$(mktemp -d)"
+      if ! mk_out="$(docker cp "$emptydir" "${name}:${target}/${d}" 2>&1)"; then
+        fail "$name: could not create the required directory ${target}/${d}: $mk_out"
+        fail "       This engine family aborts at start-up without it, and the abort looks"
+        fail "       like an engine fault rather than a missing folder. Removing the container."
+        rmdir "$emptydir" 2>/dev/null || true
+        docker rm -f "$name" >/dev/null 2>&1 || true
+        record "$name" 'failed' "$(jq -n --arg d "$d" --arg t "$target" --arg r "$mk_out" \
+          '{stage:"required-dirs", dir:($t + "/" + $d), reason:$r}')"
+        failed=$((failed+1)); continue 2
+      fi
+      rmdir "$emptydir" 2>/dev/null || true
+      ok "created empty ${target}/${d}"
+    done
+  fi
+
   # READ IT BACK. "docker cp reported success" is not the same claim as "the
   # files are where the engine looks", and the difference has cost this
   # project two builds: once when the target was wrong and the copy created a
@@ -497,7 +526,9 @@ for line in "${SERVICES[@]}"; do
   [[ -n "$FIRST_START_EPOCH" ]] || FIRST_START_EPOCH="$(date +%s)"
   record "$name" 'running' "$(jq -n --arg i "$image" --arg ip "$ip" --arg n "$net" --arg c "$config_dir" --arg tg "$target" \
     --arg rb "$readback" --arg p "${in_paths:-}" \
+    --arg rd "${reqdirs:-}" \
     '{image:$i, address:$ip, network:$n, configDir:$c, containerConfigTarget:$tg,
+      requiredEmptyDirs:($rd | split(" ") | map(select(length>0))),
       configReadback:$rb,
       configInContainer:($p | split("\n") | map(select(length>0))),
       note:"running at this instant. Superseded by the late re-check if one ran."}')"
@@ -545,7 +576,8 @@ if [[ ${#STARTED_NAMES[@]} -gt 0 && $DRY_RUN -eq 0 ]]; then
         RESULTS[$i]="$(printf '%s' "${RESULTS[$i]}" | jq -c --arg s "$state" --arg c "$code" --argjson a "$age" \
           '.status = "exited-late"
            | .detail.state = $s | .detail.exitCode = $c | .detail.secondsObserved = $a
-           | .detail.reason = "started, then stopped before the late re-check - the shape the order execution server takes when it does not own its console"
+           | .detail.reason = "started, then stopped before the late re-check"
+           | .detail.diagnosis = "NOT DIAGNOSED HERE. The console-ownership fault is a SIGINT the engine never received; an abort, a configuration error or a failed dependency look nothing like it. Read the exit code and the logs above."
            | .detail.note = "the earlier \"running\" reading was taken at '"$SETTLE_SECONDS"'s and did not survive"')"
       done
       started=$((started-1)); failed=$((failed+1))

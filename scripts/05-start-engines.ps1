@@ -55,7 +55,7 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
-$script:ScriptVersion = '2026-09-23.5-restore-parse-and-refusal-placement'
+$script:ScriptVersion = '2026-09-23.8-ps-brace-check'
 Write-Host "  script version $script:ScriptVersion" -ForegroundColor DarkGray
 
 function Write-Step { param([string] $m) Write-Host ''; Write-Host "==> $m" -ForegroundColor Cyan }
@@ -210,6 +210,8 @@ foreach ($group in @($planObj.groups)) {
             # dotted access in the loops below.
             NeedsDb   = [bool]$svcList[$i].needsDatabase
             DbName    = "$($svcList[$i].dbName)"
+            # Empty directories the engine needs and will not create itself.
+            ReqDirs   = @($svcList[$i].requiredEmptyDirs)
         }
     }
 }
@@ -324,6 +326,9 @@ foreach ($s in $services) {
         if ($s.Network) { $engineArgs += @('-Network', $s.Network) }
         if ($s.Ip)      { $engineArgs += @('-Ip', $s.Ip) }
     }
+    # Plan-driven empty directories the engine needs before it starts. Passed
+    # as separate argv entries so PowerShell does not re-split them.
+    foreach ($d in @($s.ReqDirs)) { if ($d) { $engineArgs += @('-RequiredEmptyDirs', $d) } }
     if ($Replace) { $engineArgs += '-Replace' }
     if ($DryRun)  { $engineArgs += '-DryRun' }
 
@@ -407,7 +412,14 @@ if ($startedNames.Count -gt 0 -and -not $DryRun) {
                 $row.detail.state = "$state"
                 $row.detail.exitCode = "$code"
                 $row.detail.secondsObserved = $age
-                $row.detail.reason = 'started, then stopped before the late re-check - the shape the order execution server takes when it does not own its console'
+                # NAME THE OBSERVATION, NOT A CAUSE. This used to assert the
+                # console-ownership fault. Build 119's RISK engine died with
+                # SIGABRT and exit 3 about twenty seconds in, which is not that
+                # fault at all - the console shape is a SIGINT the engine never
+                # received. The manifest was therefore about to record a
+                # diagnosis the evidence in the same file contradicted.
+                $row.detail.reason = 'started, then stopped before the late re-check'
+                $row.detail.diagnosis = 'NOT DIAGNOSED HERE. The console-ownership fault is a SIGINT the engine never received; an abort, a configuration error or a failed dependency look nothing like it. Read the exit code and the logs above.'
                 $row.detail.note = "the earlier 'running' reading was taken at $SettleSeconds s and did not survive"
             }
             $started--; $failed++

@@ -55,6 +55,9 @@ param(
     [string]   $NamespaceContainer,
     [string]   $EngineHome = 'C:\engine',
     [string[]] $Args_,
+    # Empty directories to create inside the container before it starts.
+    # Plan-driven; see CONTAINER_REQUIRED_DIRS in the generator.
+    [string[]] $RequiredEmptyDirs = @(),
     [switch]   $Replace,
     [switch]   $DryRun
 )
@@ -64,7 +67,7 @@ $ErrorActionPreference = 'Stop'
 # Printed on every run. See the note in scripts/02-prereq-windows.ps1: without a
 # version in the output a stale fetch is invisible, and a retest can silently
 # re-run old code while looking like a fresh result.
-$ScriptVersion = '2026-09-23.5-restore-parse-and-refusal-placement'
+$ScriptVersion = '2026-09-23.8-ps-brace-check'
 Write-Host "  script version $ScriptVersion" -ForegroundColor DarkGray
 
 function Write-Step { param([string] $m) Write-Host ''; Write-Host "==> $m" -ForegroundColor Cyan }
@@ -149,6 +152,33 @@ if ($cp.ExitCode -ne 0) {
     throw "docker cp failed for $Name - the container has been removed so it cannot start unconfigured"
 }
 Write-Ok "$($configFiles.Count) file(s) copied next to the binary"
+
+# DIRECTORIES THE ENGINE NEEDS AND WILL NOT CREATE.
+#
+# The order execution server aborts inside g3log if its log directory is
+# absent. Build 119's RISK engine died twenty seconds in with
+#   FATAL SIGNAL RECEIVED - SIGABRT(22)
+#   stack dump [0] g3::internal::SinkWrapper ... raise ... abort
+# which reads as an engine crash and was a missing folder. Dev confirmed on
+# 2026-09-23 that the OMS needs an EMPTY logs folder present before it starts.
+#
+# `docker cp` of an empty local directory is the only way in: the container is
+# created and NOT started, so there is no process to exec into. Created empty
+# and never populated - anything in it would be another run's history.
+foreach ($d in @($RequiredEmptyDirs)) {
+    if (-not $d) { continue }
+    $stage = Join-Path $env:TEMP "flowtest-empty-$([guid]::NewGuid().ToString('N'))"
+    $null = New-Item -ItemType Directory -Path $stage -Force
+    $mk = Invoke-Docker cp $stage "${Name}:${target}/${d}"
+    Remove-Item $stage -Recurse -Force -ErrorAction SilentlyContinue
+    if ($mk.ExitCode -ne 0) {
+        $null = Invoke-Docker rm -f $Name
+        throw ("could not create the required directory ${target}/${d} in ${Name}: $($mk.Output.Trim()). " +
+               'This engine family aborts at start-up without it, and the abort looks like an ' +
+               'engine fault rather than a missing folder. The container has been removed.')
+    }
+    Write-Ok "created empty ${target}/${d}"
+}
 
 # READ IT BACK, because "docker cp returned 0" and "the engine can see these
 # files" are different claims. On the Linux side the gap between them cost two
