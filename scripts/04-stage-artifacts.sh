@@ -55,7 +55,7 @@ set -euo pipefail
 
 # Printed first, every run. A stale fetch is otherwise invisible - see the note
 # in 02-prereq-windows.ps1.
-SCRIPT_VERSION='2026-09-22.10-ssl-off-declared-deviation'
+SCRIPT_VERSION='2026-09-22.11-containment-readback'
 
 PLAN_FILE="/opt/flowtest/bootstrap/flow-plan-linux.json"
 DRY_RUN=0
@@ -437,11 +437,22 @@ if changes:
 print(json.dumps({"changes": changes}))
 '
 
-apply_config_overrides() {   # apply_config_overrides <staged-dir> <component>
-  local dir="$1" name="$2" ovr entry file fmt section pairs create res err
+# RESULT GOES TO A FILE, NOT TO STDOUT.
+#
+# In this script ok(), warn() and fail() all print to STDOUT. So a function
+# that both reports and returns a value through `$(...)` returns its own
+# diagnostics concatenated with the value - and build 110 did exactly that:
+# the override applied correctly, the log said so, and then
+#   jq: invalid JSON text passed to --argjson
+# because $overrides held three lines of yellow warning text followed by the
+# JSON. Nothing about the failure pointed at the capture. So the JSON is
+# written to a path the caller supplies, and stdout stays what it looks like.
+apply_config_overrides() {   # apply_config_overrides <staged-dir> <component> <out-json-path>
+  local dir="$1" name="$2" outfile="$3" ovr entry file fmt section pairs create res err
   ovr="$(jq -c --arg n "$name" \
     '[.groups[].services[] | select(.containerName==$n)][0].configOverrides // []' "$PLAN_FILE" 2>/dev/null)"
-  [[ -n "$ovr" && "$ovr" != "null" && "$ovr" != "[]" ]] || { printf '[]'; return 0; }
+  printf '[]' > "$outfile"
+  [[ -n "$ovr" && "$ovr" != "null" && "$ovr" != "[]" ]] || return 0
   local applied='[]'
   while IFS= read -r entry; do
     [[ -n "$entry" ]] || continue
@@ -490,7 +501,7 @@ apply_config_overrides() {   # apply_config_overrides <staged-dir> <component>
       --arg who "$(printf '%s' "$entry" | jq -r '.authority // ""')" \
       '. + [{file:$f, section:$s, applied:true, changes:$ch, reason:$why, authority:$who}]')"
   done < <(printf '%s' "$ovr" | jq -c '.[]')
-  printf '%s' "$applied"
+  printf '%s' "$applied" > "$outfile"
 }
 
 hostonly_secret_name() {   # hostonly_secret_name <prefix> <serviceName> <relpath>
@@ -982,9 +993,15 @@ stage_config() {
       # the certificate paths in the config dead text - so applying it after
       # the scan would report a gap that no longer matters and send someone to
       # create a secret nothing reads.
-      local overrides='[]'
+      local overrides='[]' ovr_out
       if [[ "$count" -gt 0 && $DRY_RUN -eq 0 ]]; then
-        overrides="$(apply_config_overrides "$dest" "$name")"
+        ovr_out="$(mktemp)"
+        apply_config_overrides "$dest" "$name" "$ovr_out"
+        overrides="$(cat "$ovr_out")"
+        rm -f "$ovr_out"
+        # Belt and braces: a malformed value here would take the whole manifest
+        # down with an --argjson error twenty lines later.
+        printf '%s' "$overrides" | jq -e . >/dev/null 2>&1 || overrides='[]'
       fi
 
       # WHAT DOES THE CONFIG ASK FOR THAT WE DID NOT STAGE?

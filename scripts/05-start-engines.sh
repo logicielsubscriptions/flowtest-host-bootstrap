@@ -36,7 +36,7 @@
 #
 set -uo pipefail
 
-SCRIPT_VERSION='2026-09-22.10-ssl-off-declared-deviation'
+SCRIPT_VERSION='2026-09-22.11-containment-readback'
 
 PLAN=''
 ONLY=''
@@ -356,7 +356,18 @@ for line in "${SERVICES[@]}"; do
   # The comparison is deliberately against the staged tree rather than a fixed
   # expectation: this catches a partial copy, a wrong target and a missing
   # subtree, and stays correct as the configuration changes.
-  in_files=''; in_subdirs=''; readback='unavailable'
+  #
+  # THE TEST IS CONTAINMENT, NOT EQUALITY. Build 110 refused to start the
+  # Windows hub because C:/engine held 66 files against 13 staged - correctly,
+  # by the rule as written, and wrongly in substance: on that platform the
+  # target IS the engine home, so the binary and its libraries live there too.
+  # Only the Linux target is a config-only directory. So what must hold is
+  # that every staged path is present in the container; extra files in the
+  # target are the image's own and are none of this check's business.
+  #
+  # This still catches everything it was built for: a wrong target leaves 0 of
+  # 15 present, and a dropped subtree leaves 14 of 15.
+  in_files=''; in_subdirs=''; readback='unavailable'; in_missing=''
   if tar_list="$(docker cp "${name}:${target}" - 2>/dev/null | tar -tf - 2>/dev/null)"; then
     in_files="$(printf '%s\n' "$tar_list" | grep -cv '/$' || true)"
     in_subdirs="$(printf '%s\n' "$tar_list" | grep -c '/$' || true)"
@@ -368,20 +379,28 @@ for line in "${SERVICES[@]}"; do
     # configuration repository never held it" - and on a tree exported from
     # Windows, from "the directory is there under a different case".
     in_paths="$(printf '%s\n' "$tar_list" | grep -v '/$' | sed 's|^[^/]*/||' | sort | head -80)"
-    if [[ "$in_files" -eq "$count" ]]; then
+    # Every staged path, relative to the staged root, must appear in the
+    # container's listing. comm needs both sides sorted.
+    staged_paths="$(cd "$config_dir" && find . -type f 2>/dev/null | sed 's|^\./||' | sort)"
+    in_all="$(printf '%s\n' "$tar_list" | grep -v '/$' | sed 's|^[^/]*/||' | sort)"
+    in_missing="$(comm -23 <(printf '%s\n' "$staged_paths") <(printf '%s\n' "$in_all"))"
+    n_present=$(( count - $(printf '%s' "$in_missing" | grep -c . || true) ))
+    if [[ -z "$in_missing" ]]; then
       readback='match'
-      ok "read back from the container: $in_files file(s), $in_subdirs subdirectory(ies) under $target"
+      ok "read back from the container: all $count staged file(s) present under $target ($in_files file(s) there in total)"
       printf '         %s\n' $(printf '%s\n' "$in_paths" | head -40) >&2
     else
       readback='mismatch'
-      fail "$name: the container holds $in_files file(s) under $target but $count were staged"
+      fail "$name: $n_present of $count staged file(s) reached $target. MISSING:"
+      while IFS= read -r m; do [[ -n "$m" ]] && fail "         $m"; done <<< "$in_missing"
       fail "       The engine would run on a partial configuration. Removing it."
       docker rm -f "$name" >/dev/null 2>&1 || true
       record "$name" 'failed' "$(jq -n --arg t "$target" \
         --argjson staged "$count" --argjson found "$in_files" \
-        --arg p "$in_paths" \
-        '{stage:"verify-config", reason:"the configuration inside the container does not match what was staged",
-          target:$t, stagedFiles:$staged, filesInContainer:$found,
+        --arg p "$in_paths" --arg miss "$in_missing" \
+        '{stage:"verify-config", reason:"staged configuration files are missing inside the container",
+          target:$t, stagedFiles:$staged, filesInTarget:$found,
+          missingInContainer:($miss | split("\n") | map(select(length>0))),
           pathsInContainer:($p | split("\n") | map(select(length>0)))}')"
       failed=$((failed+1)); continue
     fi

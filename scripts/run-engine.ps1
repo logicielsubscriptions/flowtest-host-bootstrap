@@ -64,7 +64,7 @@ $ErrorActionPreference = 'Stop'
 # Printed on every run. See the note in scripts/02-prereq-windows.ps1: without a
 # version in the output a stale fetch is invisible, and a retest can silently
 # re-run old code while looking like a fresh result.
-$ScriptVersion = '2026-09-22.10-ssl-off-declared-deviation'
+$ScriptVersion = '2026-09-22.11-containment-readback'
 Write-Host "  script version $ScriptVersion" -ForegroundColor DarkGray
 
 function Write-Step { param([string] $m) Write-Host ''; Write-Host "==> $m" -ForegroundColor Cyan }
@@ -170,19 +170,39 @@ Remove-Item $readDir -Recurse -Force -ErrorAction SilentlyContinue
 $null = New-Item -ItemType Directory -Path $readDir -Force
 $read = Invoke-Docker cp "${Name}:${target}" $readDir
 if ($read.ExitCode -eq 0) {
+    # CONTAINMENT, NOT EQUALITY. Build 110 refused to start this hub because
+    # C:/engine held 66 files against 13 staged - correct by the rule as
+    # written, wrong in substance: on Windows the target IS the engine home,
+    # so the binary and its libraries live there too. Only the Linux target is
+    # a config-only directory. What must hold is that every staged path is
+    # present; extra files are the image's own.
+    #
+    # Nothing is lost: a wrong target leaves 0 of 13 present, a dropped
+    # subtree leaves 12 of 13, and both still refuse to start.
     $back = @(Get-ChildItem -Path $readDir -File -Recurse -ErrorAction SilentlyContinue)
     $prefix = [regex]::Escape($readDir) + '\\?'
-    $script:ConfigInContainer = @($back | ForEach-Object { ($_.FullName -replace $prefix, '') -replace '\\', '/' } | Sort-Object)
-    if ($back.Count -eq $configFiles.Count) {
+    $rel = @($back | ForEach-Object { ($_.FullName -replace $prefix, '') -replace '\\', '/' })
+    # docker cp OUT nests everything under the copied directory's own name.
+    $inTarget = @{}
+    foreach ($r in $rel) { $inTarget[($r -replace '^[^/]*/', '')] = $true }
+    $script:ConfigInContainer = @($inTarget.Keys | Sort-Object)
+
+    $stagedRel = @($configFiles | ForEach-Object {
+        ($_.FullName.Substring($ConfigDir.Length).TrimStart('\')) -replace '\\', '/' })
+    $missing = @($stagedRel | Where-Object { -not $inTarget.ContainsKey($_) } | Sort-Object)
+
+    if ($missing.Count -eq 0) {
         $script:ConfigReadback = 'match'
-        Write-Ok "read back from the container: $($back.Count) file(s) under $target"
+        Write-Ok ("read back from the container: all $($stagedRel.Count) staged file(s) present " +
+                  "under $target ($($back.Count) file(s) there in total)")
         $script:ConfigInContainer | Select-Object -First 40 | ForEach-Object { Write-Host "         $_" }
     } else {
         $script:ConfigReadback = 'mismatch'
-        $found = $back.Count
+        $present = $stagedRel.Count - $missing.Count
         Remove-Item $readDir -Recurse -Force -ErrorAction SilentlyContinue
         $null = Invoke-Docker rm -f $Name
-        throw ("$Name holds $found file(s) under $target but $($configFiles.Count) were staged. " +
+        throw ("$Name - only $present of $($stagedRel.Count) staged file(s) reached ${target}. " +
+               "MISSING: $($missing -join ', '). " +
                'The container has been removed rather than run on a partial configuration.')
     }
 }
