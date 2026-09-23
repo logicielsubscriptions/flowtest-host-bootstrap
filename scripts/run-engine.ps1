@@ -67,7 +67,7 @@ $ErrorActionPreference = 'Stop'
 # Printed on every run. See the note in scripts/02-prereq-windows.ps1: without a
 # version in the output a stale fetch is invisible, and a retest can silently
 # re-run old code while looking like a fresh result.
-$ScriptVersion = '2026-09-23.8-ps-brace-check'
+$ScriptVersion = '2026-09-23.9-capture-engine-logs'
 Write-Host "  script version $ScriptVersion" -ForegroundColor DarkGray
 
 function Write-Step { param([string] $m) Write-Host ''; Write-Host "==> $m" -ForegroundColor Cyan }
@@ -155,12 +155,16 @@ Write-Ok "$($configFiles.Count) file(s) copied next to the binary"
 
 # DIRECTORIES THE ENGINE NEEDS AND WILL NOT CREATE.
 #
-# The order execution server aborts inside g3log if its log directory is
-# absent. Build 119's RISK engine died twenty seconds in with
-#   FATAL SIGNAL RECEIVED - SIGABRT(22)
-#   stack dump [0] g3::internal::SinkWrapper ... raise ... abort
-# which reads as an engine crash and was a missing folder. Dev confirmed on
-# 2026-09-23 that the OMS needs an EMPTY logs folder present before it starts.
+# Dev confirmed on 2026-09-23 that the OMS needs an EMPTY logs folder present
+# before it starts and will not create one, so this creates it.
+#
+# IT IS NOT A FIX FOR THE SIGABRT. Build 121 created the folder and the RISK
+# engine aborted identically, so that crash is something else. The earlier
+# reading - that the g3log SinkWrapper frame at the top of the stack dump was
+# the cause - was wrong: that frame is g3log's crash HANDLER unwinding, and
+# the engine had already written its log file successfully. Do not let a
+# familiar-looking frame stand in for a diagnosis; read the engine's own log,
+# which is why 05-start-engines now copies it out on every failure.
 #
 # `docker cp` of an empty local directory is the only way in: the container is
 # created and NOT started, so there is no process to exec into. Created empty

@@ -55,7 +55,7 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
-$script:ScriptVersion = '2026-09-23.8-ps-brace-check'
+$script:ScriptVersion = '2026-09-23.9-capture-engine-logs'
 Write-Host "  script version $script:ScriptVersion" -ForegroundColor DarkGray
 
 function Write-Step { param([string] $m) Write-Host ''; Write-Host "==> $m" -ForegroundColor Cyan }
@@ -249,6 +249,40 @@ if ($missing.Count -gt 0) {
 }
 
 # ---------------------------------------------------------------------------
+function Copy-EngineLogs {
+    <#  PULL THE ENGINE'S OWN LOG OUT OF A CONTAINER THAT DIED.
+
+        `docker logs` is stdout only. These engines write a g3log FILE next to
+        the binary, and it holds what happened before the crash. Build 121's
+        RISK engine aborted with SIGABRT and the console carried nothing but
+        the stack dump, so three runs were spent guessing at causes the engine
+        had already written down - and the top frame of that dump is g3log's
+        crash HANDLER, which reads like the cause and is not.
+
+        Best-effort: a container with no log is not an extra failure, and this
+        must never mask the real one. Mirrors capture_engine_logs in the .sh. #>
+    param([Parameter(Mandatory)][string] $Name, [string] $Target)
+    if (-not $Target) { return }
+    $dest = Join-Path $workRoot "engine-logs\$Name"
+    $null = New-Item -ItemType Directory -Path $dest -Force -ErrorAction SilentlyContinue
+    $tmp = Join-Path $env:TEMP "flowtest-logs-$([guid]::NewGuid().ToString('N'))"
+    $null = New-Item -ItemType Directory -Path $tmp -Force
+    $cp = Invoke-Native docker @('cp', "${Name}:$Target", $tmp)
+    if ($cp.ExitCode -eq 0) {
+        $logs = @(Get-ChildItem -Path $tmp -Recurse -File -ErrorAction SilentlyContinue |
+                  Where-Object { $_.Name -like '*.log' -or $_.Name -like '*g3log*' })
+        foreach ($f in $logs) { Copy-Item $f.FullName -Destination $dest -Force -ErrorAction SilentlyContinue }
+        if ($logs.Count -gt 0) {
+            Write-Warn "${Name}: copied $($logs.Count) engine log file(s) to $dest - READ THESE, not the stack dump"
+        } else {
+            Write-Warn "${Name}: the container had no log files to copy"
+        }
+    } else {
+        Write-Warn "${Name}: could not copy logs out of the container"
+    }
+    Remove-Item $tmp -Recurse -Force -ErrorAction SilentlyContinue
+}
+
 $results = @()
 $startedNames = @()
 $script:FirstStart = $null
@@ -321,6 +355,24 @@ foreach ($s in $services) {
     $engineArgs = @('-Name', $s.Name, '-Image', $image, '-ConfigDir', $configDir,
                     '-EngineHome', $s.Target)
     if ($s.Shared -and -not $s.IsFirst) {
+        # THE OWNER HAS TO BE ALIVE, AND ITS DEATH IS NOT THIS ENGINE'S FAULT.
+        #
+        # Build 121: the RISK engine died and the OE that shares its namespace
+        # failed with "cannot join network of a non-running container", which
+        # reads as an independent fault on the OE and is a consequence of the
+        # other engine's crash. Said plainly so the manifest points at the
+        # component that actually failed.
+        $ownerUp = @((Invoke-Native docker @('ps','--format','{{.Names}}')).Output -split "`r?`n" |
+                     Where-Object { $_.Trim() -eq $s.Owner })
+        if ($ownerUp.Count -eq 0) {
+            Write-Fail "$($s.Name): its namespace owner '$($s.Owner)' is not running, so it cannot start."
+            Write-Fail '       This is a CONSEQUENCE, not this engine''s own fault - these two share'
+            Write-Fail "       one production address, so look at why '$($s.Owner)' stopped."
+            $results += [pscustomobject]@{ component = $s.Name; status = 'refused'
+                detail = @{ reason = 'the namespace owner is not running'; namespaceOwner = $s.Owner
+                            note = 'consequence of the owner failing; diagnose that component, not this one' } }
+            $failed++; continue
+        }
         $engineArgs += @('-NamespaceContainer', $s.Owner)
     } else {
         if ($s.Network) { $engineArgs += @('-Network', $s.Network) }
@@ -361,6 +413,7 @@ foreach ($s in $services) {
         Write-Fail "$($s.Name): container is '$state' (exit $code) $SettleSeconds s after start. Last output:"
         (Invoke-Native docker @('logs','--tail','30',$s.Name)).Output -split "`r?`n" |
             ForEach-Object { Write-Host "         $_" -ForegroundColor DarkGray }
+        Copy-EngineLogs -Name $s.Name -Target $s.Target
         $results += [pscustomobject]@{ component = $s.Name; status = 'exited'
             detail = @{ reason = 'did not stay running'; state = "$state"; exitCode = "$code"; image = $image } }
         $failed++; continue
@@ -407,6 +460,8 @@ if ($startedNames.Count -gt 0 -and -not $DryRun) {
             Write-Fail "${n}: was running at $SettleSeconds s and is '$state' (exit $code) at $age s. Last output:"
             (Invoke-Native docker @('logs','--tail','30',$n)).Output -split "`r?`n" |
                 ForEach-Object { Write-Host "         $_" -ForegroundColor DarkGray }
+            $svcRow = @($services | Where-Object { $_.Name -eq $n }) | Select-Object -First 1
+            if ($svcRow) { Copy-EngineLogs -Name $n -Target $svcRow.Target }
             if ($row) {
                 $row.status = 'exited-late'
                 $row.detail.state = "$state"

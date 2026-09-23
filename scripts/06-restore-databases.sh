@@ -37,7 +37,7 @@
 #
 set -uo pipefail
 
-SCRIPT_VERSION='2026-09-23.8-ps-brace-check'
+SCRIPT_VERSION='2026-09-23.9-capture-engine-logs'
 
 PLAN=''
 SA_SECRET=''

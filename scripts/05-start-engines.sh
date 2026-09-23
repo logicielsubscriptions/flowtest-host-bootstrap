@@ -42,7 +42,7 @@
 #
 set -uo pipefail
 
-SCRIPT_VERSION='2026-09-23.8-ps-brace-check'
+SCRIPT_VERSION='2026-09-23.9-capture-engine-logs'
 
 PLAN=''
 ONLY=''
@@ -276,6 +276,37 @@ fi
 # ---------------------------------------------------------------------------
 MANIFEST="${WORK_ROOT}/started-${ROLE}.json"
 RESULTS=()
+# PULL THE ENGINE'S OWN LOG OUT OF A CONTAINER THAT DIED.
+#
+# `docker logs` is stdout only. These engines write a g3log FILE next to the
+# binary, and it holds what happened before the crash - build 121's RISK
+# engine aborted with SIGABRT and the console showed nothing but the stack
+# dump, so three runs were spent guessing at causes the engine had already
+# written down. Copy the log out on every failure and let the build archive
+# it.
+#
+# Best-effort: a container that never created a log is not an additional
+# failure, and this must never mask the real one.
+capture_engine_logs() {   # capture_engine_logs <container> <target-dir-in-container>
+  local name="$1" target="$2"
+  local dest="${WORK_ROOT}/engine-logs/${name}"
+  mkdir -p "$dest" 2>/dev/null || return 0
+  local tmp; tmp="$(mktemp -d)"
+  if docker cp "${name}:${target}" "$tmp" >/dev/null 2>&1; then
+    # Only the logs: the rest is the config we already have and the binary.
+    find "$tmp" -type f \( -name '*.log' -o -name '*.g3log*' \) -exec cp {} "$dest/" \; 2>/dev/null || true
+    local n; n="$(find "$dest" -type f 2>/dev/null | wc -l | tr -d ' ')"
+    if [[ "$n" -gt 0 ]]; then
+      warn "$name: copied $n engine log file(s) to $dest - READ THESE, not the stack dump"
+    else
+      warn "$name: the container had no log files to copy"
+    fi
+  else
+    warn "$name: could not copy logs out of the container"
+  fi
+  rm -rf "$tmp" 2>/dev/null || true
+}
+
 record() {  # name, status, detail-json
   RESULTS+=("$(jq -n --arg n "$1" --arg s "$2" --argjson d "$3" \
                  '{component:$n, status:$s, detail:$d}')")
@@ -347,6 +378,22 @@ for line in "${SERVICES[@]}"; do
   # --ip alongside it.
   net_args=()
   if [[ "$shared" == "shared" && "$owner" != "$name" ]]; then
+    # THE OWNER HAS TO BE ALIVE, AND ITS DEATH IS NOT THIS ENGINE'S FAULT.
+    #
+    # Build 121: the RISK engine died, and the OE that shares its namespace
+    # then failed with "cannot join network of a non-running container" -
+    # which reads as an independent fault on the OE and is a consequence of
+    # the other engine's crash. Said plainly here so the manifest points at
+    # the engine that actually failed.
+    if ! docker ps --format '{{.Names}}' | grep -qx "$owner"; then
+      fail "$name: its namespace owner '$owner' is not running, so it cannot start."
+      fail "       This is a CONSEQUENCE, not this engine's own fault - these two share one"
+      fail "       production address, so look at why '$owner' stopped."
+      record "$name" 'refused' "$(jq -n --arg o "$owner" \
+        '{reason:"the namespace owner is not running", namespaceOwner:$o,
+          note:"consequence of the owner failing; diagnose that component, not this one"}')"
+      failed=$((failed+1)); continue
+    fi
     net_args=(--network "container:${owner}")
     ok "sharing the network namespace of $owner"
   elif [[ -n "$net" ]]; then
@@ -513,6 +560,7 @@ for line in "${SERVICES[@]}"; do
     code="$(docker inspect -f '{{.State.ExitCode}}' "$name" 2>/dev/null || echo unknown)"
     fail "$name: container is '$state' (exit $code) after ${SETTLE_SECONDS}s. Last output:"
     docker logs --tail 30 "$name" 2>&1 | sed 's/^/           /' >&2 || true
+    capture_engine_logs "$name" "$target"
     record "$name" 'exited' "$(jq -n --arg s "$state" --arg i "$image" --arg c "$code" \
       --arg rb "$readback" --arg p "${in_paths:-}" \
       '{reason:"did not stay running", state:$s, exitCode:$c, image:$i,
@@ -571,6 +619,8 @@ if [[ ${#STARTED_NAMES[@]} -gt 0 && $DRY_RUN -eq 0 ]]; then
       code="$(docker inspect -f '{{.State.ExitCode}}' "$name" 2>/dev/null || echo unknown)"
       fail "$name: was running at ${SETTLE_SECONDS}s and is '$state' (exit $code) at ${age}s. Last output:"
       docker logs --tail 30 "$name" 2>&1 | sed 's/^/           /' >&2 || true
+      capture_engine_logs "$name" "$(jq -r --arg n "$name" \
+        '[.groups[].services[] | select(.containerName==$n)][0].containerConfigTarget // ""' "$PLAN")"
       for i in "${!RESULTS[@]}"; do
         [[ "$(printf '%s' "${RESULTS[$i]}" | jq -r '.component // ""')" == "$name" ]] || continue
         RESULTS[$i]="$(printf '%s' "${RESULTS[$i]}" | jq -c --arg s "$state" --arg c "$code" --argjson a "$age" \
