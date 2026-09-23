@@ -55,7 +55,7 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
-$script:ScriptVersion = '2026-09-23.4-ssm-poll-blank-status'
+$script:ScriptVersion = '2026-09-23.5-restore-parse-and-refusal-placement'
 Write-Host "  script version $script:ScriptVersion" -ForegroundColor DarkGray
 
 function Write-Step { param([string] $m) Write-Host ''; Write-Host "==> $m" -ForegroundColor Cyan }
@@ -229,6 +229,33 @@ if ($Only) {
 Write-Step "Image availability ($($services.Count) component(s))"
 $missing = @()
 foreach ($s in $services) {
+    $repo = "$EcrNamespace/$($s.Family)"
+    $q = Invoke-Native aws @('ecr','describe-images','--repository-name',$repo,
+                             '--image-ids',"imageTag=$($s.Tag)",'--region',$region)
+    if ($q.ExitCode -eq 0) { Write-Ok "${repo}:$($s.Tag)" }
+    else {
+        $missing += "${repo}:$($s.Tag)  (for $($s.Service))"
+        Write-Fail "${repo}:$($s.Tag) NOT in the registry"
+    }
+}
+if ($missing.Count -gt 0) {
+    Write-Host ''
+    Write-Fail "$($missing.Count) image tag(s) missing. Nothing was started."
+    $missing | ForEach-Object { Write-Host "         $_" -ForegroundColor Red }
+    Write-Host '         Build and push them with images\build-images.ps1, then re-run.' -ForegroundColor Red
+    exit 1
+}
+
+# ---------------------------------------------------------------------------
+$results = @()
+$startedNames = @()
+$script:FirstStart = $null
+$started = 0
+$failed  = 0
+
+foreach ($s in $services) {
+    Write-Step $s.Name
+
     # A DATABASE THIS ENGINE NEEDS AND DOES NOT HAVE.
     #
     # Checked FIRST, before configuration, because it is the more dangerous
@@ -260,32 +287,6 @@ foreach ($s in $services) {
         Write-Ok "database $($s.DbName) is restored"
     }
 
-    $repo = "$EcrNamespace/$($s.Family)"
-    $q = Invoke-Native aws @('ecr','describe-images','--repository-name',$repo,
-                             '--image-ids',"imageTag=$($s.Tag)",'--region',$region)
-    if ($q.ExitCode -eq 0) { Write-Ok "${repo}:$($s.Tag)" }
-    else {
-        $missing += "${repo}:$($s.Tag)  (for $($s.Service))"
-        Write-Fail "${repo}:$($s.Tag) NOT in the registry"
-    }
-}
-if ($missing.Count -gt 0) {
-    Write-Host ''
-    Write-Fail "$($missing.Count) image tag(s) missing. Nothing was started."
-    $missing | ForEach-Object { Write-Host "         $_" -ForegroundColor Red }
-    Write-Host '         Build and push them with images\build-images.ps1, then re-run.' -ForegroundColor Red
-    exit 1
-}
-
-# ---------------------------------------------------------------------------
-$results = @()
-$startedNames = @()
-$script:FirstStart = $null
-$started = 0
-$failed  = 0
-
-foreach ($s in $services) {
-    Write-Step $s.Name
     $configDir = Join-Path $configRoot $s.Name
 
     if (-not (Test-Path $configDir)) {

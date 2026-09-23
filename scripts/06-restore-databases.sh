@@ -37,7 +37,7 @@
 #
 set -uo pipefail
 
-SCRIPT_VERSION='2026-09-23.4-ssm-poll-blank-status'
+SCRIPT_VERSION='2026-09-23.5-restore-parse-and-refusal-placement'
 
 PLAN=''
 SA_SECRET=''
@@ -244,6 +244,20 @@ sqlq() {  # sqlq <sql>  -> stdout, exit code of sqlcmd
     "$SQLCMD" "$1" 2>&1
 }
 
+# THE SAME, BUT WITH AN EXPLICIT COLUMN SEPARATOR.
+#
+# Build 116 parsed RESTORE FILELISTONLY by whitespace and got "no D or L rows
+# parsed" for both databases. Column 2 is the PHYSICAL file name, and a
+# production path contains spaces - "D:\Program Files\..." - so splitting on
+# whitespace put the type letter in a different field on every row. The parse
+# found nothing, and "nothing" read as a corrupt backup rather than as a
+# corrupt parse. A separator the data cannot contain removes the guesswork.
+sqlq_cols() {  # sqlq_cols <sql>  -> pipe-separated columns
+  docker exec "$CONTAINER" /bin/sh -c \
+    'SQLCMDPASSWORD="$MSSQL_SA_PASSWORD" exec "$0" -C -S localhost -U sa -b -h -1 -W -s "|" -Q "$1"' \
+    "$SQLCMD" "$1" 2>&1
+}
+
 # ---------------------------------------------------------------------------
 step 'Wait for the instance to accept connections'
 if [[ $DRY_RUN -eq 1 ]]; then
@@ -312,7 +326,7 @@ while IFS= read -r entry; do
   # called on the production host and carry its paths, which do not exist here,
   # so every one needs a MOVE. Reading FILELISTONLY is the only way to know
   # them; guessing "<db>" and "<db>_log" is right often enough to be dangerous.
-  filelist="$(sqlq "RESTORE FILELISTONLY FROM DISK = N'${incontainer}'")"
+  filelist="$(sqlq_cols "RESTORE FILELISTONLY FROM DISK = N'${incontainer}'")"
   fl_rc=$?
   if [[ $fl_rc -ne 0 || -z "$filelist" ]]; then
     fail "$dbname: could not read the backup's file list. Output:"
@@ -321,13 +335,15 @@ while IFS= read -r entry; do
     failed=$((failed+1)); continue
   fi
 
-  # -W -h -1 gives one row per line, columns separated by whitespace. Only the
-  # logical name (first field) and the type (D or L) are needed.
+  # Columns are pipe-separated (see sqlq_cols). Field 1 is the logical name,
+  # field 3 the type - D for data, L for log - and field 2 is the physical
+  # path, which is exactly the one that contains spaces.
   moves=''
   while IFS= read -r row; do
     [[ -n "$row" ]] || continue
-    logical="$(printf '%s' "$row" | awk '{print $1}')"
-    type_="$(printf '%s' "$row" | awk '{print $3}')"
+    [[ "$row" == *"|"* ]] || continue       # headers, blank rows, row counts
+    logical="$(printf '%s' "$row" | awk -F'|' '{gsub(/^ +| +$/,"",$1); print $1}')"
+    type_="$(printf '%s' "$row" | awk -F'|' '{gsub(/^ +| +$/,"",$3); print $3}')"
     [[ -n "$logical" ]] || continue
     case "$type_" in
       D) moves+=", MOVE N'${logical}' TO N'/var/opt/mssql/data/${dbname}_${logical}.mdf'" ;;
@@ -337,8 +353,15 @@ while IFS= read -r entry; do
   done <<< "$filelist"
 
   if [[ -z "$moves" ]]; then
+    # PRINT THE RAW LIST. Build 116 recorded "no D or L rows parsed" and
+    # nothing else, which reads as a bad backup when it was a bad parse.
     fail "$dbname: the backup's file list yielded no data or log files - refusing to restore blind"
-    record "$dbname" 'failed' "$(jq -n --arg s "$svc" --arg r "$filelist" '{service:$s, stage:"filelistonly", reason:"no D or L rows parsed", output:$r}')"
+    fail "       Raw FILELISTONLY output follows; if it has rows, the PARSE is wrong, not the backup:"
+    printf '         %s\n' "$filelist" >&2
+    record "$dbname" 'failed' "$(jq -n --arg s "$svc" --arg r "$filelist" \
+      '{service:$s, stage:"filelistonly",
+        reason:"no D or L rows parsed from the file list - see rawOutput; rows present there mean the parse is at fault, not the backup",
+        rawOutput:$r}')"
     failed=$((failed+1)); continue
   fi
 

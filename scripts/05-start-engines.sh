@@ -42,7 +42,7 @@
 #
 set -uo pipefail
 
-SCRIPT_VERSION='2026-09-23.4-ssm-poll-blank-status'
+SCRIPT_VERSION='2026-09-23.5-restore-parse-and-refusal-placement'
 
 PLAN=''
 ONLY=''
