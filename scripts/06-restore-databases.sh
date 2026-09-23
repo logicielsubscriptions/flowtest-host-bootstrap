@@ -37,7 +37,7 @@
 #
 set -uo pipefail
 
-SCRIPT_VERSION='2026-09-23.10-declared-bypasses'
+SCRIPT_VERSION='2026-09-23.11-cps-method-size'
 
 PLAN=''
 SA_SECRET=''
