@@ -55,7 +55,7 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
-$script:ScriptVersion = '2026-09-24.2-ship-publishes-flows'
+$script:ScriptVersion = '2026-09-24.4-namespace-consequence-and-log-capture'
 Write-Host "  script version $script:ScriptVersion" -ForegroundColor DarkGray
 
 function Write-Step { param([string] $m) Write-Host ''; Write-Host "==> $m" -ForegroundColor Cyan }
@@ -269,8 +269,14 @@ function Copy-EngineLogs {
     $null = New-Item -ItemType Directory -Path $tmp -Force
     $cp = Invoke-Native docker @('cp', "${Name}:$Target", $tmp)
     if ($cp.ExitCode -eq 0) {
+        # '*.log' ONLY. The previous filter also took '*g3log*', which matches
+        # g3log.dll - the LIBRARY, not a log. Build 129's captured archive
+        # contained exactly one member: a 360 KB DLL, and no logs at all. The
+        # engine's own file is named like
+        # Internal_LSL_Modules.g3log.20260924-080939.log, so the extension
+        # alone finds it.
         $logs = @(Get-ChildItem -Path $tmp -Recurse -File -ErrorAction SilentlyContinue |
-                  Where-Object { $_.Name -like '*.log' -or $_.Name -like '*g3log*' })
+                  Where-Object { $_.Extension -eq '.log' })
         foreach ($f in $logs) { Copy-Item $f.FullName -Destination $dest -Force -ErrorAction SilentlyContinue }
         if ($logs.Count -gt 0) {
             Write-Warn "${Name}: copied $($logs.Count) engine log file(s) to $dest - READ THESE, not the stack dump"
@@ -392,6 +398,25 @@ foreach ($s in $services) {
         continue
     }
     if ($run.ExitCode -ne 0) {
+        # A DEAD NAMESPACE HOLDER IS A CONSEQUENCE, NOT THIS ENGINE'S FAULT.
+        #
+        # The pre-flight check above asks docker ps whether the holder is up,
+        # but it cannot close the race: build 129's RISK engine was running at
+        # that moment and had aborted by the time `docker start` ran, so the
+        # OE's manifest entry read only "run-engine.ps1 exited 1" - a dead end
+        # pointing at the wrong component. Recognise docker's own words and
+        # say whose failure this actually is.
+        $joinFail = "$($run.Output)" -match 'cannot join network of a non[- ]running container'
+        if ($joinFail) {
+            Write-Fail "$($s.Name): could not start because its namespace owner '$($s.Owner)' is not running."
+            Write-Fail '       This is a CONSEQUENCE, not this engine''s own fault - these two share'
+            Write-Fail "       one production address, so diagnose '$($s.Owner)', not this component."
+            $results += [pscustomobject]@{ component = $s.Name; status = 'refused'
+                detail = @{ reason = 'the namespace owner stopped before this engine could join it'
+                            namespaceOwner = $s.Owner; image = $image
+                            note = 'consequence of the owner failing; diagnose that component, not this one' } }
+            $failed++; continue
+        }
         Write-Fail "$($s.Name): run-engine.ps1 exited $($run.ExitCode)"
         $results += [pscustomobject]@{ component = $s.Name; status = 'failed'
             detail = @{ reason = "run-engine.ps1 exited $($run.ExitCode)"; image = $image } }

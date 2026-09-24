@@ -37,7 +37,7 @@
 #
 set -uo pipefail
 
-SCRIPT_VERSION='2026-09-24.2-ship-publishes-flows'
+SCRIPT_VERSION='2026-09-24.4-namespace-consequence-and-log-capture'
 
 PLAN=''
 SA_SECRET=''

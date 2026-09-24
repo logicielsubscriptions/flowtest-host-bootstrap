@@ -42,7 +42,7 @@
 #
 set -uo pipefail
 
-SCRIPT_VERSION='2026-09-24.2-ship-publishes-flows'
+SCRIPT_VERSION='2026-09-24.4-namespace-consequence-and-log-capture'
 
 PLAN=''
 ONLY=''
@@ -294,7 +294,10 @@ capture_engine_logs() {   # capture_engine_logs <container> <target-dir-in-conta
   local tmp; tmp="$(mktemp -d)"
   if docker cp "${name}:${target}" "$tmp" >/dev/null 2>&1; then
     # Only the logs: the rest is the config we already have and the binary.
-    find "$tmp" -type f \( -name '*.log' -o -name '*.g3log*' \) -exec cp {} "$dest/" \; 2>/dev/null || true
+    # '*.log' ONLY - parity with Copy-EngineLogs in the .ps1. A '*g3log*'
+    # pattern also matches the g3log LIBRARY: build 129's Windows capture came
+    # back holding one 360 KB DLL and no logs. The engine's own file ends .log.
+    find "$tmp" -type f -name '*.log' -exec cp {} "$dest/" \; 2>/dev/null || true
     local n; n="$(find "$dest" -type f 2>/dev/null | wc -l | tr -d ' ')"
     if [[ "$n" -gt 0 ]]; then
       warn "$name: copied $n engine log file(s) to $dest - READ THESE, not the stack dump"

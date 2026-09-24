@@ -108,7 +108,7 @@ trap {
 
 # Printed first, every run. Without it a stale fetch is invisible and a retest
 # can silently re-run old code while looking like a fresh result.
-$script:ScriptVersion = '2026-09-24.2-ship-publishes-flows'
+$script:ScriptVersion = '2026-09-24.4-namespace-consequence-and-log-capture'
 
 function Write-Step { param([string] $Message) Write-Host "`n=== $Message ===" -ForegroundColor Cyan }
 function Write-Ok   { param([string] $Message) Write-Host "  [ok]   $Message" -ForegroundColor Green }
@@ -403,13 +403,69 @@ function Set-IniValues {
     param([Parameter(Mandatory)][string] $Path,
           [Parameter(Mandatory)][string] $Section,
           [Parameter(Mandatory)][hashtable] $Set,
-          [bool] $CreateSectionIfAbsent = $true)
+          [bool] $CreateSectionIfAbsent = $true,
+          [string] $Scope = 'section')
 
     $raw = [System.IO.File]::ReadAllText($Path)
     $crlf = $raw.Contains("`r`n")
     $lines = [System.Collections.Generic.List[string]]@($raw -split "`n")
     $want = @{}
     foreach ($k in $Set.Keys) { $want[$k.ToLowerInvariant()] = @($k, [string]$Set[$k]) }
+
+    # SCOPE 'wherever-present': set these keys in EVERY section that already
+    # declares them, and create nothing.
+    #
+    # RoutingRules.ini has no [RoutingRules] section to target. Its real
+    # sections are [RoutingRules/<SessionTargetID>/Rule<N>] - one per session
+    # per rule - so a setting like EnableSymbolValidationAndPopulation lives
+    # inside whichever rule blocks use it. Build 129 recorded "section
+    # [RoutingRules] not present and createSectionIfAbsent is false": the
+    # helper correctly refusing to invent a section this product has never had.
+    #
+    # Turning a setting OFF is precisely where creating it would be wrong. If
+    # the key is absent the behaviour is already the default, and writing it
+    # into a section the engine does not read changes nothing while looking
+    # like it did. Mirrors the 'wherever-present' branch of INI_SET in the .sh.
+    if ($Scope -eq 'wherever-present') {
+        $changes = @(); $hits = 0; $cur = $null
+        $out = [System.Collections.Generic.List[string]]::new()
+        foreach ($line in $lines) {
+            $bare = $line.TrimEnd("`r")
+            $t = $bare.Trim()
+            if ($t.StartsWith('[') -and $t.EndsWith(']')) {
+                $cur = $t.Substring(1, $t.Length - 2).Trim()
+                $out.Add($line)
+                continue
+            }
+            if ($bare.Contains('=') -and -not ($t.StartsWith(';') -or $t.StartsWith('#'))) {
+                $key = $bare.Split('=', 2)[0].Trim()
+                $lk = $key.ToLowerInvariant()
+                if ($want.ContainsKey($lk)) {
+                    $old = $bare.Split('=', 2)[1].Trim()
+                    $new = $want[$lk][1]
+                    $hits++
+                    if ($old -ne $new) {
+                        $changes += [pscustomobject]@{ key = $key; from = $old; to = $new; section = $cur }
+                        $out.Add("$key=$new" + $(if ($line.EndsWith("`r")) { "`r" } else { '' }))
+                        continue
+                    }
+                }
+            }
+            $out.Add($line)
+        }
+        if ($hits -eq 0) {
+            $names = (($want.Values | ForEach-Object { $_[0] }) | Sort-Object) -join ', '
+            return [pscustomobject]@{ error = "none of $names appears anywhere in this file, so nothing was changed. Creating them is deliberately not done: a key the engine does not already read changes no behaviour." }
+        }
+        while ($out.Count -gt 0 -and -not $out[$out.Count - 1].Trim()) { $out.RemoveAt($out.Count - 1) }
+        $out.Add('')
+        if ($changes.Count -gt 0) {
+            $text = ($out -join "`n")
+            if ($crlf) { $text = ($text -replace "`r`n", "`n") -replace "`n", "`r`n" }
+            [System.IO.File]::WriteAllText($Path, $text, (New-Object System.Text.UTF8Encoding $false))
+        }
+        return [pscustomobject]@{ changes = $changes; occurrences = $hits }
+    }
 
     $changes = @(); $seen = @{}; $cur = $null
     $out = [System.Collections.Generic.List[string]]::new()
@@ -515,7 +571,8 @@ function Invoke-ConfigOverrides {
         $set = @{}
         foreach ($prop in $e.set.PSObject.Properties) { $set[$prop.Name] = [string]$prop.Value }
         $res = Set-IniValues -Path $target -Section $e.section -Set $set `
-                 -CreateSectionIfAbsent ([bool]$e.createSectionIfAbsent)
+                 -CreateSectionIfAbsent ([bool]$e.createSectionIfAbsent) `
+                 -Scope $(if ($e.scope) { [string]$e.scope } else { 'section' })
         if ($res.error) {
             Write-Warn "${Component}: override of $($e.file) not applied: $($res.error)"
             $r = @{ file = $e.file; applied = $false; reason = $res.error }
@@ -1097,6 +1154,24 @@ function Stage-Config {
                 }
                 $files = @(Get-ChildItem -LiteralPath $dest -File).Count
             }
+            # DECLARED DEVIATIONS APPLY HERE TOO.
+            #
+            # They did not, until build 129. Overrides were called only on the
+            # git branch of this switch, so a component whose config comes from
+            # the daily snapshot silently received none - and its manifest
+            # entry had no configOverrides key at all, so nothing downstream
+            # could tell "no overrides declared" from "overrides never
+            # attempted". Build 129's RISK engine was exactly that case: the
+            # flow declared a bypass, the plan carried it, and the engine
+            # started with production's unmodified configuration and died on
+            # the dependency the bypass existed to avoid.
+            #
+            # Where configuration comes from is not a reason to apply a
+            # deviation or not. Every staging path applies them, or the
+            # declaration means nothing.
+            $overrides = @()
+            if ($files -gt 0 -and -not $DryRun) { $overrides = @(Invoke-ConfigOverrides -Dir $dest -Component $Name) }
+
             # marketDateVerdict is the field to read, not dateOffsetDays. The
             # offset alone is what let a 62-day-old snapshot pass as plain
             # 'staged': a number with no judgement attached.
@@ -1104,6 +1179,7 @@ function Stage-Config {
                 source = 's3-daily-snapshot'; key = $resolved.Key
                 dateOffsetDays = $resolved.Offset; files = $files; dest = $dest
                 marketDate = $plan.marketDate; windowDays = $ArchiveWindowDays
+                configOverrides = $overrides
                 marketDateVerdict = $snapVerdict; marketDateEvidence = $snapEvidence }
             Test-AgainstGit -Name $Name -ConfigSource $cs -Dest $dest
         }

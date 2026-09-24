@@ -55,7 +55,7 @@ set -euo pipefail
 
 # Printed first, every run. A stale fetch is otherwise invisible - see the note
 # in 02-prereq-windows.ps1.
-SCRIPT_VERSION='2026-09-24.2-ship-publishes-flows'
+SCRIPT_VERSION='2026-09-24.4-namespace-consequence-and-log-capture'
 
 PLAN_FILE="/opt/flowtest/bootstrap/flow-plan-linux.json"
 DRY_RUN=0
@@ -384,12 +384,71 @@ config_references_missing() {   # config_references_missing <staged-dir>
 INI_SET='
 import io, json, os, sys
 path, section, pairs_json, create_section = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4] == "1"
+# scope: "section" (default) sets the keys in ONE named section; "wherever-present"
+# sets them in EVERY section that already declares them, and creates nothing.
+#
+# The second mode exists because RoutingRules.ini has no [RoutingRules] section
+# to target. Its real sections are [RoutingRules/<SessionTargetID>/Rule<N>] -
+# one per session per rule - and a setting like
+# EnableSymbolValidationAndPopulation appears inside whichever rule blocks use
+# it. Build 129 recorded "section [RoutingRules] not present and
+# createSectionIfAbsent is false", which was the helper correctly refusing to
+# invent a section that has never existed in this product.
+#
+# Turning a setting OFF is exactly the case where creating it would be wrong:
+# if the key is absent the behaviour is already whatever the default is, and
+# writing it into a section the engine does not read changes nothing while
+# looking like it did.
+scope = sys.argv[5] if len(sys.argv) > 5 else "section"
 pairs = json.loads(pairs_json)
 raw = open(path, "rb").read().decode("utf-8", "surrogateescape")
 crlf = "\r\n" in raw
 lines = raw.split("\n")
 want = {k.lower(): (k, v) for k, v in pairs.items()}
 changes, seen, cur, out, insert_at = [], set(), None, [], None
+
+if scope == "wherever-present":
+    hits = 0
+    for line in lines:
+        bare = line.rstrip("\r")
+        stripped = bare.strip()
+        if stripped.startswith("[") and stripped.endswith("]"):
+            cur = stripped[1:-1].strip()
+            out.append(line)
+            continue
+        if "=" in bare and not stripped.startswith((";", "#")):
+            key = bare.split("=", 1)[0].strip()
+            if key.lower() in want:
+                old_v = bare.split("=", 1)[1].strip()
+                new_v = want[key.lower()][1]
+                hits += 1
+                if old_v != new_v:
+                    changes.append({"key": key, "from": old_v, "to": new_v,
+                                    "section": cur})
+                    out.append(key + "=" + new_v + ("\r" if line.endswith("\r") else ""))
+                    continue
+        out.append(line)
+    if hits == 0:
+        # NOT an error, and NOT a success either. Say which it is and let the
+        # caller decide - the key being absent may mean the feature is already
+        # off, or may mean this is the wrong file.
+        print(json.dumps({"error": "none of %s appears anywhere in this file, so nothing was "
+                                   "changed. Creating them is deliberately not done: a key the "
+                                   "engine does not already read changes no behaviour."
+                                   % ", ".join(sorted(k for k, _ in want.values()))}))
+        sys.exit(0)
+    while out and out[-1].strip() == "":
+        out.pop()
+    out.append("")
+    text = "\n".join(out)
+    if crlf:
+        text = text.replace("\r\n", "\n").replace("\n", "\r\n")
+    if changes:
+        with open(path, "wb") as fh:
+            fh.write(text.encode("utf-8", "surrogateescape"))
+    print(json.dumps({"changes": changes, "occurrences": hits}))
+    sys.exit(0)
+
 for i, line in enumerate(lines):
     bare = line.rstrip("\r")
     stripped = bare.strip()
@@ -452,7 +511,7 @@ print(json.dumps({"changes": changes}))
 # JSON. Nothing about the failure pointed at the capture. So the JSON is
 # written to a path the caller supplies, and stdout stays what it looks like.
 apply_config_overrides() {   # apply_config_overrides <staged-dir> <component> <out-json-path>
-  local dir="$1" name="$2" outfile="$3" ovr entry file fmt section pairs create res err dep
+  local dir="$1" name="$2" outfile="$3" ovr entry file fmt section pairs create scope res err dep
   ovr="$(jq -c --arg n "$name" \
     '[.groups[].services[] | select(.containerName==$n)][0].configOverrides // []' "$PLAN_FILE" 2>/dev/null)"
   printf '[]' > "$outfile"
@@ -465,6 +524,7 @@ apply_config_overrides() {   # apply_config_overrides <staged-dir> <component> <
     section="$(printf '%s' "$entry" | jq -r '.section // ""')"
     pairs="$(printf '%s' "$entry"   | jq -c '.set // {}')"
     create="$(printf '%s' "$entry"  | jq -r 'if (.createSectionIfAbsent // false) then "1" else "0" end')"
+    scope="$(printf '%s' "$entry"   | jq -r '.scope // "section"')"
     # Carry the dependency id through to the manifest. claim-bounds prints
     # "this run does not talk to X", which is what a reader can act on; an
     # INI key name on its own tells them nothing.
@@ -488,7 +548,7 @@ apply_config_overrides() {   # apply_config_overrides <staged-dir> <component> <
               + (if $d == "" then {} else {bypassedDependency:$d} end)]')"
       continue
     fi
-    res="$(python3 -c "$INI_SET" "$dir/$file" "$section" "$pairs" "$create" 2>&1)" || {
+    res="$(python3 -c "$INI_SET" "$dir/$file" "$section" "$pairs" "$create" "$scope" 2>&1)" || {
       fail "$name: override of $file failed: $res"
       applied="$(printf '%s' "$applied" | jq -c --arg f "$file" --arg r "$res" --arg d "$dep" \
         '. + [{file:$f, applied:false, reason:$r}
@@ -767,12 +827,32 @@ stage_config() {
       #   within-window        the snapshot is from the market date's own window
       #   stale-but-unchanged  older, but the config repo shows no change since
       #   unverified           older, and nothing could confirm it either way
+      # DECLARED DEVIATIONS APPLY HERE TOO.
+      #
+      # They did not, until build 129. Overrides were applied only on the git
+      # branch of this case statement, so a component whose config comes from
+      # the daily snapshot silently received none - and its manifest entry
+      # carried no configOverrides key at all, so nothing downstream could tell
+      # "no overrides declared" from "overrides never attempted". Where
+      # configuration comes from is not a reason to apply a declared deviation
+      # or not. Every staging path applies them, or the declaration is decor.
+      # mktemp, exactly as the git path does - not a name built from $name in a
+      # directory that may not exist. TMP_DIR is not a variable this script has.
+      local snap_ovr='[]' snap_ovr_out
+      if [[ $DRY_RUN -eq 0 && "$count" -gt 0 ]]; then
+        snap_ovr_out="$(mktemp)"
+        apply_config_overrides "$dest" "$name" "$snap_ovr_out"
+        snap_ovr="$(cat "$snap_ovr_out")"
+        rm -f "$snap_ovr_out"
+      fi
       record "$name" config staged \
         "$(jq -n --arg k "$key" --arg o "$offset" --argjson c "$count" --arg d "$dest" \
               --arg m "$MARKET_DATE" --argjson w "$ARCHIVE_WINDOW_DAYS" \
               --arg v "$snap_verdict" --arg e "$snap_evidence" \
+              --argjson ov "$snap_ovr" \
               '{source:"s3-daily-snapshot", key:$k, dateOffsetDays:($o|tonumber),
                 files:$c, dest:$d, marketDate:$m, windowDays:$w,
+                configOverrides:$ov,
                 marketDateVerdict:$v, marketDateEvidence:$e}')"
       cross_check_against_git "$name" "$cs" "$dest"
       ;;
