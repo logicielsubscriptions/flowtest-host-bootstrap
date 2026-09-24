@@ -37,7 +37,7 @@
 #
 set -uo pipefail
 
-SCRIPT_VERSION='2026-09-23.11-cps-method-size'
+SCRIPT_VERSION='2026-09-24.2-ship-publishes-flows'
 
 PLAN=''
 SA_SECRET=''
@@ -379,8 +379,39 @@ while IFS= read -r entry; do
     failed=$((failed+1)); continue
   fi
   ok "$dbname restored and ONLINE"
+
+  # ---- post-restore refresh -------------------------------------------------
+  # A RESTORED DATABASE IS NOT YET A USABLE ONE.
+  #
+  # Production runs sp_RefreshDB after a restore (Dev, 2026-09-24). A restore
+  # brings back the bytes of whatever day the backup was taken on; this is the
+  # procedure that makes the database fit for the session about to be replayed.
+  # Skipping it leaves a database that is ONLINE, answers queries, and is
+  # nonetheless not what the engines expect - exactly the shape of failure this
+  # pipeline exists to avoid, because nothing about it looks wrong.
+  #
+  # Recorded either way. The procedure not existing is reported rather than
+  # ignored: a database whose restore ran but whose refresh did not is a fact a
+  # reader of the manifest needs, not a detail to swallow.
+  refresh_out="$(sqlq "USE [${dbname}]; EXEC sp_RefreshDB")"
+  refresh_rc=$?
+  if [[ $refresh_rc -ne 0 ]]; then
+    fail "$dbname: sp_RefreshDB failed (sqlcmd exit $refresh_rc). The database is"
+    fail "      ONLINE but has NOT been refreshed, so it is not the book the"
+    fail "      engines expect. Output:"
+    printf '         %s\n' "$refresh_out" >&2
+    record "$dbname" 'failed' "$(jq -n --arg s "$svc" --arg r "$refresh_out" --argjson c "$refresh_rc" \
+      '{service:$s, stage:"sp_RefreshDB", sqlcmdExit:$c, stateAfter:"ONLINE",
+        reason:$r, note:"the RESTORE succeeded; the post-restore refresh did not"}')"
+    failed=$((failed+1)); continue
+  fi
+  ok "$dbname refreshed (sp_RefreshDB)"
+
   record "$dbname" 'restored' "$(jq -n --arg s "$svc" --arg b "$bak" --argjson by "$size" --arg st "$state" \
-    '{service:$s, backup:$b, bytes:$by, stateAfter:$st, instance:"the flow-test SQL Server container"}')"
+    '{service:$s, backup:$b, bytes:$by, stateAfter:$st, refreshed:true,
+      refreshProcedure:"sp_RefreshDB",
+      backupBook:"closing - D.bak is the CLOSING book of day D (Dev, 2026-09-24)",
+      instance:"the flow-test SQL Server container"}')"
   restored=$((restored+1))
 
   docker exec "$CONTAINER" rm -f "$incontainer" >/dev/null 2>&1 || true
