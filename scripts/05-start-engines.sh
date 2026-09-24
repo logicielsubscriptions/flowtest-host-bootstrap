@@ -42,7 +42,7 @@
 #
 set -uo pipefail
 
-SCRIPT_VERSION='2026-09-24.4-namespace-consequence-and-log-capture'
+SCRIPT_VERSION='2026-09-24.5-allowemptystring-and-override-containment'
 
 PLAN=''
 ONLY=''

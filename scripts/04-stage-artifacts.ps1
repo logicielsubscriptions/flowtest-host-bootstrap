@@ -108,7 +108,7 @@ trap {
 
 # Printed first, every run. Without it a stale fetch is invisible and a retest
 # can silently re-run old code while looking like a fresh result.
-$script:ScriptVersion = '2026-09-24.4-namespace-consequence-and-log-capture'
+$script:ScriptVersion = '2026-09-24.5-allowemptystring-and-override-containment'
 
 function Write-Step { param([string] $Message) Write-Host "`n=== $Message ===" -ForegroundColor Cyan }
 function Write-Ok   { param([string] $Message) Write-Host "  [ok]   $Message" -ForegroundColor Green }
@@ -400,8 +400,13 @@ function Set-IniValues {
         parser prefers. Returns the list of changes actually made; an empty
         list means the file already said what the override wants, which is not
         a deviation at all. Mirrors INI_SET in the .sh. #>
+    # AllowEmptyString on $Section: PowerShell treats '' as NOT SUPPLIED for a
+    # [Parameter(Mandatory)][string], so passing it throws a terminating error.
+    # Scope 'wherever-present' has no single section to name and the generator
+    # emits '' for it - which killed the whole Windows staging run in build 130
+    # and took the manifest with it.
     param([Parameter(Mandatory)][string] $Path,
-          [Parameter(Mandatory)][string] $Section,
+          [Parameter(Mandatory)][AllowEmptyString()][string] $Section,
           [Parameter(Mandatory)][hashtable] $Set,
           [bool] $CreateSectionIfAbsent = $true,
           [string] $Scope = 'section')
@@ -570,9 +575,25 @@ function Invoke-ConfigOverrides {
         }
         $set = @{}
         foreach ($prop in $e.set.PSObject.Properties) { $set[$prop.Name] = [string]$prop.Value }
-        $res = Set-IniValues -Path $target -Section $e.section -Set $set `
-                 -CreateSectionIfAbsent ([bool]$e.createSectionIfAbsent) `
-                 -Scope $(if ($e.scope) { [string]$e.scope } else { 'section' })
+        # WRAPPED. A declared deviation is one line of one file; it must not be
+        # able to take the entire staging run with it. In build 130 a single
+        # bad argument threw out of here, Stage-Config never recorded its
+        # result, the script died before writing staged-windows.json at all,
+        # and the run reported 'no staged configuration directory' for a
+        # component whose configuration had in fact been fetched. The manifest
+        # is the record of what happened; losing it is worse than any override.
+        try {
+            $res = Set-IniValues -Path $target -Section $e.section -Set $set `
+                     -CreateSectionIfAbsent ([bool]$e.createSectionIfAbsent) `
+                     -Scope $(if ($e.scope) { [string]$e.scope } else { 'section' })
+        } catch {
+            Write-Fail "${Component}: the override of $($e.file) THREW: $($_.Exception.Message)"
+            Write-Fail '       Recorded and carried on - a bad override must not cost the manifest.'
+            $r = @{ file = $e.file; applied = $false; reason = "override threw: $($_.Exception.Message)" }
+            if ($dep) { $r.bypassedDependency = $dep }
+            $applied += $r
+            continue
+        }
         if ($res.error) {
             Write-Warn "${Component}: override of $($e.file) not applied: $($res.error)"
             $r = @{ file = $e.file; applied = $false; reason = $res.error }

@@ -55,7 +55,7 @@ set -euo pipefail
 
 # Printed first, every run. A stale fetch is otherwise invisible - see the note
 # in 02-prereq-windows.ps1.
-SCRIPT_VERSION='2026-09-24.4-namespace-consequence-and-log-capture'
+SCRIPT_VERSION='2026-09-24.5-allowemptystring-and-override-containment'
 
 PLAN_FILE="/opt/flowtest/bootstrap/flow-plan-linux.json"
 DRY_RUN=0
@@ -548,6 +548,11 @@ apply_config_overrides() {   # apply_config_overrides <staged-dir> <component> <
               + (if $d == "" then {} else {bypassedDependency:$d} end)]')"
       continue
     fi
+    # A declared deviation is one line of one file; it must not be able to take
+    # the whole staging run with it. The || branch already keeps going - the
+    # .ps1 had no equivalent until build 130, where one bad argument threw out
+    # of the override call, the script died before writing its manifest, and a
+    # component whose config HAD been fetched was reported as never staged.
     res="$(python3 -c "$INI_SET" "$dir/$file" "$section" "$pairs" "$create" "$scope" 2>&1)" || {
       fail "$name: override of $file failed: $res"
       applied="$(printf '%s' "$applied" | jq -c --arg f "$file" --arg r "$res" --arg d "$dep" \
