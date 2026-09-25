@@ -42,7 +42,7 @@
 #
 set -uo pipefail
 
-SCRIPT_VERSION='2026-09-25.2-dsn-and-engine-login'
+SCRIPT_VERSION='2026-09-25.4-imagetag-probe-and-db-server'
 
 PLAN=''
 ONLY=''
