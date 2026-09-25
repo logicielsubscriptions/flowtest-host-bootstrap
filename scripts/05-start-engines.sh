@@ -42,7 +42,7 @@
 #
 set -uo pipefail
 
-SCRIPT_VERSION='2026-09-24.5-allowemptystring-and-override-containment'
+SCRIPT_VERSION='2026-09-24.6-strictmode-result-shape'
 
 PLAN=''
 ONLY=''

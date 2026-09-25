@@ -55,7 +55,7 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
-$script:ScriptVersion = '2026-09-24.5-allowemptystring-and-override-containment'
+$script:ScriptVersion = '2026-09-24.6-strictmode-result-shape'
 Write-Host "  script version $script:ScriptVersion" -ForegroundColor DarkGray
 
 function Write-Step { param([string] $m) Write-Host ''; Write-Host "==> $m" -ForegroundColor Cyan }

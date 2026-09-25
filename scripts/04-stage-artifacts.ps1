@@ -108,7 +108,7 @@ trap {
 
 # Printed first, every run. Without it a stale fetch is invisible and a retest
 # can silently re-run old code while looking like a fresh result.
-$script:ScriptVersion = '2026-09-24.5-allowemptystring-and-override-containment'
+$script:ScriptVersion = '2026-09-24.6-strictmode-result-shape'
 
 function Write-Step { param([string] $Message) Write-Host "`n=== $Message ===" -ForegroundColor Cyan }
 function Write-Ok   { param([string] $Message) Write-Host "  [ok]   $Message" -ForegroundColor Green }
@@ -460,7 +460,7 @@ function Set-IniValues {
         }
         if ($hits -eq 0) {
             $names = (($want.Values | ForEach-Object { $_[0] }) | Sort-Object) -join ', '
-            return [pscustomobject]@{ error = "none of $names appears anywhere in this file, so nothing was changed. Creating them is deliberately not done: a key the engine does not already read changes no behaviour." }
+            return [pscustomobject]@{ changes = @(); error = "none of $names appears anywhere in this file, so nothing was changed. Creating them is deliberately not done: a key the engine does not already read changes no behaviour." }
         }
         while ($out.Count -gt 0 -and -not $out[$out.Count - 1].Trim()) { $out.RemoveAt($out.Count - 1) }
         $out.Add('')
@@ -469,7 +469,12 @@ function Set-IniValues {
             if ($crlf) { $text = ($text -replace "`r`n", "`n") -replace "`n", "`r`n" }
             [System.IO.File]::WriteAllText($Path, $text, (New-Object System.Text.UTF8Encoding $false))
         }
-        return [pscustomobject]@{ changes = $changes; occurrences = $hits }
+        # error = $null on the success path too. Set-StrictMode makes reading
+        # an absent property a TERMINATING error, so a result object whose
+        # shape varies by branch turns the caller's `if ($res.error)` into a
+        # crash - which is what killed Windows staging in builds 130 and 131.
+        # One shape, always.
+        return [pscustomobject]@{ changes = $changes; occurrences = $hits; error = $null }
     }
 
     $changes = @(); $seen = @{}; $cur = $null
@@ -504,7 +509,7 @@ function Set-IniValues {
     if ($missing.Count -gt 0) {
         if ($insertAt -lt 0) {
             if (-not $CreateSectionIfAbsent) {
-                return [pscustomobject]@{ error = "section [$Section] not present and createSectionIfAbsent is false" }
+                return [pscustomobject]@{ changes = @(); error = "section [$Section] not present and createSectionIfAbsent is false" }
             }
             while ($out.Count -gt 0 -and -not $out[$out.Count - 1].Trim()) { $out.RemoveAt($out.Count - 1) }
             $out.Add("[$Section]")
@@ -526,7 +531,7 @@ function Set-IniValues {
         if ($crlf) { $text = ($text -replace "`r`n", "`n") -replace "`n", "`r`n" }
         [System.IO.File]::WriteAllText($Path, $text, (New-Object System.Text.UTF8Encoding $false))
     }
-    return [pscustomobject]@{ changes = $changes }
+    return [pscustomobject]@{ changes = $changes; error = $null }
 }
 
 function Invoke-ConfigOverrides {
@@ -586,6 +591,11 @@ function Invoke-ConfigOverrides {
             $res = Set-IniValues -Path $target -Section $e.section -Set $set `
                      -CreateSectionIfAbsent ([bool]$e.createSectionIfAbsent) `
                      -Scope $(if ($e.scope) { [string]$e.scope } else { 'section' })
+            # INSIDE the try, because reading the result is as able to throw as
+            # producing it: `$res.error` on an object without that property is
+            # a terminating error under Set-StrictMode. Guarding only the call
+            # left exactly that line unprotected in build 131.
+            $resErr = if ($res -and $res.PSObject.Properties['error']) { $res.error } else { $null }
         } catch {
             Write-Fail "${Component}: the override of $($e.file) THREW: $($_.Exception.Message)"
             Write-Fail '       Recorded and carried on - a bad override must not cost the manifest.'
@@ -594,9 +604,9 @@ function Invoke-ConfigOverrides {
             $applied += $r
             continue
         }
-        if ($res.error) {
-            Write-Warn "${Component}: override of $($e.file) not applied: $($res.error)"
-            $r = @{ file = $e.file; applied = $false; reason = $res.error }
+        if ($resErr) {
+            Write-Warn "${Component}: override of $($e.file) not applied: $resErr"
+            $r = @{ file = $e.file; applied = $false; reason = $resErr }
             if ($dep) { $r.bypassedDependency = $dep }
             $applied += $r
             continue
