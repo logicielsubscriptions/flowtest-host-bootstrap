@@ -42,7 +42,7 @@
 #
 set -uo pipefail
 
-SCRIPT_VERSION='2026-09-24.6-strictmode-result-shape'
+SCRIPT_VERSION='2026-09-25.2-dsn-and-engine-login'
 
 PLAN=''
 ONLY=''
@@ -167,7 +167,12 @@ mapfile -t SERVICES < <(jq -r '
   | [ .value.containerName,
       .value.serviceName,
       .value.imageFamily,
-      .value.tag,
+      # imageTag, not tag - parity with the .ps1. The image for a database
+      # engine carries a baked ODBC data source and so is per component; the
+      # generator names it. // .tag keeps an older plan working.
+      # NO APOSTROPHES IN HERE: this jq program sits inside a shell
+      # single-quoted string, so one would end the quoting mid-filter.
+      (.value.imageTag // .value.tag),
       ($g.dockerNetwork // ""),
       ($g.ip // ""),
       (if $g.sharedNamespace then "shared" else "own" end),

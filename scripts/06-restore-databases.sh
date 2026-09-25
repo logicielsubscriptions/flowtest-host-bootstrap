@@ -37,7 +37,7 @@
 #
 set -uo pipefail
 
-SCRIPT_VERSION='2026-09-24.6-strictmode-result-shape'
+SCRIPT_VERSION='2026-09-25.2-dsn-and-engine-login'
 
 PLAN=''
 SA_SECRET=''

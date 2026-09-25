@@ -48,6 +48,15 @@ param(
     # to travel. Absent is not the same as "restored nothing", and an engine
     # that needs a database is refused either way.
     [string]   $RestoreManifest = 'C:\FlowTest\restored-databases.json',
+    # The flow-test SQL Server, and the secret holding its SA password. The
+    # address is read from the plan when not given; the secret is the same one
+    # 06-restore-databases.sh used to start the instance.
+    # Both default from the plan / the caller. NO DEFAULT SECRET NAME: guessing
+    # one and failing to read it would look like a permissions problem instead
+    # of a missing argument, and the Jenkins job already passes the same secret
+    # to 06-restore-databases.sh.
+    [string]   $DbAddress,
+    [string]   $DbSecretId,
     [switch]   $Replace,
     [switch]   $DryRun
 )
@@ -55,7 +64,7 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
-$script:ScriptVersion = '2026-09-24.6-strictmode-result-shape'
+$script:ScriptVersion = '2026-09-25.2-dsn-and-engine-login'
 Write-Host "  script version $script:ScriptVersion" -ForegroundColor DarkGray
 
 function Write-Step { param([string] $m) Write-Host ''; Write-Host "==> $m" -ForegroundColor Cyan }
@@ -194,7 +203,11 @@ foreach ($group in @($planObj.groups)) {
             Name      = $svcList[$i].containerName
             Service   = $svcList[$i].serviceName
             Family    = $svcList[$i].imageFamily
-            Tag       = $svcList[$i].tag
+            # imageTag, not tag. An engine that needs a database carries a
+            # baked ODBC data source, so its image is per component and the
+            # generator names it accordingly. Falling back to tag keeps a plan
+            # from an older generator working rather than pulling nothing.
+            Tag       = $(if ($svcList[$i].PSObject.Properties['imageTag'] -and $svcList[$i].imageTag) { [string]$svcList[$i].imageTag } else { [string]$svcList[$i].tag })
             Network   = $group.dockerNetwork
             Ip        = $group.ip
             Shared    = [bool]$group.sharedNamespace
@@ -249,6 +262,119 @@ if ($missing.Count -gt 0) {
 }
 
 # ---------------------------------------------------------------------------
+
+function Get-IniValue {
+    <#  One key out of one section of an INI file, case-insensitively.
+        Returns $null when the file, the section or the key is absent - the
+        caller decides whether that is fatal. #>
+    param([Parameter(Mandatory)][string] $Path,
+          [Parameter(Mandatory)][string] $Section,
+          [Parameter(Mandatory)][string] $Key)
+    if (-not (Test-Path -LiteralPath $Path)) { return $null }
+    $cur = $null
+    foreach ($line in [System.IO.File]::ReadAllLines($Path)) {
+        $t = $line.Trim()
+        if ($t.StartsWith('[') -and $t.EndsWith(']')) { $cur = $t.Substring(1, $t.Length - 2).Trim(); continue }
+        if ($cur -ne $Section) { continue }
+        if ($t.StartsWith(';') -or $t.StartsWith('#') -or -not $t.Contains('=')) { continue }
+        if ($t.Split('=', 2)[0].Trim() -ieq $Key) { return $t.Split('=', 2)[1].Trim() }
+    }
+    return $null
+}
+
+function Grant-EngineDbLogin {
+    <#  MAKE THE STAND-IN DATABASE ACCEPT THE CREDENTIAL THE ENGINE CARRIES.
+
+        The engine authenticates with USER/PWD from its own staged
+        ServerConfiguration.ini - production's credential, arriving with
+        production's config. The flow-test SQL Server knows only SA, so without
+        this the engine reaches the server and is refused, which looks nothing
+        like a missing login three layers downstream.
+
+        The substitute conforms to the system under test, not the other way
+        round: we do NOT rewrite the engine credential, because that would be a
+        declared deviation on every database engine on every run.
+
+        CHECK_POLICY = OFF is required, not laziness. Production passwords here
+        are shorter than SQL Server's complexity minimum, so a plain CREATE
+        LOGIN is rejected outright.
+
+        NO PASSWORD REACHES A COMMAND LINE. The T-SQL goes in through a file
+        that is created with an owner-only ACL and deleted in a finally block;
+        SA authenticates through SQLCMDPASSWORD in the child environment. This
+        script has twice had to fix the other shape. #>
+    param([Parameter(Mandatory)][string] $Server,
+          [Parameter(Mandatory)][string] $Database,
+          [Parameter(Mandatory)][string] $Login,
+          [Parameter(Mandatory)][string] $Password,
+          [Parameter(Mandatory)][string] $SaPassword)
+
+    $sqlcmd = (Get-Command sqlcmd -ErrorAction SilentlyContinue)
+    if (-not $sqlcmd) {
+        return [pscustomobject]@{ ok = $false; error = 'sqlcmd is not installed on this host, so the engine login cannot be provisioned. Re-run 02-prereq-windows.ps1 - the SQL client tools step is marked optional and may have been skipped.' }
+    }
+
+    # ' is the escape for ' inside a T-SQL string literal. A password holding
+    # one would otherwise end the literal and the rest would be parsed as SQL.
+    $pwLit = $Password.Replace("'", "''")
+    $sql = @"
+SET NOCOUNT ON;
+IF NOT EXISTS (SELECT 1 FROM sys.server_principals WHERE name = N'$Login')
+    CREATE LOGIN [$Login] WITH PASSWORD = N'$pwLit', CHECK_POLICY = OFF, CHECK_EXPIRATION = OFF;
+ELSE
+    ALTER LOGIN [$Login] WITH PASSWORD = N'$pwLit', CHECK_POLICY = OFF, CHECK_EXPIRATION = OFF;
+ALTER LOGIN [$Login] ENABLE;
+USE [$Database];
+IF NOT EXISTS (SELECT 1 FROM sys.database_principals WHERE name = N'$Login')
+    CREATE USER [$Login] FOR LOGIN [$Login];
+ELSE
+    ALTER USER [$Login] WITH LOGIN = [$Login];
+ALTER ROLE [db_owner] ADD MEMBER [$Login];
+PRINT 'LOGIN_PROVISIONED';
+"@
+
+    $file = Join-Path $env:TEMP ("flowtest-login-" + [guid]::NewGuid().ToString('N') + '.sql')
+    try {
+        # Owner-only before a byte of it exists, not after.
+        $null = New-Item -ItemType File -Path $file -Force
+        $acl = Get-Acl $file
+        $acl.SetAccessRuleProtection($true, $false)
+        $acl.SetOwner([System.Security.Principal.NTAccount]::new($env:USERNAME))
+        $acl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule(
+            $env:USERNAME, 'FullControl', 'Allow')))
+        Set-Acl -Path $file -AclObject $acl
+        [System.IO.File]::WriteAllText($file, $sql, (New-Object System.Text.UTF8Encoding $false))
+
+        $prevPw = $env:SQLCMDPASSWORD
+        try {
+            $env:SQLCMDPASSWORD = $SaPassword
+            $out = & sqlcmd -S $Server -U sa -C -b -h -1 -W -i $file 2>&1 | Out-String
+            $rc = $LASTEXITCODE
+        } finally {
+            $env:SQLCMDPASSWORD = $prevPw
+        }
+        if ($rc -ne 0 -or $out -notmatch 'LOGIN_PROVISIONED') {
+            return [pscustomobject]@{ ok = $false; error = "sqlcmd exit $rc. $($out.Trim())" }
+        }
+
+        # THE EXIT CODE IS NOT THE VERDICT. Log in AS the engine would.
+        $prevPw = $env:SQLCMDPASSWORD
+        try {
+            $env:SQLCMDPASSWORD = $Password
+            $probe = & sqlcmd -S $Server -U $Login -d $Database -C -b -h -1 -W -Q 'SELECT 1' 2>&1 | Out-String
+            $prc = $LASTEXITCODE
+        } finally {
+            $env:SQLCMDPASSWORD = $prevPw
+        }
+        if ($prc -ne 0) {
+            return [pscustomobject]@{ ok = $false; error = "the login was created but could not connect with it: sqlcmd exit $prc. $($probe.Trim())" }
+        }
+        return [pscustomobject]@{ ok = $true; error = $null }
+    } finally {
+        Remove-Item -LiteralPath $file -Force -ErrorAction SilentlyContinue
+    }
+}
+
 function Copy-EngineLogs {
     <#  PULL THE ENGINE'S OWN LOG OUT OF A CONTAINER THAT DIED.
 
@@ -327,6 +453,63 @@ foreach ($s in $services) {
             $failed++; continue
         }
         Write-Ok "database $($s.DbName) is restored"
+
+        # THE LOGIN THE ENGINE WILL USE.
+        #
+        # Restored is not the same as reachable-as-this-engine. The flow-test
+        # SQL Server is created knowing only SA; the engine authenticates with
+        # the credential in its own staged config. Provisioned here, where both
+        # the credential and a route to the database exist - the restore script
+        # runs on the Linux host and has neither.
+        $svcIni = Join-Path (Join-Path $configRoot $s.Name) 'ServerConfiguration.ini'
+        $dbUser = Get-IniValue -Path $svcIni -Section 'ServerDatabaseSettings' -Key 'USER'
+        $dbPw   = Get-IniValue -Path $svcIni -Section 'ServerDatabaseSettings' -Key 'PWD'
+        if (-not $dbUser -or -not $dbPw) {
+            Write-Fail "$($s.Name): [ServerDatabaseSettings] USER/PWD are not in $svcIni,"
+            Write-Fail '       so the login this engine will use cannot be provisioned. NOT starting it:'
+            Write-Fail '       it would reach the database and be refused, which reads as a routing fault.'
+            $results += [pscustomobject]@{ component = $s.Name; status = 'refused'
+                detail = @{ reason = 'no [ServerDatabaseSettings] USER/PWD in the staged configuration'
+                            configFile = $svcIni; dbName = $s.DbName } }
+            $failed++; continue
+        }
+        if (-not $DbAddress) { $DbAddress = "$($plan.databaseAddress)" }
+        if (-not $DbAddress -or -not $DbSecretId) {
+            $why = if (-not $DbAddress) { 'the plan carries no databaseAddress' } else { '-DbSecretId was not given' }
+            Write-Fail "$($s.Name): cannot provision its database login - $why."
+            Write-Fail '       NOT starting it: it would reach the database and be refused.'
+            $results += [pscustomobject]@{ component = $s.Name; status = 'refused'
+                detail = @{ reason = 'the database address or SA secret id is not available, so no engine login could be provisioned'
+                            dbName = $s.DbName; dbServer = "$DbAddress"; secretId = "$DbSecretId" } }
+            $failed++; continue
+        }
+        if (-not $script:SaPassword) {
+            $sec = Invoke-Native aws @('secretsmanager','get-secret-value','--secret-id',$DbSecretId,
+                                       '--query','SecretString','--output','text')
+            if ($sec.ExitCode -ne 0 -or -not "$($sec.Output)".Trim()) {
+                Write-Fail "$($s.Name): could not read $DbSecretId from Secrets Manager, so the engine"
+                Write-Fail '       login cannot be provisioned. The instance role grants flowtest/* only.'
+                $results += [pscustomobject]@{ component = $s.Name; status = 'refused'
+                    detail = @{ reason = 'the SA secret could not be read, so no engine login could be created'
+                                secretId = $DbSecretId; dbName = $s.DbName } }
+                $failed++; continue
+            }
+            $script:SaPassword = "$($sec.Output)".Trim()
+        }
+        $grant = Grant-EngineDbLogin -Server $DbAddress -Database $s.DbName `
+                                     -Login $dbUser -Password $dbPw -SaPassword $script:SaPassword
+        if (-not $grant.ok) {
+            Write-Fail "$($s.Name): could not provision the database login '$dbUser' on $DbAddress."
+            Write-Fail "       $($grant.error)"
+            $results += [pscustomobject]@{ component = $s.Name; status = 'refused'
+                detail = @{ reason = 'the login this engine authenticates with could not be provisioned'
+                            dbName = $s.DbName; dbLogin = $dbUser; dbServer = $DbAddress
+                            error = "$($grant.error)" } }
+            $failed++; continue
+        }
+        # The LOGIN NAME is recorded, never the password.
+        Write-Ok "database login '$dbUser' provisioned on $DbAddress and verified by connecting with it"
+        $dbLoginProvisioned = $dbUser
     }
 
     $configDir = Join-Path $configRoot $s.Name
