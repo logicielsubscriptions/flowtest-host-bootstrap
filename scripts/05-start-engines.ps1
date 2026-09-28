@@ -64,7 +64,7 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
-$script:ScriptVersion = '2026-09-28.1-reuse-stack'
+$script:ScriptVersion = '2026-09-28.2-tests-dsn-guard'
 Write-Host "  script version $script:ScriptVersion" -ForegroundColor DarkGray
 
 function Write-Step { param([string] $m) Write-Host ''; Write-Host "==> $m" -ForegroundColor Cyan }
@@ -282,6 +282,57 @@ function Get-IniValue {
     return $null
 }
 
+function Compare-ImageDataSource {
+    <#  WHICH DATA SOURCE WAS THIS IMAGE BUILT FOR, AND IS IT THE ONE THIS RUN NEEDS?
+
+        The ODBC data source is baked into a database engine's image at build
+        time and recorded on it as labels. ECR tags are IMMUTABLE and the tag
+        does not change when the data source does - so correcting the server,
+        database or DSN name and re-pushing is rejected, build-images used to
+        report the existing tag as "already in ECR - nothing to build", and the
+        engine then started against the OLD data source with every step green.
+
+        Pure: labels in, list of mismatches out. An image with no labels at all
+        predates them and cannot be vouched for, so absence is a mismatch.
+
+        Case-INsensitive on purpose: ODBC resolves DSN names case-insensitively
+        and SQL Server database names are compared under the server collation,
+        so a case-only difference is not a different data source.
+
+        IDENTICAL TEXT in images/build-images.ps1; verify-all compares them. #>
+    param($Labels, [string] $Dsn, [string] $Server, [string] $Database)
+    $want = [ordered]@{
+        'com.logiciel.flowtest.odbcDsn'      = $Dsn
+        'com.logiciel.flowtest.odbcServer'   = $Server
+        'com.logiciel.flowtest.odbcDatabase' = $Database
+    }
+    $bad = @()
+    foreach ($k in $want.Keys) {
+        $have = if ($null -ne $Labels -and $Labels.PSObject.Properties[$k]) { [string]$Labels.PSObject.Properties[$k].Value } else { '<absent>' }
+        if ($have -ne $want[$k]) {
+            $bad += "$($k.Split('.')[-1]): the image has '$have', this run needs '$($want[$k])'"
+        }
+    }
+    # NOT `return ,$bad`. Every caller wraps this in @(...), and the comma
+    # form hands @() an array CONTAINING an empty array - Count 1 - so a
+    # matching image read as one mismatch and every correct image would have
+    # been refused. Caught by tests/Test-ImageDataSource.ps1 before it shipped.
+    return $bad
+}
+
+function Get-ImageLabels {
+    <#  Pull the image and read its labels. The pull is not extra work: the
+        container create that follows would pull it anyway. #>
+    param([Parameter(Mandatory)][string] $Image)
+    $p = Invoke-Native docker @('pull', $Image)
+    if ($p.ExitCode -ne 0) { return [pscustomobject]@{ ok = $false; labels = $null; error = "docker pull failed: $($p.Output)" } }
+    $i = Invoke-Native docker @('image', 'inspect', '--format', '{{json .Config.Labels}}', $Image)
+    if ($i.ExitCode -ne 0) { return [pscustomobject]@{ ok = $false; labels = $null; error = "docker image inspect failed: $($i.Output)" } }
+    try { $labels = ("$($i.Output)".Trim() | ConvertFrom-Json) }
+    catch { return [pscustomobject]@{ ok = $false; labels = $null; error = "the image labels are not readable JSON: $($i.Output)" } }
+    return [pscustomobject]@{ ok = $true; labels = $labels; error = $null }
+}
+
 function Grant-EngineDbLogin {
     <#  MAKE THE STAND-IN DATABASE ACCEPT THE CREDENTIAL THE ENGINE CARRIES.
 
@@ -423,6 +474,12 @@ $failed  = 0
 
 foreach ($s in $services) {
     Write-Step $s.Name
+    # Evidence of the declared ENVIRONMENT deviations this engine runs under
+    # (hosts-map.json environmentDeviations), read from what was actually
+    # applied - the image's labels and the grant - not from the catalogue.
+    # Reset per engine: a value left over from the previous one would record a
+    # deviation against an engine that has no database at all.
+    $envEvidence = $null
 
     # A DATABASE THIS ENGINE NEEDS AND DOES NOT HAVE.
     #
@@ -454,6 +511,43 @@ foreach ($s in $services) {
         }
         Write-Ok "database $($s.DbName) is restored"
 
+        # THE IMAGE MUST HAVE BEEN BUILT FOR THIS DATA SOURCE.
+        #
+        # Checked here, at the point of use, and before the login is created -
+        # nothing is changed on the database server for an engine that will
+        # not start. See Compare-ImageDataSource for why a tag that exists
+        # proves nothing about which data source is inside it.
+        if (-not $DbAddress) { $DbAddress = "$($planObj.databaseAddress)" }
+        $svcIniDsn = Join-Path (Join-Path $configRoot $s.Name) 'ServerConfiguration.ini'
+        $wantDsn = Get-IniValue -Path $svcIniDsn -Section 'ServerDatabaseSettings' -Key 'DSN'
+        $imgRef = "$registry/$EcrNamespace/$($s.Family):$($s.Tag)"
+        if (-not $DryRun) {
+            $lab = Get-ImageLabels -Image $imgRef
+            $mismatch = @(if ($lab.ok) { @(Compare-ImageDataSource -Labels $lab.labels -Dsn "$wantDsn" -Server "$DbAddress" -Database $s.DbName) } else { @() })
+            if (-not $lab.ok -or $mismatch.Count -gt 0) {
+                Write-Fail "$($s.Name): $imgRef was NOT built for the data source this run needs."
+                if (-not $lab.ok) { Write-Fail "       $($lab.error)" }
+                foreach ($m in $mismatch) { Write-Fail "       $m" }
+                Write-Fail '       NOT starting it. It would connect to the data source baked into the image,'
+                Write-Fail '       and every step before this one would still read green. ECR tags are immutable,'
+                Write-Fail '       so re-pushing cannot fix it - delete the tag and rebuild:'
+                Write-Fail "         aws ecr batch-delete-image --repository-name $EcrNamespace/$($s.Family) --image-ids imageTag=$($s.Tag) --region $region"
+                Write-Fail '         then images\build-images.ps1, which now refuses to skip a mismatched image.'
+                $results += [pscustomobject]@{ component = $s.Name; status = 'refused'
+                    detail = @{ reason = 'the image was built for a different ODBC data source than this run needs'
+                                image = $imgRef; mismatches = @($mismatch); error = "$($lab.error)"
+                                wantDsn = "$wantDsn"; wantServer = "$DbAddress"; wantDatabase = $s.DbName } }
+                $failed++; continue
+            }
+            Write-Ok "image built for DSN $wantDsn -> $DbAddress / $($s.DbName) (read from its labels)"
+            $labelOf = { param($n) if ($null -ne $lab.labels -and $lab.labels.PSObject.Properties[$n]) { [string]$lab.labels.PSObject.Properties[$n].Value } else { '<absent>' } }
+            $envEvidence = [ordered]@{
+                'odbc-encryption-off' = [ordered]@{ Encrypt = (& $labelOf 'com.logiciel.flowtest.odbcEncrypt')
+                                                    TrustServerCertificate = (& $labelOf 'com.logiciel.flowtest.odbcTrustServerCertificate')
+                                                    source = 'image labels' }
+            }
+        }
+
         # THE LOGIN THE ENGINE WILL USE.
         #
         # Restored is not the same as reachable-as-this-engine. The flow-test
@@ -473,7 +567,13 @@ foreach ($s in $services) {
                             configFile = $svcIni; dbName = $s.DbName } }
             $failed++; continue
         }
-        if (-not $DbAddress) { $DbAddress = "$($plan.databaseAddress)" }
+        # $planObj, NOT $plan. PowerShell names are case-insensitive, so in this
+        # script $plan IS the -Plan parameter - the path STRING - and reading
+        # .databaseAddress off a string is a terminating error under StrictMode.
+        # The Jenkinsfile never passes -DbAddress, so this would have killed the
+        # Windows start step the first time an OMS engine got this far. Found
+        # 2026-09-28 by reading the code, not by a run: no run had reached it.
+        if (-not $DbAddress) { $DbAddress = "$($planObj.databaseAddress)" }
         if (-not $DbAddress -or -not $DbSecretId) {
             $why = if (-not $DbAddress) { 'the plan carries no databaseAddress' } else { '-DbSecretId was not given' }
             Write-Fail "$($s.Name): cannot provision its database login - $why."
@@ -510,6 +610,7 @@ foreach ($s in $services) {
         # The LOGIN NAME is recorded, never the password.
         Write-Ok "database login '$dbUser' provisioned on $DbAddress and verified by connecting with it"
         $dbLoginProvisioned = $dbUser
+        if ($envEvidence) { $envEvidence['engine-login-db-owner'] = [ordered]@{ login = $dbUser; role = 'db_owner'; verifiedByConnecting = $true } }
     }
 
     $configDir = Join-Path $configRoot $s.Name
@@ -630,6 +731,7 @@ foreach ($s in $services) {
     $results += [pscustomobject]@{ component = $s.Name; status = 'running'
         detail = @{ image = $image; address = $s.Ip; network = $s.Network; configDir = $configDir
                     containerConfigTarget = $s.Target
+                    environmentDeviations = $envEvidence
                     note = 'running at this instant. Superseded by the late re-check if one ran.' } }
     $startedNames += $s.Name
     if (-not $script:FirstStart) { $script:FirstStart = Get-Date }

@@ -108,7 +108,7 @@ trap {
 
 # Printed first, every run. Without it a stale fetch is invisible and a retest
 # can silently re-run old code while looking like a fresh result.
-$script:ScriptVersion = '2026-09-28.1-reuse-stack'
+$script:ScriptVersion = '2026-09-28.2-tests-dsn-guard'
 
 function Write-Step { param([string] $Message) Write-Host "`n=== $Message ===" -ForegroundColor Cyan }
 function Write-Ok   { param([string] $Message) Write-Host "  [ok]   $Message" -ForegroundColor Green }
@@ -411,11 +411,44 @@ function Set-IniValues {
           [bool] $CreateSectionIfAbsent = $true,
           [string] $Scope = 'section')
 
-    $raw = [System.IO.File]::ReadAllText($Path)
+    # BYTES, NOT TEXT. Every byte this override does not declare must survive.
+    # Found by tests/ini-overrides (2026-09-28), not by a run - ReadAllText /
+    # WriteAllText(UTF8) had three silent effects on files it edited:
+    #   - a Windows-1252 byte anywhere (a comment, say) became U+FFFD, editing
+    #     a line no deviation declared;
+    #   - a UTF-8 BOM was dropped, changing the file's encoding unrecorded;
+    #   - a UTF-16 file was re-encoded to UTF-8 wholesale.
+    # Latin-1 maps every byte to one char and back, so decoding with it and
+    # re-encoding with it is an exact round trip; the keys and sections being
+    # matched are ASCII either way. UTF-16 is refused, as in the .sh.
+    $latin1 = [System.Text.Encoding]::GetEncoding(28591)
+    $bytes = [System.IO.File]::ReadAllBytes($Path)
+    if (($bytes.Length -ge 2 -and (($bytes[0] -eq 0xFF -and $bytes[1] -eq 0xFE) -or ($bytes[0] -eq 0xFE -and $bytes[1] -eq 0xFF))) -or
+        ([Array]::IndexOf($bytes, [byte]0) -ge 0)) {
+        return [pscustomobject]@{ changes = @(); occurrences = 0; error = 'file is UTF-16 (or holds NUL bytes), not an 8-bit INI. Not edited: read as bytes it has no sections, and writing to it would put two encodings in one file.' }
+    }
+    $bomLen = if ($bytes.Length -ge 3 -and $bytes[0] -eq 0xEF -and $bytes[1] -eq 0xBB -and $bytes[2] -eq 0xBF) { 3 } else { 0 }
+    $raw = $latin1.GetString($bytes, $bomLen, $bytes.Length - $bomLen)
     $crlf = $raw.Contains("`r`n")
     $lines = [System.Collections.Generic.List[string]]@($raw -split "`n")
     $want = @{}
     foreach ($k in $Set.Keys) { $want[$k.ToLowerInvariant()] = @($k, [string]$Set[$k]) }
+    # ASCII only in what is WRITTEN: the file encoding is not known, so a
+    # non-ASCII value would be encoded differently by the two hosts.
+    foreach ($pair in $want.Values) {
+        if (($pair[0] + $pair[1]) -match '[^\x00-\x7F]') {
+            return [pscustomobject]@{ changes = @(); occurrences = 0; error = 'override keys and values must be ASCII: the file encoding is not known, so anything else would be written differently on each host' }
+        }
+    }
+    # Written back as the BOM it had plus the edited body, byte for byte.
+    $writeBack = {
+        param([string] $Text)
+        $body = $latin1.GetBytes($Text)
+        $all = New-Object byte[] ($bomLen + $body.Length)
+        if ($bomLen -gt 0) { [Array]::Copy($bytes, 0, $all, 0, $bomLen) }
+        [Array]::Copy($body, 0, $all, $bomLen, $body.Length)
+        [System.IO.File]::WriteAllBytes($Path, $all)
+    }
 
     # SCOPE 'wherever-present': set these keys in EVERY section that already
     # declares them, and create nothing.
@@ -449,7 +482,10 @@ function Set-IniValues {
                     $old = $bare.Split('=', 2)[1].Trim()
                     $new = $want[$lk][1]
                     $hits++
-                    if ($old -ne $new) {
+                    # -cne, not -ne: PowerShell compares strings case-INsensitively
+                    # by default, so 'TRUE' -> 'true' was silently skipped and not
+                    # recorded. A value is bytes the engine parses.
+                    if ($old -cne $new) {
                         $changes += [pscustomobject]@{ key = $key; from = $old; to = $new; section = $cur }
                         $out.Add("$key=$new" + $(if ($line.EndsWith("`r")) { "`r" } else { '' }))
                         continue
@@ -467,7 +503,7 @@ function Set-IniValues {
         if ($changes.Count -gt 0) {
             $text = ($out -join "`n")
             if ($crlf) { $text = ($text -replace "`r`n", "`n") -replace "`n", "`r`n" }
-            [System.IO.File]::WriteAllText($Path, $text, (New-Object System.Text.UTF8Encoding $false))
+            & $writeBack $text
         }
         # error = $null on the success path too. Set-StrictMode makes reading
         # an absent property a TERMINATING error, so a result object whose
@@ -494,7 +530,7 @@ function Set-IniValues {
                 $old = $bare.Split('=', 2)[1].Trim()
                 $new = $want[$lk][1]
                 $seen[$lk] = $true
-                if ($old -ne $new) {
+                if ($old -cne $new) {
                     $changes += [pscustomobject]@{ key = $key; from = $old; to = $new }
                     $out.Add("$key=$new" + $(if ($line.EndsWith("`r")) { "`r" } else { '' }))
                     continue
@@ -529,7 +565,7 @@ function Set-IniValues {
     if ($changes.Count -gt 0) {
         $text = ($out -join "`n")
         if ($crlf) { $text = ($text -replace "`r`n", "`n") -replace "`n", "`r`n" }
-        [System.IO.File]::WriteAllText($Path, $text, (New-Object System.Text.UTF8Encoding $false))
+        & $writeBack $text
     }
     return [pscustomobject]@{ changes = $changes; error = $null }
 }

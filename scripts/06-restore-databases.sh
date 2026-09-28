@@ -37,7 +37,7 @@
 #
 set -uo pipefail
 
-SCRIPT_VERSION='2026-09-28.1-reuse-stack'
+SCRIPT_VERSION='2026-09-28.2-tests-dsn-guard'
 
 PLAN=''
 SA_SECRET=''

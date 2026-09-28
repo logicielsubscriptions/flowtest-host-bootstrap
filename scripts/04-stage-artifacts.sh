@@ -55,7 +55,7 @@ set -euo pipefail
 
 # Printed first, every run. A stale fetch is otherwise invisible - see the note
 # in 02-prereq-windows.ps1.
-SCRIPT_VERSION='2026-09-28.1-reuse-stack'
+SCRIPT_VERSION='2026-09-28.2-tests-dsn-guard'
 
 PLAN_FILE="/opt/flowtest/bootstrap/flow-plan-linux.json"
 DRY_RUN=0
@@ -401,10 +401,34 @@ path, section, pairs_json, create_section = sys.argv[1], sys.argv[2], sys.argv[3
 # looking like it did.
 scope = sys.argv[5] if len(sys.argv) > 5 else "section"
 pairs = json.loads(pairs_json)
-raw = open(path, "rb").read().decode("utf-8", "surrogateescape")
+# ENCODING. Every byte this override does not declare must survive untouched,
+# so the file is handled as bytes and only the target lines are rewritten.
+# Found by tests/ini-overrides (2026-09-28), not by a run:
+#   - UTF-16 has no recognisable section when read as bytes, so with
+#     createSectionIfAbsent=true this APPENDED a UTF-8 section to a UTF-16
+#     file. Refuse instead: nothing written, and the reason says why.
+#   - A UTF-8 BOM glued itself to the first header, so a target in the FIRST
+#     section was never found. It is set aside and written back unchanged.
+data = open(path, "rb").read()
+if data[:2] in (b"\xff\xfe", b"\xfe\xff") or b"\x00" in data:
+    print(json.dumps({"error": "file is UTF-16 (or holds NUL bytes), not an 8-bit INI. Not edited: "
+                               "read as bytes it has no sections, and writing to it would put two "
+                               "encodings in one file."}))
+    sys.exit(0)
+bom = b"\xef\xbb\xbf" if data.startswith(b"\xef\xbb\xbf") else b""
+raw = data[len(bom):].decode("utf-8", "surrogateescape")
 crlf = "\r\n" in raw
 lines = raw.split("\n")
-want = {k.lower(): (k, v) for k, v in pairs.items()}
+# str(): the catalogue is JSON, and an unquoted number crashed this with a
+# TypeError while the .ps1 cast it and carried on.
+want = {k.lower(): (k, str(v)) for k, v in pairs.items()}
+# ASCII only in what we WRITE. The file encoding is not known (Windows-1252
+# and UTF-8 look identical in ASCII), so a non-ASCII value would be encoded
+# differently by the two hosts. Refuse rather than guess.
+if any(ord(c) > 127 for k, v in want.values() for c in k + v):
+    print(json.dumps({"error": "override keys and values must be ASCII: the file encoding is not "
+                               "known, so anything else would be written differently on each host"}))
+    sys.exit(0)
 changes, seen, cur, out, insert_at = [], set(), None, [], None
 
 if scope == "wherever-present":
@@ -445,7 +469,7 @@ if scope == "wherever-present":
         text = text.replace("\r\n", "\n").replace("\n", "\r\n")
     if changes:
         with open(path, "wb") as fh:
-            fh.write(text.encode("utf-8", "surrogateescape"))
+            fh.write(bom + text.encode("utf-8", "surrogateescape"))
     print(json.dumps({"changes": changes, "occurrences": hits}))
     sys.exit(0)
 
@@ -496,7 +520,7 @@ if crlf:
     text = text.replace("\r\n", "\n").replace("\n", "\r\n")
 if changes:
     with open(path, "wb") as fh:
-        fh.write(text.encode("utf-8", "surrogateescape"))
+        fh.write(bom + text.encode("utf-8", "surrogateescape"))
 print(json.dumps({"changes": changes}))
 '
 
@@ -638,7 +662,8 @@ CONFIG_CHANGE_RESULT=""
 CONFIG_CHANGE_COUNT=0
 CONFIG_CHANGE_NOTE=""
 config_changed_between() {
-  local cs="$1" snapshot_key="$2" offset="$3"
+  # $2 (the snapshot key) is accepted and unused: callers pass it positionally.
+  local cs="$1" _snapshot_key="$2" offset="$3"
   CONFIG_CHANGE_RESULT=""; CONFIG_CHANGE_COUNT=0; CONFIG_CHANGE_NOTE=""
 
   local gp repo branch owner
@@ -1356,9 +1381,9 @@ stage_db_backups() {
       #    is outside the window - a database from another month is a different
       #    book, and restoring one produces a run that looks fine and is not.
       [[ -n "$wanted" ]] && warn "$dbname: $wanted is NOT in s3://$bucket/${prefix%/}/ - looking for the nearest dated backup"
-      local resolved rkey roff rflag
+      local resolved rkey roff _rflag
       resolved="$(resolve_dated "$bucket" "$prefix" '%Y%m%d' '{date}.bak')"
-      IFS=$'\t' read -r rkey roff rflag <<<"$resolved"
+      IFS=$'\t' read -r rkey roff _rflag <<<"$resolved"
       if [[ "$rkey" == "NONE" ]]; then
         fail "$dbname: NOTHING dated found under s3://$bucket/${prefix%/}/"
         record "$dbname" dbBackup missing \
@@ -1524,7 +1549,13 @@ rows = [l.strip() for l in sys.stdin if l.strip()]
 # INFER THE CONVENTION FROM THE LISTING, DO NOT ASSUME IT.
 #
 # Two formats are in use in the same bucket, on different prefixes - build 81
-# saw YYYY-MM-DD under one host's FIX prefix and DD-MM-YYYY under another's. And
+# saw YYYY-MM-DD under the FIX prefix of one host and DD-MM-YYYY under the
+# prefix of another. (NO APOSTROPHES ANYWHERE IN THIS BLOCK: it is a bash
+# single-quoted string, and the two that stood here from 2026-09-15 ended the
+# program mid-comment - python ran a truncated script that printed nothing, so
+# this block could never select a FIX folder and would have reported "none
+# within the window". Latent only because no flow yet gives a Linux-hosted
+# component a FIX archive. Found 2026-09-28 by shellcheck SC1011.) And
 # DD-MM vs MM-DD is ambiguous whenever both numbers are <= 12.
 #
 # The earlier rule was "keep the folder if EITHER reading lands in the window",

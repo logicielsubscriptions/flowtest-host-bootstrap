@@ -42,7 +42,7 @@
 #
 set -uo pipefail
 
-SCRIPT_VERSION='2026-09-28.1-reuse-stack'
+SCRIPT_VERSION='2026-09-28.2-tests-dsn-guard'
 
 PLAN=''
 ONLY=''
@@ -325,7 +325,7 @@ STARTED_NAMES=()
 FIRST_START_EPOCH=''
 
 for line in "${SERVICES[@]}"; do
-  IFS=$'\t' read -r name svc family tag net ip shared pos owner target needsdb dbname reqdirs <<<"$line"
+  IFS=$'\t' read -r name svc family tag net ip shared _pos owner target needsdb dbname reqdirs <<<"$line"
   step "$name"
 
   # A DATABASE THIS ENGINE NEEDS AND DOES NOT HAVE.
@@ -528,7 +528,8 @@ for line in "${SERVICES[@]}"; do
     if [[ -z "$in_missing" ]]; then
       readback='match'
       ok "read back from the container: all $count staged file(s) present under $target ($in_files file(s) there in total)"
-      printf '         %s\n' $(printf '%s\n' "$in_paths" | head -40) >&2
+      # One line per path, quoted: a path with a space in it is one path (SC2046).
+      printf '%s\n' "$in_paths" | head -40 | sed 's/^/         /' >&2
     else
       readback='mismatch'
       fail "$name: $n_present of $count staged file(s) reached $target. MISSING:"
