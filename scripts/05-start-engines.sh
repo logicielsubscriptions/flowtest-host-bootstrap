@@ -42,7 +42,7 @@
 #
 set -uo pipefail
 
-SCRIPT_VERSION='2026-09-25.4-imagetag-probe-and-db-server'
+SCRIPT_VERSION='2026-09-28.1-reuse-stack'
 
 PLAN=''
 ONLY=''
