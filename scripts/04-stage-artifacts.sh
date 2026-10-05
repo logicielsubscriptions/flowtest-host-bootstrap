@@ -55,7 +55,7 @@ set -euo pipefail
 
 # Printed first, every run. A stale fetch is otherwise invisible - see the note
 # in 02-prereq-windows.ps1.
-SCRIPT_VERSION='2026-09-28.2-tests-dsn-guard'
+SCRIPT_VERSION='2026-10-05.1-sapassword-absent-ok'
 
 PLAN_FILE="/opt/flowtest/bootstrap/flow-plan-linux.json"
 DRY_RUN=0
@@ -456,7 +456,8 @@ if scope == "wherever-present":
         # NOT an error, and NOT a success either. Say which it is and let the
         # caller decide - the key being absent may mean the feature is already
         # off, or may mean this is the wrong file.
-        print(json.dumps({"error": "none of %s appears anywhere in this file, so nothing was "
+        print(json.dumps({"occurrences": 0,
+                          "error": "none of %s appears anywhere in this file, so nothing was "
                                    "changed. Creating them is deliberately not done: a key the "
                                    "engine does not already read changes no behaviour."
                                    % ", ".join(sorted(k for k, _ in want.values()))}))
@@ -585,6 +586,19 @@ apply_config_overrides() {   # apply_config_overrides <staged-dir> <component> <
       continue
     }
     err="$(printf '%s' "$res" | jq -r '.error // empty' 2>/dev/null)"
+    # ABSENT EVERYWHERE, AND THE CATALOGUE SAYS ABSENT IS ALREADY OFF: the
+    # bypass is satisfied with nothing to change. Build 135 recorded the OE
+    # this way as a FAILED bypass and the whole run claimed "none". Decided on
+    # occurrences==0, never on the error text, and only when declared.
+    if [[ -n "$err" && "$(printf '%s' "$entry" | jq -r '.absentMeansAlreadyOff // false')" == "true" \
+          && "$(printf '%s' "$res" | jq -r '.occurrences // "x"')" == "0" ]]; then
+      ok "$name: $file carries none of the keys - already off, nothing to bypass"
+      applied="$(printf '%s' "$applied" | jq -c --arg f "$file" --arg d "$dep" \
+        '. + [{file:$f, applied:true, changes:[], absentAlreadyOff:true,
+               reason:"none of the keys appears in the file; the catalogue declares absent as already off"}
+              + (if $d == "" then {} else {bypassedDependency:$d} end)]')"
+      continue
+    fi
     if [[ -n "$err" ]]; then
       warn "$name: override of $file not applied: $err"
       applied="$(printf '%s' "$applied" | jq -c --arg f "$file" --arg r "$err" --arg d "$dep" \

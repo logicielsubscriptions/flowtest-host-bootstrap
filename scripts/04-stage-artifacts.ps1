@@ -108,7 +108,7 @@ trap {
 
 # Printed first, every run. Without it a stale fetch is invisible and a retest
 # can silently re-run old code while looking like a fresh result.
-$script:ScriptVersion = '2026-09-28.2-tests-dsn-guard'
+$script:ScriptVersion = '2026-10-05.1-sapassword-absent-ok'
 
 function Write-Step { param([string] $Message) Write-Host "`n=== $Message ===" -ForegroundColor Cyan }
 function Write-Ok   { param([string] $Message) Write-Host "  [ok]   $Message" -ForegroundColor Green }
@@ -496,7 +496,7 @@ function Set-IniValues {
         }
         if ($hits -eq 0) {
             $names = (($want.Values | ForEach-Object { $_[0] }) | Sort-Object) -join ', '
-            return [pscustomobject]@{ changes = @(); error = "none of $names appears anywhere in this file, so nothing was changed. Creating them is deliberately not done: a key the engine does not already read changes no behaviour." }
+            return [pscustomobject]@{ changes = @(); occurrences = 0; error = "none of $names appears anywhere in this file, so nothing was changed. Creating them is deliberately not done: a key the engine does not already read changes no behaviour." }
         }
         while ($out.Count -gt 0 -and -not $out[$out.Count - 1].Trim()) { $out.RemoveAt($out.Count - 1) }
         $out.Add('')
@@ -636,6 +636,20 @@ function Invoke-ConfigOverrides {
             Write-Fail "${Component}: the override of $($e.file) THREW: $($_.Exception.Message)"
             Write-Fail '       Recorded and carried on - a bad override must not cost the manifest.'
             $r = @{ file = $e.file; applied = $false; reason = "override threw: $($_.Exception.Message)" }
+            if ($dep) { $r.bypassedDependency = $dep }
+            $applied += $r
+            continue
+        }
+        # ABSENT EVERYWHERE, AND THE CATALOGUE SAYS ABSENT IS ALREADY OFF: the
+        # bypass is satisfied with nothing to change. Build 135 recorded the OE
+        # this way as a FAILED bypass and the whole run claimed "none". Decided
+        # on occurrences -eq 0, never on the error text, and only when declared.
+        $absentOk = ($e.PSObject.Properties['absentMeansAlreadyOff'] -and [bool]$e.absentMeansAlreadyOff -and
+                     $res -and $res.PSObject.Properties['occurrences'] -and $res.occurrences -eq 0)
+        if ($resErr -and $absentOk) {
+            Write-Ok "${Component}: $($e.file) carries none of the keys - already off, nothing to bypass"
+            $r = @{ file = $e.file; applied = $true; changes = @(); absentAlreadyOff = $true
+                    reason = 'none of the keys appears in the file; the catalogue declares absent as already off' }
             if ($dep) { $r.bypassedDependency = $dep }
             $applied += $r
             continue

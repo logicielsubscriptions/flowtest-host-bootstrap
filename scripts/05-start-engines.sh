@@ -42,7 +42,7 @@
 #
 set -uo pipefail
 
-SCRIPT_VERSION='2026-09-28.2-tests-dsn-guard'
+SCRIPT_VERSION='2026-10-05.1-sapassword-absent-ok'
 
 PLAN=''
 ONLY=''

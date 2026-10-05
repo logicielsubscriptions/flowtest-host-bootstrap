@@ -64,7 +64,7 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
-$script:ScriptVersion = '2026-09-28.2-tests-dsn-guard'
+$script:ScriptVersion = '2026-10-05.1-sapassword-absent-ok'
 Write-Host "  script version $script:ScriptVersion" -ForegroundColor DarkGray
 
 function Write-Step { param([string] $m) Write-Host ''; Write-Host "==> $m" -ForegroundColor Cyan }
@@ -109,6 +109,37 @@ trap {
     Write-Host ''
     Write-Fail "line $($inv.ScriptLineNumber): $($inv.Line.Trim())"
     Write-Fail $_.Exception.Message
+    # KEEP THE RECORD. Build 135 died here after the Windows FIX hub was
+    # already started: no started-windows.json, no late re-check, and a running
+    # container nothing listed. A fatal error must not cost the manifest - write
+    # what was done so far, plus the fault, so the build can say which engines
+    # are up and which were never attempted. Every read is guarded: under
+    # StrictMode an unset variable here would throw inside the trap.
+    try {
+        $wr = Get-Variable -Name workRoot -ValueOnly -ErrorAction SilentlyContinue
+        $dr = Get-Variable -Name DryRun -ValueOnly -ErrorAction SilentlyContinue
+        if ($wr -and -not $dr) {
+            # Assigned first, then @(): Get-Variable -ValueOnly emits the array
+            # as ONE object, so @(Get-Variable ...) nested it a level deep.
+            $done = Get-Variable -Name results -ValueOnly -ErrorAction SilentlyContinue
+            if ($null -eq $done) { $done = @() }
+            $doc = [ordered]@{
+                schemaVersion = '1.0'
+                hostRole      = (Get-Variable -Name role -ValueOnly -ErrorAction SilentlyContinue)
+                flow          = (Get-Variable -Name flow -ValueOnly -ErrorAction SilentlyContinue)
+                startedBy     = $script:ScriptVersion
+                startedAt     = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
+                fatal         = [ordered]@{ line = $inv.ScriptLineNumber; statement = "$($inv.Line.Trim())"
+                                            message = "$($_.Exception.Message)"
+                                            note = 'the script stopped here; components after this point were NOT attempted, and any listed as running were left running' }
+                items         = @($done)
+                summary       = @{ fatal = 1 }
+            }
+            $mp = Join-Path $wr "started-$($doc.hostRole).json"
+            $doc | ConvertTo-Json -Depth 8 | Set-Content -Path $mp -Encoding UTF8
+            Write-Fail "partial manifest written to $mp"
+        }
+    } catch { Write-Fail "could not write a partial manifest: $($_.Exception.Message)" }
     exit 1
 }
 
@@ -469,6 +500,11 @@ function Copy-EngineLogs {
 $results = @()
 $startedNames = @()
 $script:FirstStart = $null
+# Read by `if (-not $script:SaPassword)` before the first database engine sets
+# it. Under StrictMode reading an UNSET variable is a terminating error, and
+# build 135 died on exactly that line - the first run ever to reach it, because
+# no earlier run had got an order-management engine past its image check.
+$script:SaPassword = $null
 $started = 0
 $failed  = 0
 
