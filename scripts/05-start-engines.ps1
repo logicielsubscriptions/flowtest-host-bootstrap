@@ -64,7 +64,7 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
-$script:ScriptVersion = '2026-10-05.1-sapassword-absent-ok'
+$script:ScriptVersion = '2026-10-06.1-acl-by-sid'
 Write-Host "  script version $script:ScriptVersion" -ForegroundColor DarkGray
 
 function Write-Step { param([string] $m) Write-Host ''; Write-Host "==> $m" -ForegroundColor Cyan }
@@ -418,12 +418,21 @@ PRINT 'LOGIN_PROVISIONED';
     $file = Join-Path $env:TEMP ("flowtest-login-" + [guid]::NewGuid().ToString('N') + '.sql')
     try {
         # Owner-only before a byte of it exists, not after.
+        #
+        # BY SID, NOT BY NAME. Under SSM this runs as SYSTEM, where
+        # $env:USERNAME is the MACHINE account ('<HOST>$'), and turning that
+        # name into an NTAccount throws "Some or all identity references could
+        # not be translated" - which killed the whole Windows start step in
+        # build 136, one engine past where build 135 died. The SID of the
+        # identity actually running is exact under every account, interactive
+        # or not.
+        $me = [System.Security.Principal.WindowsIdentity]::GetCurrent().User
         $null = New-Item -ItemType File -Path $file -Force
         $acl = Get-Acl $file
         $acl.SetAccessRuleProtection($true, $false)
-        $acl.SetOwner([System.Security.Principal.NTAccount]::new($env:USERNAME))
+        $acl.SetOwner($me)
         $acl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule(
-            $env:USERNAME, 'FullControl', 'Allow')))
+            $me, 'FullControl', 'Allow')))
         Set-Acl -Path $file -AclObject $acl
         [System.IO.File]::WriteAllText($file, $sql, (New-Object System.Text.UTF8Encoding $false))
 
@@ -632,8 +641,16 @@ foreach ($s in $services) {
             }
             $script:SaPassword = "$($sec.Output)".Trim()
         }
-        $grant = Grant-EngineDbLogin -Server $DbAddress -Database $s.DbName `
-                                     -Login $dbUser -Password $dbPw -SaPassword $script:SaPassword
+        # ONE ENGINE'S LOGIN MUST NOT COST THE OTHERS. An exception from inside
+        # the grant (build 136: an ACL call) went to the script-level trap and
+        # ended the step for every engine after this one. Caught here, it is a
+        # refusal of THIS engine, recorded with its reason, and the loop goes on.
+        try {
+            $grant = Grant-EngineDbLogin -Server $DbAddress -Database $s.DbName `
+                                         -Login $dbUser -Password $dbPw -SaPassword $script:SaPassword
+        } catch {
+            $grant = [pscustomobject]@{ ok = $false; error = "the grant THREW: $($_.Exception.Message)" }
+        }
         if (-not $grant.ok) {
             Write-Fail "$($s.Name): could not provision the database login '$dbUser' on $DbAddress."
             Write-Fail "       $($grant.error)"

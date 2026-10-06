@@ -42,7 +42,7 @@
 #
 set -uo pipefail
 
-SCRIPT_VERSION='2026-10-05.1-sapassword-absent-ok'
+SCRIPT_VERSION='2026-10-06.1-acl-by-sid'
 
 PLAN=''
 ONLY=''
