@@ -37,7 +37,7 @@
 #
 set -uo pipefail
 
-SCRIPT_VERSION='2026-10-06.5-sa-boot-pw'
+SCRIPT_VERSION='2026-10-06.6-sa-reuse'
 
 PLAN=''
 SA_SECRET=''
@@ -182,7 +182,7 @@ fi
 # Which password the instance answers to right now. An instance this script
 # started earlier (a reused stack) already holds the secret's; a fresh one
 # boots on a throwaway and is switched below.
-CUR_PW="$SA_PASSWORD"; FRESH_INSTANCE=0
+CUR_PW="$SA_PASSWORD"; NEEDS_SWITCH=0
 
 # ---------------------------------------------------------------------------
 step 'Start the instance'
@@ -211,7 +211,6 @@ else
     # password that passes, and sa is switched to the secret's password
     # straight after, with CHECK_POLICY OFF - see 'Set the sa password'.
     BOOT_PW="Ft1!$(head -c 18 /dev/urandom | od -An -tx1 | tr -d ' \n')"
-    CUR_PW="$BOOT_PW"; FRESH_INSTANCE=1
     printf 'ACCEPT_EULA=Y\nMSSQL_SA_PASSWORD=%s\n' "$BOOT_PW" > "$envfile"
     if ! out="$(docker run -d --name "$CONTAINER" --restart unless-stopped \
                   --env-file "$envfile" \
@@ -258,7 +257,7 @@ fi
 # appears in an argv the host can see.
 sqlq() {  # sqlq <sql>  -> stdout, exit code of sqlcmd
   printf '%s\n' "$CUR_PW" | docker exec -i "$CONTAINER" /bin/sh -c \
-    'IFS= read -r p; SQLCMDPASSWORD="$p" exec "$0" -C -S localhost -U sa -b -h -1 -W -Q "$1"' \
+    'IFS= read -r p; [ -n "$p" ] || p="$MSSQL_SA_PASSWORD"; SQLCMDPASSWORD="$p" exec "$0" -C -S localhost -U sa -b -h -1 -W -Q "$1"' \
     "$SQLCMD" "$1" 2>&1
 }
 
@@ -272,7 +271,7 @@ sqlq() {  # sqlq <sql>  -> stdout, exit code of sqlcmd
 # corrupt parse. A separator the data cannot contain removes the guesswork.
 sqlq_cols() {  # sqlq_cols <sql>  -> pipe-separated columns
   printf '%s\n' "$CUR_PW" | docker exec -i "$CONTAINER" /bin/sh -c \
-    'IFS= read -r p; SQLCMDPASSWORD="$p" exec "$0" -C -S localhost -U sa -b -h -1 -W -s "|" -Q "$1"' \
+    'IFS= read -r p; [ -n "$p" ] || p="$MSSQL_SA_PASSWORD"; SQLCMDPASSWORD="$p" exec "$0" -C -S localhost -U sa -b -h -1 -W -s "|" -Q "$1"' \
     "$SQLCMD" "$1" 2>&1
 }
 
@@ -284,7 +283,15 @@ else
   deadline=$(( $(date +%s) + READY_TIMEOUT ))
   ready=0
   while [[ $(date +%s) -lt $deadline ]]; do
-    if sqlq 'SELECT 1' >/dev/null 2>&1; then ready=1; break; fi
+    # WHICH PASSWORD DOES IT ANSWER TO? The secret's, if this instance was
+    # already switched. Otherwise the one it was CREATED with, which it holds
+    # as MSSQL_SA_PASSWORD (CUR_PW="" selects that): a fresh instance's
+    # throwaway boot password, or - build 142, a reused stack - the secret's
+    # OLD value from before it was changed. Either way it is switched below.
+    CUR_PW="$SA_PASSWORD"
+    if sqlq 'SELECT 1' >/dev/null 2>&1; then ready=1; NEEDS_SWITCH=0; break; fi
+    CUR_PW=""
+    if sqlq 'SELECT 1' >/dev/null 2>&1; then ready=1; NEEDS_SWITCH=1; break; fi
     sleep 5
   done
   if [[ $ready -eq 0 ]]; then
@@ -299,7 +306,7 @@ else
   fi
   ok "accepting connections"
 
-  if [[ $FRESH_INSTANCE -eq 1 ]]; then
+  if [[ $NEEDS_SWITCH -eq 1 ]]; then
     step 'Set the sa password'
     # The SQL carries the password, so it goes in through stdin to a private
     # file inside the container and is deleted - never an argument on the host.
@@ -307,7 +314,7 @@ else
     printf "ALTER LOGIN [sa] WITH PASSWORD = N'%s', CHECK_POLICY = OFF, CHECK_EXPIRATION = OFF;\n" "$lit" |
       docker exec -i "$CONTAINER" /bin/sh -c 'umask 077; cat > /tmp/sa.sql'
     setout="$(printf '%s\n' "$CUR_PW" | docker exec -i "$CONTAINER" /bin/sh -c \
-      'IFS= read -r p; SQLCMDPASSWORD="$p" "$0" -C -S localhost -U sa -b -i /tmp/sa.sql; rc=$?; rm -f /tmp/sa.sql; exit $rc' \
+      'IFS= read -r p; [ -n "$p" ] || p="$MSSQL_SA_PASSWORD"; SQLCMDPASSWORD="$p" "$0" -C -S localhost -U sa -b -i /tmp/sa.sql; rc=$?; rm -f /tmp/sa.sql; exit $rc' \
       "$SQLCMD" 2>&1)"; setrc=$?
     CUR_PW="$SA_PASSWORD"
     if [[ $setrc -ne 0 ]] || ! sqlq 'SELECT 1' >/dev/null 2>&1; then

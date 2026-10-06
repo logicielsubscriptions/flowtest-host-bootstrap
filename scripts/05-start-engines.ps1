@@ -64,7 +64,7 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
-$script:ScriptVersion = '2026-10-06.5-sa-boot-pw'
+$script:ScriptVersion = '2026-10-06.6-sa-reuse'
 Write-Host "  script version $script:ScriptVersion" -ForegroundColor DarkGray
 
 function Write-Step { param([string] $m) Write-Host ''; Write-Host "==> $m" -ForegroundColor Cyan }
