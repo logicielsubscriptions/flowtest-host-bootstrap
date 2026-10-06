@@ -55,7 +55,7 @@ set -euo pipefail
 
 # Printed first, every run. A stale fetch is otherwise invisible - see the note
 # in 02-prereq-windows.ps1.
-SCRIPT_VERSION='2026-10-06.8-reuse-plan'
+SCRIPT_VERSION='2026-10-06.9-bare-refs'
 
 PLAN_FILE="/opt/flowtest/bootstrap/flow-plan-linux.json"
 DRY_RUN=0
@@ -340,6 +340,14 @@ config_references_missing() {   # config_references_missing <staged-dir>
           printf '%s -> %s (not staged)\n' "$(basename "$f")" "$ref"
         fi
       done
+    # Bare filenames in INI values (build 145 - see the .ps1). INI-style only.
+    case "${f,,}" in
+      *.ini|*.cfg|*.conf|*.properties)
+        sed -nE 's/^[[:space:]]*[A-Za-z0-9_.]+[[:space:]]*=[[:space:]]*([A-Za-z0-9_.-]+\.(txt|csv|json|dat|xml|pem))[[:space:]]*\r?$/\1/p' "$f" 2>/dev/null \
+        | while IFS= read -r ref; do
+            [[ -e "$dir/$ref" ]] || printf '%s -> %s (not staged)\n' "$(basename "$f")" "$ref"
+          done ;;
+    esac
   done < <(find "$dir" -type f 2>/dev/null) | sort -u
 }
 

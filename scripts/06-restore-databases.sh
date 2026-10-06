@@ -37,7 +37,7 @@
 #
 set -uo pipefail
 
-SCRIPT_VERSION='2026-10-06.8-reuse-plan'
+SCRIPT_VERSION='2026-10-06.9-bare-refs'
 
 PLAN=''
 SA_SECRET=''

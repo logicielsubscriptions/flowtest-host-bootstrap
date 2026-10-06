@@ -108,7 +108,7 @@ trap {
 
 # Printed first, every run. Without it a stale fetch is invisible and a retest
 # can silently re-run old code while looking like a fresh result.
-$script:ScriptVersion = '2026-10-06.8-reuse-plan'
+$script:ScriptVersion = '2026-10-06.9-bare-refs'
 
 function Write-Step { param([string] $Message) Write-Host "`n=== $Message ===" -ForegroundColor Cyan }
 function Write-Ok   { param([string] $Message) Write-Host "  [ok]   $Message" -ForegroundColor Green }
@@ -383,6 +383,25 @@ function Get-MissingConfigReferences {
             if (-not $rel) { continue }
             $full = Join-Path $Dir ($rel -replace '/', '\')
             if (-not (Test-Path -LiteralPath $full)) {
+                $line = "$($f.Name) -> $ref (not staged)"
+                if (-not $out.Contains($line)) { $out.Add($line) }
+            }
+        }
+    }
+    # BARE FILENAMES IN INI VALUES. Build 145: the OE died in the StopLoss algo
+    # right after "Symbols file not found" - algo_selector_config.ini names its
+    # file as allowed_symbol_file=<name>.txt, no separator, so the pattern above
+    # never saw it, this list was EMPTY, and the host-only fetch it triggers
+    # never ran. INI-style files only: a bare word in JSON/XML is too often not
+    # a file. Resolved against the staged folder, which becomes the engine home.
+    $bare = '(?m)^\s*[A-Za-z0-9_.]+\s*=\s*([A-Za-z0-9_.-]+\.(txt|csv|json|dat|xml|pem))\s*$'
+    foreach ($f in @(Get-ChildItem -LiteralPath $Dir -File -Recurse -ErrorAction SilentlyContinue)) {
+        if (@('.ini', '.cfg', '.conf', '.properties') -notcontains $f.Extension.ToLowerInvariant()) { continue }
+        $text = Get-Content -LiteralPath $f.FullName -Raw -ErrorAction SilentlyContinue
+        if (-not $text) { continue }
+        foreach ($m in [regex]::Matches($text, $bare)) {
+            $ref = $m.Groups[1].Value
+            if (-not (Test-Path -LiteralPath (Join-Path $Dir $ref))) {
                 $line = "$($f.Name) -> $ref (not staged)"
                 if (-not $out.Contains($line)) { $out.Add($line) }
             }
