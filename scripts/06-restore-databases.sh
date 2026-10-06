@@ -37,7 +37,7 @@
 #
 set -uo pipefail
 
-SCRIPT_VERSION='2026-10-06.7-oe-hostname'
+SCRIPT_VERSION='2026-10-06.8-reuse-plan'
 
 PLAN=''
 SA_SECRET=''
@@ -409,6 +409,14 @@ while IFS= read -r entry; do
         rawOutput:$r}')"
     failed=$((failed+1)); continue
   fi
+
+  # A REUSED STACK STILL HAS LAST RUN'S ENGINES CONNECTED. Build 144: RESTORE
+  # failed with "Exclusive access could not be obtained because the database is
+  # in use" - build 143's risk engine was still running. If the database
+  # exists, take it single-user, rolling back other sessions; the restore then
+  # replaces it (the restored database comes back multi-user, as backed up).
+  # Those engines are replaced by the start step that follows anyway.
+  sqlq "IF DB_ID(N'${dbname}') IS NOT NULL ALTER DATABASE [${dbname}] SET SINGLE_USER WITH ROLLBACK IMMEDIATE" >/dev/null 2>&1 || true
 
   restore_out="$(sqlq "RESTORE DATABASE [${dbname}] FROM DISK = N'${incontainer}' WITH REPLACE, RECOVERY${moves}")"
   rc=$?

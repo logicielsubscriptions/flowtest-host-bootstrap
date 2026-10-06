@@ -42,7 +42,7 @@
 #
 set -uo pipefail
 
-SCRIPT_VERSION='2026-10-06.7-oe-hostname'
+SCRIPT_VERSION='2026-10-06.8-reuse-plan'
 
 PLAN=''
 ONLY=''
@@ -321,6 +321,8 @@ record() {  # name, status, detail-json
 }
 
 started=0; failed=0
+# Logs from THIS run only - a reused host keeps the last run's (build 144).
+rm -rf "${WORK_ROOT}/engine-logs" 2>/dev/null || true
 STARTED_NAMES=()
 FIRST_START_EPOCH=''
 

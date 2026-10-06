@@ -64,7 +64,7 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
-$script:ScriptVersion = '2026-10-06.7-oe-hostname'
+$script:ScriptVersion = '2026-10-06.8-reuse-plan'
 Write-Host "  script version $script:ScriptVersion" -ForegroundColor DarkGray
 
 function Write-Step { param([string] $m) Write-Host ''; Write-Host "==> $m" -ForegroundColor Cyan }
@@ -533,6 +533,10 @@ function Copy-EngineLogs {
 }
 
 $results = @()
+# LOGS FROM THIS RUN ONLY. A reused host still holds the last run's engine logs,
+# and build 144 archived build 143's as if they were its own (10:39 timestamps
+# in a 12:07 run). Cleared before anything starts.
+Remove-Item -LiteralPath (Join-Path $workRoot 'engine-logs') -Recurse -Force -ErrorAction SilentlyContinue
 $startedNames = @()
 $script:FirstStart = $null
 # Read by `if (-not $script:SaPassword)` before the first database engine sets
@@ -772,7 +776,10 @@ foreach ($s in $services) {
     # that needs the database (harmless for one that only uses the DSN).
     if ($s.NeedsDb -and $DbAddress) {
         # ONE line, all names: passing -HostsEntries twice would be a binding error.
-        $hns = @(@($planObj.PSObject.Properties['databaseHostNames'] | ForEach-Object { $_.Value }) | Where-Object { $_ })
+        # Read only if present: Properties['x'] is $null for a plan without it,
+        # and $null.Value under StrictMode is the crash build 144 died on.
+        $hns = @()
+        if ($planObj.PSObject.Properties['databaseHostNames']) { $hns = @($planObj.databaseHostNames | Where-Object { $_ }) }
         if ($hns.Count -gt 0) { $engineArgs += @('-HostsEntries', "$DbAddress $($hns -join ' ')") }
     }
     if ($Replace) { $engineArgs += '-Replace' }
