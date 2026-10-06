@@ -64,7 +64,7 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
-$script:ScriptVersion = '2026-10-06.3-refresh-url'
+$script:ScriptVersion = '2026-10-06.4-sa-secret'
 Write-Host "  script version $script:ScriptVersion" -ForegroundColor DarkGray
 
 function Write-Step { param([string] $m) Write-Host ''; Write-Host "==> $m" -ForegroundColor Cyan }
@@ -392,6 +392,26 @@ function Grant-EngineDbLogin {
           [Parameter(Mandatory)][string] $SaPassword)
 
     $sqlcmd = (Get-Command sqlcmd -ErrorAction SilentlyContinue)
+
+    # THE ENGINE IS sa. Build 141's engines carry USER=sa in their staged
+    # config. The steps below would then ALTER LOGIN [sa] - silently replacing
+    # the stand-in server's SA password with the engine's - and try to make sa a
+    # database user and a db_owner member. Nothing is provisioned for sa: the
+    # only honest step is to check that the engine's OWN credential logs in.
+    if ($Login -ieq 'sa') {
+        if (-not $sqlcmd) { return [pscustomobject]@{ ok = $false; error = 'sqlcmd is not installed, so the sa credential cannot be checked.' } }
+        $prevPw = $env:SQLCMDPASSWORD; $prevEap = $ErrorActionPreference
+        try {
+            $env:SQLCMDPASSWORD = $Password; $ErrorActionPreference = 'Continue'
+            $probe = & sqlcmd -S $Server -U sa -d $Database -C -b -h -1 -W -Q 'SELECT 1' 2>&1 | Out-String
+            $prc = $LASTEXITCODE
+        } finally { $env:SQLCMDPASSWORD = $prevPw; $ErrorActionPreference = $prevEap }
+        if ($prc -ne 0) {
+            return [pscustomobject]@{ ok = $false; error = "the engine authenticates as sa, and its staged sa password is NOT the stand-in server's (that comes from the DB secret). Nothing was changed on the server. Make the secret's password the engine's staged one, then re-run. sqlcmd: $($probe.Trim())" }
+        }
+        return [pscustomobject]@{ ok = $true; error = $null; engineIsSa = $true }
+    }
+
     if (-not $sqlcmd) {
         return [pscustomobject]@{ ok = $false; error = 'sqlcmd is not installed on this host, so the engine login cannot be provisioned. Re-run 02-prereq-windows.ps1 - the SQL client tools step is marked optional and may have been skipped.' }
     }
@@ -439,6 +459,10 @@ PRINT 'LOGIN_PROVISIONED';
         $prevPw = $env:SQLCMDPASSWORD
         try {
             $env:SQLCMDPASSWORD = $SaPassword
+            # Continue, not Stop: under PS 5.1 a native command's stderr is a
+            # terminating error, which is why build 141 reported "the grant
+            # THREW" instead of the sqlcmd exit code and message.
+            $ErrorActionPreference = 'Continue'
             $out = & sqlcmd -S $Server -U sa -C -b -h -1 -W -i $file 2>&1 | Out-String
             $rc = $LASTEXITCODE
         } finally {
@@ -640,6 +664,19 @@ foreach ($s in $services) {
                 $failed++; continue
             }
             $script:SaPassword = "$($sec.Output)".Trim()
+            # SAME PARSING AS 06-restore-databases.sh, which started SQL Server:
+            # the secret is JSON, and the password is its .password field. Build
+            # 141 passed the WHOLE JSON text as the SA password here, and both
+            # engines were refused with "Login failed for user 'sa'".
+            if ($script:SaPassword.StartsWith('{')) {
+                try {
+                    $j = $script:SaPassword | ConvertFrom-Json
+                    $pw = $null
+                    foreach ($k in 'password', 'Password') { if ($j.PSObject.Properties[$k]) { $pw = [string]$j.$k; break } }
+                    if (-not $pw) { throw "the secret $DbSecretId is JSON but carries no 'password' field" }
+                    $script:SaPassword = $pw
+                } catch { $script:SaPassword = $null; throw }
+            }
         }
         # ONE ENGINE'S LOGIN MUST NOT COST THE OTHERS. An exception from inside
         # the grant (build 136: an ACL call) went to the script-level trap and

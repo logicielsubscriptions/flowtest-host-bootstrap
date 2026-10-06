@@ -37,7 +37,7 @@
 #
 set -uo pipefail
 
-SCRIPT_VERSION='2026-10-06.3-refresh-url'
+SCRIPT_VERSION='2026-10-06.4-sa-secret'
 
 PLAN=''
 SA_SECRET=''
