@@ -37,7 +37,7 @@
 #
 set -uo pipefail
 
-SCRIPT_VERSION='2026-10-06.4-sa-secret'
+SCRIPT_VERSION='2026-10-06.5-sa-boot-pw'
 
 PLAN=''
 SA_SECRET=''
@@ -179,6 +179,11 @@ if [[ $DRY_RUN -eq 0 ]]; then
   ok "SA password read from $SA_SECRET"
 fi
 
+# Which password the instance answers to right now. An instance this script
+# started earlier (a reused stack) already holds the secret's; a fresh one
+# boots on a throwaway and is switched below.
+CUR_PW="$SA_PASSWORD"; FRESH_INSTANCE=0
+
 # ---------------------------------------------------------------------------
 step 'Start the instance'
 if [[ $DRY_RUN -eq 1 ]]; then
@@ -199,7 +204,15 @@ else
     # password there for as long as docker run takes. The file is created with
     # a private umask, used once, and removed.
     envfile="$(umask 077; mktemp)"
-    printf 'ACCEPT_EULA=Y\nMSSQL_SA_PASSWORD=%s\n' "$SA_PASSWORD" > "$envfile"
+    # A THROWAWAY BOOT PASSWORD, NOT THE SECRET'S. The image refuses to start
+    # unless MSSQL_SA_PASSWORD has 8+ characters from 3 classes - and the
+    # secret has to hold the ENGINES' sa password, which is production's and
+    # shorter than that (2026-10-06). So the container boots on a generated
+    # password that passes, and sa is switched to the secret's password
+    # straight after, with CHECK_POLICY OFF - see 'Set the sa password'.
+    BOOT_PW="Ft1!$(head -c 18 /dev/urandom | od -An -tx1 | tr -d ' \n')"
+    CUR_PW="$BOOT_PW"; FRESH_INSTANCE=1
+    printf 'ACCEPT_EULA=Y\nMSSQL_SA_PASSWORD=%s\n' "$BOOT_PW" > "$envfile"
     if ! out="$(docker run -d --name "$CONTAINER" --restart unless-stopped \
                   --env-file "$envfile" \
                   ${DB_NET:+--network "$DB_NET"} ${DB_NET:+--ip "$DB_IP"} \
@@ -232,15 +245,20 @@ fi
 # not be in production: the instance is created by this script, on an isolated
 # network, and lives for the length of the run.
 #
-# THE PASSWORD IS TAKEN FROM THE CONTAINER'S OWN ENVIRONMENT, not passed on the
+# THE PASSWORD ARRIVES ON STDIN (2026-10-06), still never on a command line. It
+# used to be read from the container's MSSQL_SA_PASSWORD, but that is now only
+# the throwaway boot password; sa is switched to the secret's straight after.
+# CUR_PW is whichever is in force.
+#
+# (Original note:) THE PASSWORD IS TAKEN FROM THE CONTAINER'S OWN ENVIRONMENT, not passed on the
 # docker exec command line. `docker exec -e SQLCMDPASSWORD=...` would publish
 # it in the host's process table on every single query. The container already
 # holds it as MSSQL_SA_PASSWORD - that is how the image was started - so the
 # shell inside the container copies it across and nothing sensitive ever
 # appears in an argv the host can see.
 sqlq() {  # sqlq <sql>  -> stdout, exit code of sqlcmd
-  docker exec "$CONTAINER" /bin/sh -c \
-    'SQLCMDPASSWORD="$MSSQL_SA_PASSWORD" exec "$0" -C -S localhost -U sa -b -h -1 -W -Q "$1"' \
+  printf '%s\n' "$CUR_PW" | docker exec -i "$CONTAINER" /bin/sh -c \
+    'IFS= read -r p; SQLCMDPASSWORD="$p" exec "$0" -C -S localhost -U sa -b -h -1 -W -Q "$1"' \
     "$SQLCMD" "$1" 2>&1
 }
 
@@ -253,8 +271,8 @@ sqlq() {  # sqlq <sql>  -> stdout, exit code of sqlcmd
 # found nothing, and "nothing" read as a corrupt backup rather than as a
 # corrupt parse. A separator the data cannot contain removes the guesswork.
 sqlq_cols() {  # sqlq_cols <sql>  -> pipe-separated columns
-  docker exec "$CONTAINER" /bin/sh -c \
-    'SQLCMDPASSWORD="$MSSQL_SA_PASSWORD" exec "$0" -C -S localhost -U sa -b -h -1 -W -s "|" -Q "$1"' \
+  printf '%s\n' "$CUR_PW" | docker exec -i "$CONTAINER" /bin/sh -c \
+    'IFS= read -r p; SQLCMDPASSWORD="$p" exec "$0" -C -S localhost -U sa -b -h -1 -W -s "|" -Q "$1"' \
     "$SQLCMD" "$1" 2>&1
 }
 
@@ -280,6 +298,26 @@ else
     exit 1
   fi
   ok "accepting connections"
+
+  if [[ $FRESH_INSTANCE -eq 1 ]]; then
+    step 'Set the sa password'
+    # The SQL carries the password, so it goes in through stdin to a private
+    # file inside the container and is deleted - never an argument on the host.
+    lit="${SA_PASSWORD//\'/\'\'}"
+    printf "ALTER LOGIN [sa] WITH PASSWORD = N'%s', CHECK_POLICY = OFF, CHECK_EXPIRATION = OFF;\n" "$lit" |
+      docker exec -i "$CONTAINER" /bin/sh -c 'umask 077; cat > /tmp/sa.sql'
+    setout="$(printf '%s\n' "$CUR_PW" | docker exec -i "$CONTAINER" /bin/sh -c \
+      'IFS= read -r p; SQLCMDPASSWORD="$p" "$0" -C -S localhost -U sa -b -i /tmp/sa.sql; rc=$?; rm -f /tmp/sa.sql; exit $rc' \
+      "$SQLCMD" 2>&1)"; setrc=$?
+    CUR_PW="$SA_PASSWORD"
+    if [[ $setrc -ne 0 ]] || ! sqlq 'SELECT 1' >/dev/null 2>&1; then
+      fail "could not switch sa to the password in $SA_SECRET: $setout"
+      record "$CONTAINER" 'failed' "$(jq -n '{stage:"set-sa-password", reason:"sa did not accept the secret password after ALTER LOGIN"}')"
+      write_manifest
+      exit 1
+    fi
+    ok "sa now answers to the password in $SA_SECRET (CHECK_POLICY OFF - it is production's, and shorter than the image allows)"
+  fi
 fi
 
 # ---------------------------------------------------------------------------
