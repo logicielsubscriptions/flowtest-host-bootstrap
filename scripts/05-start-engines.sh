@@ -42,7 +42,7 @@
 #
 set -uo pipefail
 
-SCRIPT_VERSION='2026-10-06.1-acl-by-sid'
+SCRIPT_VERSION='2026-10-06.2-refresh-speaks'
 
 PLAN=''
 ONLY=''
