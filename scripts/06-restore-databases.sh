@@ -37,7 +37,7 @@
 #
 set -uo pipefail
 
-SCRIPT_VERSION='2026-10-06.6-sa-reuse'
+SCRIPT_VERSION='2026-10-06.7-oe-hostname'
 
 PLAN=''
 SA_SECRET=''

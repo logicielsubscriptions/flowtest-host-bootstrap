@@ -64,7 +64,7 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
-$script:ScriptVersion = '2026-10-06.6-sa-reuse'
+$script:ScriptVersion = '2026-10-06.7-oe-hostname'
 Write-Host "  script version $script:ScriptVersion" -ForegroundColor DarkGray
 
 function Write-Step { param([string] $m) Write-Host ''; Write-Host "==> $m" -ForegroundColor Cyan }
@@ -256,6 +256,8 @@ foreach ($group in @($planObj.groups)) {
             DbName    = "$($svcList[$i].dbName)"
             # Empty directories the engine needs and will not create itself.
             ReqDirs   = @($svcList[$i].requiredEmptyDirs)
+            # 'dsn' unless the plan says otherwise; see hosts-map OE._why_dbConnection.
+            DbConn    = $(if ($svcList[$i].PSObject.Properties['dbConnection'] -and $svcList[$i].dbConnection) { [string]$svcList[$i].dbConnection } else { 'dsn' })
         }
     }
 }
@@ -590,7 +592,12 @@ foreach ($s in $services) {
         $svcIniDsn = Join-Path (Join-Path $configRoot $s.Name) 'ServerConfiguration.ini'
         $wantDsn = Get-IniValue -Path $svcIniDsn -Section 'ServerDatabaseSettings' -Key 'DSN'
         $imgRef = "$registry/$EcrNamespace/$($s.Family):$($s.Tag)"
-        if (-not $DryRun) {
+        if ($s.DbConn -ne 'dsn') {
+            # Build 143: this engine builds its OWN connection string and never
+            # opens the image's DSN, so the DSN labels say nothing about what it
+            # will connect to. Its server name is resolved via the hosts entry.
+            Write-Ok "connects by its own connection string ($($s.DbConn)) - the image's DSN is not used, so not checked"
+        } elseif (-not $DryRun) {
             $lab = Get-ImageLabels -Image $imgRef
             $mismatch = @(if ($lab.ok) { @(Compare-ImageDataSource -Labels $lab.labels -Dsn "$wantDsn" -Server "$DbAddress" -Database $s.DbName) } else { @() })
             if (-not $lab.ok -or $mismatch.Count -gt 0) {
@@ -761,6 +768,13 @@ foreach ($s in $services) {
     # Plan-driven empty directories the engine needs before it starts. Passed
     # as separate argv entries so PowerShell does not re-split them.
     foreach ($d in @($s.ReqDirs)) { if ($d) { $engineArgs += @('-RequiredEmptyDirs', $d) } }
+    # The database's production hostname -> its address here, for any engine
+    # that needs the database (harmless for one that only uses the DSN).
+    if ($s.NeedsDb -and $DbAddress) {
+        # ONE line, all names: passing -HostsEntries twice would be a binding error.
+        $hns = @(@($planObj.PSObject.Properties['databaseHostNames'] | ForEach-Object { $_.Value }) | Where-Object { $_ })
+        if ($hns.Count -gt 0) { $engineArgs += @('-HostsEntries', "$DbAddress $($hns -join ' ')") }
+    }
     if ($Replace) { $engineArgs += '-Replace' }
     if ($DryRun)  { $engineArgs += '-DryRun' }
 

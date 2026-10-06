@@ -58,6 +58,10 @@ param(
     # Empty directories to create inside the container before it starts.
     # Plan-driven; see CONTAINER_REQUIRED_DIRS in the generator.
     [string[]] $RequiredEmptyDirs = @(),
+    # "<address> <name>" lines for the container's hosts file. Plan-driven: a
+    # production HOSTNAME the engine names in its own config, mapped to the
+    # address that host holds in this IP-exact environment.
+    [string[]] $HostsEntries = @(),
     [switch]   $Replace,
     [switch]   $DryRun
 )
@@ -67,7 +71,7 @@ $ErrorActionPreference = 'Stop'
 # Printed on every run. See the note in scripts/02-prereq-windows.ps1: without a
 # version in the output a stale fetch is invisible, and a retest can silently
 # re-run old code while looking like a fresh result.
-$ScriptVersion = '2026-10-06.6-sa-reuse'
+$ScriptVersion = '2026-10-06.7-oe-hostname'
 Write-Host "  script version $ScriptVersion" -ForegroundColor DarkGray
 
 function Write-Step { param([string] $m) Write-Host ''; Write-Host "==> $m" -ForegroundColor Cyan }
@@ -244,6 +248,30 @@ if ($script:ConfigReadback -eq 'unavailable') {
     Write-Warn "could not read $target back out of $Name; this run cannot prove the engine sees the staged files"
 }
 Remove-Item $readDir -Recurse -Force -ErrorAction SilentlyContinue
+
+# PRODUCTION HOSTNAMES, RESOLVED THE WAY PRODUCTION RESOLVES THEM.
+#
+# Build 143: the order-execution engine names its database server by HOSTNAME
+# in its own connection string, which nothing in the isolated network resolves.
+# It timed out for 18 s and then aborted in SOR::OrderExecutionData::get_qty -
+# a crash that pointed nowhere near DNS. The name is mapped to the address that
+# host holds here, which IS its production address, so this is name
+# resolution, not a configuration change. Written while the container is
+# created and not started (docker cp, like the config), then read back.
+if (@($HostsEntries | Where-Object { $_ }).Count -gt 0) {
+    $hostsFile = Join-Path $env:TEMP "flowtest-hosts-$([guid]::NewGuid().ToString('N'))"
+    $body = (@('127.0.0.1 localhost', '::1 localhost') + @($HostsEntries | Where-Object { $_ })) -join "`r`n"
+    [System.IO.File]::WriteAllText($hostsFile, $body + "`r`n", (New-Object System.Text.ASCIIEncoding))
+    $hp = Invoke-Docker cp $hostsFile "${Name}:C:/Windows/System32/drivers/etc/hosts"
+    Remove-Item $hostsFile -Force -ErrorAction SilentlyContinue
+    if ($hp.ExitCode -ne 0) {
+        $null = Invoke-Docker rm -f $Name
+        throw ("could not write the hosts file into ${Name}: $($hp.Output.Trim()). Without it the engine " +
+               'cannot resolve the production hostname it names, and fails 18 s later as an unrelated-looking ' +
+               'abort. The container has been removed.')
+    }
+    foreach ($h in @($HostsEntries | Where-Object { $_ })) { Write-Ok "hosts: $h" }
+}
 
 Write-Step "start $Name"
 $start = Invoke-Docker start $Name
