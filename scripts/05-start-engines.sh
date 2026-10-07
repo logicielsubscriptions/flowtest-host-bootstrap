@@ -42,7 +42,7 @@
 #
 set -uo pipefail
 
-SCRIPT_VERSION='2026-10-07.1-git-symbols'
+SCRIPT_VERSION='2026-10-07.2-oe-dsn'
 
 PLAN=''
 ONLY=''
