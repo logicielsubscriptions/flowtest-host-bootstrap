@@ -37,7 +37,7 @@
 #
 set -uo pipefail
 
-SCRIPT_VERSION='2026-10-06.9-bare-refs'
+SCRIPT_VERSION='2026-10-07.1-git-symbols'
 
 PLAN=''
 SA_SECRET=''

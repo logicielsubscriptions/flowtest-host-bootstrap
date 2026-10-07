@@ -108,7 +108,7 @@ trap {
 
 # Printed first, every run. Without it a stale fetch is invisible and a retest
 # can silently re-run old code while looking like a fresh result.
-$script:ScriptVersion = '2026-10-06.9-bare-refs'
+$script:ScriptVersion = '2026-10-07.1-git-symbols'
 
 function Write-Step { param([string] $Message) Write-Host "`n=== $Message ===" -ForegroundColor Cyan }
 function Write-Ok   { param([string] $Message) Write-Host "  [ok]   $Message" -ForegroundColor Green }
@@ -731,6 +731,28 @@ function Invoke-HostOnlyConfigFetch {
         $rel = ($line -replace '^.*? -> ', '') -replace ' \(not staged\)$', ''
         $rel = $rel -replace '^\./', '' -replace '^config/', ''
         if (-not $rel) { continue }
+        # A FILE WITH A GIT HOME OF ITS OWN (hostOnlyConfig.gitFiles): fetched with
+        # the config-repository token before Secrets Manager is tried. symbols.txt,
+        # named by the OE's market_data_config.ini, is published this way.
+        $gf = $null
+        if ($hoc.PSObject.Properties['gitFiles'] -and $hoc.gitFiles -and $hoc.gitFiles.PSObject.Properties[$rel]) { $gf = $hoc.gitFiles.PSObject.Properties[$rel].Value }
+        if ($gf -and (Resolve-GitHubToken)) {
+            $full = Join-Path $Dir ($rel -replace '/', '\')
+            $null = New-Item -ItemType Directory -Force -Path (Split-Path -Parent $full)
+            $src = "$($gf.repo)@$($gf.ref):$($gf.path)"
+            try {
+                [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+                $u = "https://api.github.com/repos/$($gf.repo)/contents/$($gf.path)?ref=$($gf.ref)"
+                Invoke-WebRequest -Uri $u -UseBasicParsing -OutFile $full -Headers @{
+                    Authorization = "Bearer $script:GitHubToken"; Accept = 'application/vnd.github.raw'
+                    'User-Agent' = 'flowtest-staging' }
+                Write-Ok "${Component}: $rel supplied from git $src ($((Get-Item $full).Length) bytes; a branch, not the market date's commit)"
+                continue
+            } catch {
+                Remove-Item -LiteralPath $full -Force -ErrorAction SilentlyContinue
+                Write-Warn "${Component}: $rel could not be fetched from git $src - $($_.Exception.Message). Trying Secrets Manager."
+            }
+        }
         $secret = Get-HostOnlySecretName -Prefix $hoc.secretPrefix -Component $Component -RelPath $rel
         $value = $null
         try {

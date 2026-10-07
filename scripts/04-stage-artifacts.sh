@@ -55,7 +55,7 @@ set -euo pipefail
 
 # Printed first, every run. A stale fetch is otherwise invisible - see the note
 # in 02-prereq-windows.ps1.
-SCRIPT_VERSION='2026-10-06.9-bare-refs'
+SCRIPT_VERSION='2026-10-07.1-git-symbols'
 
 PLAN_FILE="/opt/flowtest/bootstrap/flow-plan-linux.json"
 DRY_RUN=0
@@ -654,6 +654,24 @@ fetch_host_only_config() {   # fetch_host_only_config <staged-dir> <serviceName>
     # The line is "<referring file> -> <path> (not staged)"; take the path.
     rel="${ref#* -> }"; rel="${rel% (not staged)}"
     rel="${rel#./}"; rel="${rel#config/}"
+    # A file with a git home of its own (hostOnlyConfig.gitFiles) - see the .ps1.
+    local gf; gf="$(jq -c --arg r "$rel" '.staged.hostOnlyConfig.gitFiles[$r] // empty' "$PLAN_FILE" 2>/dev/null)"
+    if [[ -n "$gf" ]] && resolve_github_token; then
+      local grepo gref gpath cfg src
+      grepo="$(jq -r .repo <<<"$gf")"; gref="$(jq -r .ref <<<"$gf")"; gpath="$(jq -r .path <<<"$gf")"
+      src="$grepo@$gref:$gpath"
+      # The token goes in a mode-600 curl config, never on the command line.
+      cfg="$(umask 077; mktemp)"
+      printf 'header = "Authorization: Bearer %s"\nheader = "Accept: application/vnd.github.raw"\nheader = "User-Agent: flowtest-staging"\n' "$GITHUB_TOKEN" > "$cfg"
+      mkdir -p "$(dirname "$dir/$rel")"
+      if curl -fsS --config "$cfg" -o "$dir/$rel" "https://api.github.com/repos/$grepo/contents/$gpath?ref=$gref"; then
+        rm -f "$cfg"
+        ok "$svc: $rel supplied from git $src ($(stat -c %s "$dir/$rel") bytes; a branch, not the market date's commit)"
+        continue
+      fi
+      rm -f "$cfg" "$dir/$rel"
+      warn "$svc: $rel could not be fetched from git $src - trying Secrets Manager."
+    fi
     secret="$(hostonly_secret_name "$prefix" "$svc" "$rel")"
     tmp="$(mktemp)"
     # --query/--output text keeps the value off the command line and out of any

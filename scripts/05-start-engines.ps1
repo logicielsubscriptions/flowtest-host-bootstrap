@@ -64,7 +64,7 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
-$script:ScriptVersion = '2026-10-06.9-bare-refs'
+$script:ScriptVersion = '2026-10-07.1-git-symbols'
 Write-Host "  script version $script:ScriptVersion" -ForegroundColor DarkGray
 
 function Write-Step { param([string] $m) Write-Host ''; Write-Host "==> $m" -ForegroundColor Cyan }
