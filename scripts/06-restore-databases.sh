@@ -37,7 +37,7 @@
 #
 set -uo pipefail
 
-SCRIPT_VERSION='2026-10-07.2-oe-dsn'
+SCRIPT_VERSION='2026-10-07.3-port-probe'
 
 PLAN=''
 SA_SECRET=''
