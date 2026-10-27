@@ -37,7 +37,7 @@
 #
 set -uo pipefail
 
-SCRIPT_VERSION='2026-10-19.1-phase1-fixtofix-inputs'
+SCRIPT_VERSION='2026-10-27.1-phase1-static-base-files'
 
 PLAN=''
 SA_SECRET=''
