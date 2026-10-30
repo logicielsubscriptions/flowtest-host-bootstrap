@@ -42,7 +42,7 @@
 #
 set -uo pipefail
 
-SCRIPT_VERSION='2026-10-29.4-phase1-flip-session-check'
+SCRIPT_VERSION='2026-10-30.1-phase1-quickfix-log-names'
 
 PLAN=''
 ONLY=''

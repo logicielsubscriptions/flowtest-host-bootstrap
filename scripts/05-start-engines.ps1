@@ -64,7 +64,7 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
-$script:ScriptVersion = '2026-10-29.4-phase1-flip-session-check'
+$script:ScriptVersion = '2026-10-30.1-phase1-quickfix-log-names'
 Write-Host "  script version $script:ScriptVersion" -ForegroundColor DarkGray
 
 function Write-Step { param([string] $m) Write-Host ''; Write-Host "==> $m" -ForegroundColor Cyan }
