@@ -42,7 +42,7 @@
 #
 set -uo pipefail
 
-SCRIPT_VERSION='2026-10-30.2-phase1-quickfix-log-names-day-pinned'
+SCRIPT_VERSION='2026-10-30.4-phase1-peer-redirects'
 
 PLAN=''
 ONLY=''

@@ -78,7 +78,7 @@ Set-StrictMode -Version Latest
 # The same lesson as PIPELINE_VERSION in Jenkinsfile-generate-cfn, which was
 # itself once left un-bumped so a build reported a version that did not describe
 # the code it ran. Cheap marker, expensive absence.
-$script:ScriptVersion = '2026-10-30.2-phase1-quickfix-log-names-day-pinned'
+$script:ScriptVersion = '2026-10-30.4-phase1-peer-redirects'
 
 # ----------------------------- configuration -----------------------------
 
