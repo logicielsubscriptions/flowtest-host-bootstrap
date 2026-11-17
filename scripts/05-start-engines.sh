@@ -42,7 +42,7 @@
 #
 set -uo pipefail
 
-SCRIPT_VERSION='2026-10-30.4-phase1-peer-redirects'
+SCRIPT_VERSION='2026-10-30.6-phase1-lint-and-empty-host'
 
 PLAN=''
 ONLY=''
@@ -184,7 +184,24 @@ mapfile -t SERVICES < <(jq -r '
       ((.value.requiredEmptyDirs // []) | join(" "))
     ] | @tsv' "$PLAN")
 
-[[ ${#SERVICES[@]} -gt 0 ]] || die 'the plan lists no services for this host'
+if [[ ${#SERVICES[@]} -eq 0 ]]; then
+  # A host can legitimately run no engine in a flow: build 176 (HANW) put only the database
+  # container on the Linux host, so its plan has groups = []. That is nothing to start, not a
+  # fault. A plan WITH groups but no services, or --only matching nothing, is still a fault.
+  if [[ -z "$ONLY" && "$(jq '(.groups // []) | length' "$PLAN")" -eq 0 ]]; then
+    ok 'the plan has no container groups: this host runs no engine in this flow, nothing to start'
+    if [[ $DRY_RUN -eq 0 ]]; then
+      mkdir -p "$WORK_ROOT"
+      jq -n --arg r "$ROLE" --arg f "$FLOW" --arg v "$SCRIPT_VERSION" --arg t "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+        '{schemaVersion:"1.0", hostRole:$r, flow:$f, startedBy:$v, startedAt:$t, items:[], summary:{},
+          note:"the plan has no container groups for this host; no engine was expected here"}' \
+        > "$WORK_ROOT/started-${ROLE}.json" || die "could not write $WORK_ROOT/started-${ROLE}.json"
+      ok "wrote $WORK_ROOT/started-${ROLE}.json (no items)"
+    fi
+    exit 0
+  fi
+  die 'the plan lists no services for this host'
+fi
 
 if [[ -n "$ONLY" ]]; then
   # A LIST, not one name. Phase 0 starts a subset deliberately - the two FIX

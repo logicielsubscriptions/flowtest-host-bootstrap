@@ -64,7 +64,7 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
-$script:ScriptVersion = '2026-10-30.4-phase1-peer-redirects'
+$script:ScriptVersion = '2026-10-30.6-phase1-lint-and-empty-host'
 Write-Host "  script version $script:ScriptVersion" -ForegroundColor DarkGray
 
 function Write-Step { param([string] $m) Write-Host ''; Write-Host "==> $m" -ForegroundColor Cyan }
@@ -261,7 +261,29 @@ foreach ($group in @($planObj.groups)) {
         }
     }
 }
-if ($services.Count -eq 0) { Write-Fail 'the plan lists no services for this host'; exit 1 }
+if ($services.Count -eq 0) {
+    # A host can legitimately run no engine in a flow (build 176, HANW: only the database
+    # container was on the Linux host, so its plan had groups = []). That is nothing to
+    # start, not a fault. A plan WITH groups but no services, or -Only matching nothing,
+    # is still a fault.
+    if (-not $Only -and @($planObj.groups).Count -eq 0) {
+        Write-Ok 'the plan has no container groups: this host runs no engine in this flow, nothing to start'
+        if (-not $DryRun) {
+            if (-not (Test-Path $workRoot)) { New-Item -ItemType Directory -Path $workRoot -Force | Out-Null }
+            $emptyDoc = [ordered]@{
+                schemaVersion = '1.0'; hostRole = $role; flow = $flow; startedBy = $script:ScriptVersion
+                startedAt = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
+                items = @(); summary = @{}
+                note = 'the plan has no container groups for this host; no engine was expected here'
+            }
+            $emptyPath = Join-Path $workRoot "started-$role.json"
+            $emptyDoc | ConvertTo-Json -Depth 8 | Set-Content -Path $emptyPath -Encoding UTF8
+            Write-Ok "wrote $emptyPath (no items)"
+        }
+        exit 0
+    }
+    Write-Fail 'the plan lists no services for this host'; exit 1
+}
 
 if ($Only) {
     # A LIST, not one name - Phase 0 starts the two FIX hubs deliberately, and

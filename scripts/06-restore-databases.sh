@@ -37,7 +37,7 @@
 #
 set -uo pipefail
 
-SCRIPT_VERSION='2026-10-30.4-phase1-peer-redirects'
+SCRIPT_VERSION='2026-10-30.6-phase1-lint-and-empty-host'
 
 PLAN=''
 SA_SECRET=''
