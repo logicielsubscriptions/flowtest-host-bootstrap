@@ -108,7 +108,7 @@ trap {
 
 # Printed first, every run. Without it a stale fetch is invisible and a retest
 # can silently re-run old code while looking like a fresh result.
-$script:ScriptVersion = '2026-11-25.2-hanwmain-flow'
+$script:ScriptVersion = '2026-11-25.3-replay-folders-market-date'
 
 function Write-Step { param([string] $Message) Write-Host "`n=== $Message ===" -ForegroundColor Cyan }
 function Write-Ok   { param([string] $Message) Write-Host "  [ok]   $Message" -ForegroundColor Green }
@@ -142,6 +142,18 @@ function Invoke-Aws {
         throw "aws $($Arguments -join ' ') exited $code`n$text"
     }
     return [pscustomobject]@{ ExitCode = $code; Output = $text }
+}
+
+function Get-AwsErrorSummary {
+    <#  The first two lines of what a failed aws call printed, on one line, for the log and the
+        manifest. Build 178 logged only "Quill fetch failed (exit 1)" and the manifest "aws s3 cp
+        exited 1", so a missing key, a 403 and a bad region all looked the same. #>
+    param([string] $Text)
+    $lines = @(($Text -split "`r?`n") | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+    if ($lines.Count -eq 0) { return '' }
+    $joined = (($lines | Select-Object -First 2) -join ' | ')
+    if ($joined.Length -gt 240) { $joined = $joined.Substring(0, 240) + '...' }
+    return $joined
 }
 
 # ---------------------------------------------------------------------------
@@ -1488,6 +1500,7 @@ function Stage-Captures {
             # manifest is what it reads.
             $fixRc = 0
             $fixReason = ''
+            $fixErr = ''
             $foldersTaken = @()
             if (-not $DryRun) {
                 New-Item -ItemType Directory -Path (Join-Path $dest 'fix') -Force | Out-Null
@@ -1575,6 +1588,7 @@ function Stage-Captures {
                                              '--recursive','--only-show-errors') -AllowFailure
                         if ($copy.ExitCode -ne 0) {
                             $fixRc = $copy.ExitCode
+                            if (-not $fixErr) { $fixErr = Get-AwsErrorSummary $copy.Output }
                             # DISTINGUISH ARCHIVED FROM FORBIDDEN, as the bash
                             # side does. InvalidObjectState is Glacier or
                             # Intelligent-Tiering archive access - not a
@@ -1592,7 +1606,8 @@ function Stage-Captures {
                         }
                         else {
                             Write-Warn "${Name}: FIX message fetch failed (exit $fixRc; prefix may not exist, or the host role lacks s3:ListBucket on the BUCKET arn as well as /*)"
-                            $fixReason = "aws s3 cp exited $fixRc"
+                            if ($fixErr) { Write-Warn "${Name}: aws said: $fixErr" }
+                            $fixReason = if ($fixErr) { "aws s3 cp exited ${fixRc}: $fixErr" } else { "aws s3 cp exited $fixRc" }
                         }
                     }
                 }
@@ -1692,7 +1707,10 @@ function Stage-Captures {
                 @('s3','cp',"s3://$($archive.bucket)/$($resolved.Key)","$target\",'--only-show-errors')
             }
             $copy = Invoke-Aws $args -AllowFailure
-            if ($copy.ExitCode -ne 0) { Write-Warn "$Name/${family}: fetch failed" }
+            if ($copy.ExitCode -ne 0) {
+                $famErr = Get-AwsErrorSummary $copy.Output
+                Write-Warn "$Name/${family}: fetch failed$(if ($famErr) { ' - ' + $famErr })"
+            }
         }
         Add-Result $Name $family 'staged' @{
             key = $resolved.Key; dateOffsetDays = $resolved.Offset; dest = (Join-Path $dest $family) }
@@ -1788,8 +1806,10 @@ else {
                 $script:QuillReason = 'object in an archived S3 access tier; restore required'
             }
             else {
+                $quillErr = Get-AwsErrorSummary $copy.Output
                 Write-Warn "Quill fetch failed (exit $quillRc). The key is a discovery HINT - the capture date may differ from the market date. A 403 here usually means the host role, not the key."
-                $script:QuillReason = "aws s3 cp exited $quillRc"
+                if ($quillErr) { Write-Warn "Quill fetch: aws said: $quillErr" }
+                $script:QuillReason = if ($quillErr) { "aws s3 cp exited ${quillRc}: $quillErr" } else { "aws s3 cp exited $quillRc" }
             }
         }
     }

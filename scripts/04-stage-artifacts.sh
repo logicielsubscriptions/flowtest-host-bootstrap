@@ -55,7 +55,7 @@ set -euo pipefail
 
 # Printed first, every run. A stale fetch is otherwise invisible - see the note
 # in 02-prereq-windows.ps1.
-SCRIPT_VERSION='2026-11-25.2-hanwmain-flow'
+SCRIPT_VERSION='2026-11-25.3-replay-folders-market-date'
 
 PLAN_FILE="/opt/flowtest/bootstrap/flow-plan-linux.json"
 DRY_RUN=0
@@ -1696,7 +1696,8 @@ for raw in rows:
             fix_reason="objects in an archived S3 access tier; restore required"
           else
             warn "$name: FIX message fetch failed (exit $fix_rc; prefix may not exist, or the host role lacks s3:ListBucket on the BUCKET arn as well as /*)"
-            fix_reason="aws s3 cp exited $fix_rc"
+            fix_one="$(printf '%s\n' "$fix_err" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//' | grep -v '^$' | head -2 | paste -sd'|' - | cut -c1-240)" || fix_one=""
+            fix_reason="aws s3 cp exited $fix_rc${fix_one:+: $fix_one}"
           fi
           printf '%s\n' "$fix_err" | tail -5 >&2
         fi
@@ -1865,11 +1866,16 @@ else
   # because the simulator then starts with no book and the replay looks green
   # while exercising the no-market fallback path.
   quill_rc=0
+  quill_err=""
   if [[ $DRY_RUN -eq 0 ]]; then
     mkdir -p "$CAPTURE_ROOT/_quill"
-    aws s3 cp "s3://$qb/$qk" "$CAPTURE_ROOT/_quill/" --only-show-errors || quill_rc=$?
+    quill_out="$(aws s3 cp "s3://$qb/$qk" "$CAPTURE_ROOT/_quill/" --only-show-errors 2>&1)" || quill_rc=$?
     if [[ $quill_rc -ne 0 ]]; then
       warn "Quill fetch failed (exit $quill_rc). The key is a discovery HINT - the capture date may differ from the market date. A 403 here usually means the host role, not the key."
+      # What aws printed, on one line. Build 178 logged only the exit code, so a missing key and
+      # a 403 looked the same.
+      quill_err="$(printf '%s\n' "$quill_out" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//' | grep -v '^$' | head -2 | paste -sd'|' - | cut -c1-240)" || quill_err=""
+      if [[ -n "$quill_err" ]]; then warn "Quill fetch: aws said: $quill_err"; fi
     fi
   fi
   if [[ $quill_rc -eq 0 ]]; then
@@ -1878,8 +1884,8 @@ else
          '{bucket:$b, key:$k, dest:$d}')"
   else
     record "-" quillCapture failed \
-      "$(jq -n --arg b "$qb" --arg k "$qk" --arg rc "$quill_rc" \
-         '{bucket:$b, key:$k, reason:"aws s3 cp exited \($rc)"}')"
+      "$(jq -n --arg b "$qb" --arg k "$qk" --arg rc "$quill_rc" --arg e "$quill_err" \
+         '{bucket:$b, key:$k, reason:("aws s3 cp exited \($rc)" + (if $e == "" then "" else ": " + $e end))}')"
   fi
 fi
 

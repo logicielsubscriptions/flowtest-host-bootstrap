@@ -45,7 +45,7 @@ set -euo pipefail
 # Printed first, every run. See the note in 02-prereq-windows.ps1: without a
 # version in the output, a stale fetch is invisible and a retest can silently
 # re-run old code.
-SCRIPT_VERSION='2026-11-25.2-hanwmain-flow'
+SCRIPT_VERSION='2026-11-25.3-replay-folders-market-date'
 echo "bootstrap script version $SCRIPT_VERSION"
 
 ROOT=""

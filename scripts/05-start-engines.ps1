@@ -64,7 +64,7 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
-$script:ScriptVersion = '2026-11-25.2-hanwmain-flow'
+$script:ScriptVersion = '2026-11-25.3-replay-folders-market-date'
 Write-Host "  script version $script:ScriptVersion" -ForegroundColor DarkGray
 
 function Write-Step { param([string] $m) Write-Host ''; Write-Host "==> $m" -ForegroundColor Cyan }

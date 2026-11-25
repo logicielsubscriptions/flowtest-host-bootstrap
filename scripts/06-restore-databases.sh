@@ -37,7 +37,7 @@
 #
 set -uo pipefail
 
-SCRIPT_VERSION='2026-11-25.2-hanwmain-flow'
+SCRIPT_VERSION='2026-11-25.3-replay-folders-market-date'
 
 PLAN=''
 SA_SECRET=''
