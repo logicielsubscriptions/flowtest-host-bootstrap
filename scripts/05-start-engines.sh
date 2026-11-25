@@ -42,7 +42,7 @@
 #
 set -uo pipefail
 
-SCRIPT_VERSION='2026-10-30.6-phase1-lint-and-empty-host'
+SCRIPT_VERSION='2026-11-25.2-hanwmain-flow'
 
 PLAN=''
 ONLY=''
